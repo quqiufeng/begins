@@ -66,6 +66,75 @@ notes/              踩坑记录
 kpi/                API 面清单（愿景期产物，暂不推进）
 ```
 
+## 怎么玩这份源码（clone → 编译 → 跑起来）
+
+不用先跑裁剪流程。`src-archive/` 里是 `make clean` 过的完整裁剪树，解包即可编译。
+
+### 1. 取下来
+
+```bash
+git clone https://github.com/quqiufeng/begins.git
+cd begins/src-archive
+sha256sum -c SHA256SUMS          # 应输出「成功」
+```
+
+### 2. 解包
+
+```bash
+tar --zstd -xf linux-7.2.12-begin-src-20261110.tar.zst
+cd linux-7.2.12
+```
+
+需要 `zstd`（`apt install zstd` / `pacman -S zstd`）。没有的话用 `zstd -dc x.tar.zst | tar -xf -`。
+
+解开后 **550 MB / 60202 个文件**，`.config` 已带好，不用再 `make menuconfig`。
+
+### 3. 编译
+
+```bash
+cp /boot/config-$(uname -r) /tmp/orig.bak   # 可选：留个对照
+make -j6                                     # 本机 6 核，按自己核数改
+```
+
+产物 `arch/x86/boot/bzImage`。全量编译后目录会涨到 **约 11.4 GB**（实测：编译产物 9.04 GB / 31155 个文件，链接产物 3.11 GB / 46 个，其中 `vmlinux.unstripped` 一段就 1.16 GB），**留 12 GB 空闲空间**。
+
+编完想还原本仓库里那种干净状态：
+
+```bash
+make clean      # 12 GB → 701 MB，2 秒
+```
+
+### 4. 装到机器上
+
+```bash
+sudo make modules_install
+sudo make install
+sudo update-initramfs -c -k 7.2.12-begin    # Debian/Ubuntu
+# sudo dracut -f                              # Fedora/Arch 系
+sudo update-grub
+```
+
+重启，GRUB 里选 `7.2.12-begin`。
+
+### 这份树和上游的差别
+
+| 项 | 上游 `linux-7.2.12.tar.xz` | 这份快照 |
+|---|---|---|
+| 文件数 | 94775 | **60202** |
+| 解包体积 | 1.51 GB | **550 MB** |
+| 配置 | 无 | **`.config` 现成**（4226 个 =y/=m，裁剪前 6717） |
+| 源码改动 | — | **无，一字没改** |
+
+只动了 `.config` 和删掉整个不需要的驱动目录实体，**C 代码原样未改**。所以任何上游文档、补丁、`git bisect` 经验都照常适用。
+
+砍掉的清单在 `tools/trim/disable.list`（2265 个符号），规则在 `tools/trim/rules.txt`。想自己重走一遍裁剪见 `docs/trim.md`。
+
+### 注意
+
+- **显卡驱动**：用发行版自带的就行，本仓库不含 NVIDIA 闭源 blob（再分发违反 EULA）。`kpi/abi/nvidia.contract` 只是 CRC 清单文本（610 个符号 = 内核侧 521 + 模块间 89），用来校验裁剪有没有破坏 ABI。
+- **不是自研内核**：这就是被裁过的 Linux 7.2.12，驱动、文件系统、网络协议栈全是原样的。
+- 换了机器（不是 RTX 3080 / 6 核）也能编能跑，但 `.config` 是针对那台机器裁的，外设多的话可能要 `make menuconfig` 补回几个驱动。
+
 ## P0 验收清单（2026-11-10 23:33 实测 PASS）
 
 实测结果：`uname -r` = `7.2.12-rtx3080-20261025-test`；RTX 3080 / 595.99.02 正常；LXQt(X11) 会话正常；
