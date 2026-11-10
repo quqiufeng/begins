@@ -148,7 +148,22 @@ sudo update-grub
 | `drivers/gpu/drm/amd` `i915` `nouveau` | — | AMD/Intel 核显、开源 NVIDIA |
 | `drivers/{mmc,ufs,watchdog,iio,reset,pmdomain,pcmcia,staging}` | — | 传感器、看门狗、老笔记本 |
 
-补法（上游 `linux-7.2.12.tar.xz` 153 MB 就够，不用解整棵树）：
+**别手抄清单——在目标机器上问它自己。** `tools/trim/adapt.py` 读 `/sys` 拿到本机真正在用的
+驱动名，反查 `obj-$(CONFIG_X) += y.o` 得到符号和目录，缺哪个就从上游 tar 里只解哪个：
+
+```bash
+python3 tools/trim/adapt.py probe            # 上机探测 → notes/hw.json
+python3 tools/trim/adapt.py plan             # 谁缺目录、谁缺 CONFIG，一目了然
+python3 tools/trim/adapt.py fetch --apply    # 缺的目录从 tar.xz 拷回树里
+python3 tools/trim/adapt.py config --apply   # 生成 config 片段并 merge，回报没生效的符号
+make -j6
+```
+
+本机实测：100 个在用驱动/模块 → 88 个已就绪、0 个缺目录（这棵树本来就是为本机裁的）；
+伪造一台 Intel 网卡+无线+读卡器的机器 → 正确报出 3 个缺目录并从上游拷回 921 个文件。
+细节见 [`docs/adapt.md`](docs/adapt.md)。
+
+手工兜底（知道确切目录时）：
 
 ```bash
 tar -xf linux-7.2.12.tar.xz \

@@ -13,3 +13,9 @@ build/initrd/root/
 # 编辑器/系统
 *.swp
 .DS_Store
+
+# adapt.py 的机器相关产物（每台机器自己生成，不入库）
+notes/.cache/
+notes/hw.json
+notes/adapt-plan.json
+notes/adapt-*.config
