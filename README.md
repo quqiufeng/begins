@@ -155,6 +155,7 @@ sudo update-grub
 python3 tools/trim/adapt.py probe            # 上机探测 → notes/hw.json
 python3 tools/trim/adapt.py plan             # 谁缺目录、谁缺 CONFIG，一目了然
 python3 tools/trim/adapt.py fetch --apply    # 缺的目录从 tar.xz 拷回树里
+python3 tools/trim/adapt.py refs  --apply    # 把目录重新挂回父 Makefile/Kconfig（否则代码是哑的）
 python3 tools/trim/adapt.py config --apply   # 生成 config 片段并 merge，回报没生效的符号
 make -j6
 ```

@@ -17,7 +17,7 @@
 import argparse, json, os, re, subprocess, sys, tarfile, glob
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-TREE = os.path.join(ROOT, "src", "linux-7.2.12")
+TREE = os.environ.get("KERNEL_TREE") or os.path.join(ROOT, "src", "linux-7.2.12")
 NOTES = os.path.join(ROOT, "notes")
 DEFAULT_TAR = "/opt/linux/src/linux-7.2.12.tar.xz"
 
@@ -242,8 +242,8 @@ def fetch(args):
     if not args.apply:
         print("\n（未加 --apply，仅预演）")
         return
-    prefix = os.path.basename(DEFAULT_TAR).replace(".tar.xz", "")
     with tarfile.open(args.tar, "r:*") as tf:
+        prefix = tf.getmembers()[0].name.split("/")[0]
         names = set(tf.getnames())
         for d in dirs:
             want = "%s/%s" % (prefix, d)
@@ -265,7 +265,8 @@ def fetch(args):
                 subprocess.run(["rm", "-rf", os.path.join(TREE, prefix)])
             n = sum(len(f) for _, _, f in os.walk(dest))
             print("   + %s (%d 文件)" % (d, n))
-    print("\n完成。接着改 config： python3 tools/trim/adapt.py config --apply")
+    print("\n目录已回填。接着把父 Makefile/Kconfig 的引用挂回去：")
+    refs(args)
 
 
 # ---------------------------------------------------------------- config
@@ -301,13 +302,230 @@ def config(args):
         print("\n✅ 全部生效，可以 make -j6")
 
 
+# ---------------------------------------------------------------- refs
+def _logical(path, merge=True):
+    """按续行合并成逻辑行（Makefile 用；Kconfig 直接按行）"""
+    lines = open(path, errors="surrogateescape").read().split("\n")
+    if not merge:
+        return lines
+    out, i = [], 0
+    while i < len(lines):
+        cur, cont = lines[i], lines[i].rstrip().endswith("\\")
+        if cont:
+            cur = cur.rstrip()[:-1]
+        while cont and i + 1 < len(lines):
+            i += 1
+            nxt, cont = lines[i], lines[i].rstrip().endswith("\\")
+            if cont:
+                nxt = nxt.rstrip()[:-1]
+            cur += " " + nxt.strip()
+        out.append(cur)
+        i += 1
+    return out
+
+
+def upstream_tree(tar, cache):
+    """只解 Makefile + Kconfig（引用行修复用），缓存到 notes/.cache/mk"""
+    tmp = os.path.join(cache, "mk")
+    mark = os.path.join(tmp, ".kconfig")
+    def _root(d):
+        cand = [x for x in os.listdir(d) if not x.startswith(".")]
+        return os.path.join(d, sorted(cand)[0]) if cand else d
+    if os.path.exists(mark):
+        return _root(tmp)
+    os.makedirs(tmp, exist_ok=True)
+    print("  · 从上游解 Makefile/Kconfig（首次）…", file=sys.stderr)
+    with tarfile.open(tar, "r:*") as tf:
+        members = [m for m in tf.getmembers() if m.isfile() and
+                   (m.name.endswith("/Makefile") or m.name.endswith("/Kconfig"))]
+        tf.extractall(tmp, members=members)
+    open(mark, "w").write("ok")
+    return _root(tmp)
+
+
+def _ref_pat(child):
+    """匹配『指向 child 目录（可更深，如 amd/amdgpu/）』的 token/source"""
+    return re.compile(r"(^|\s)%s(/|\s|$)" % re.escape(child))
+
+
+def _dir_exists(parent, tok):
+    tok = tok.rstrip("/")
+    for base in (TREE, os.path.join(TREE, parent)):
+        if os.path.isdir(os.path.join(base, tok)):
+            return True
+    return False
+
+
+def _gen_filtered(parent, name, up, dest):
+    """上游文件 → 与本树一致的版本：丢掉指向已删目录的 obj token / source 行"""
+    if name == "Makefile":
+        out = []
+        for ln in _logical(up):
+            if "=" not in ln or ln.lstrip().startswith("#"):
+                out.append(ln)
+                continue
+            lhs, rhs = ln.split("=", 1)
+            keep = []
+            for t in rhs.split():
+                if t.endswith("/") and "$" not in t and not _dir_exists(parent, t.rstrip("/")):
+                    continue
+                keep.append(t)
+            if keep:
+                out.append(lhs + "=" + " " + " ".join(keep))
+    else:
+        out = []
+        for ln in _logical(up, merge=False):
+            m = re.match(r'\s*source\s+"([^"]+)"', ln)
+            if m and not _dir_exists(parent, m.group(1)):
+                continue
+            out.append(ln)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    open(dest, "w").write("\n".join(out))
+    return " ".join(out)
+
+
+def _ensure(parent, name):
+    """父目录的 Makefile/Kconfig 不存在（整棵子树被删）就从上游补一份过滤过的"""
+    tp = os.path.join(TREE, parent, name)
+    up = os.path.join(UP, parent, name)
+    if not os.path.isfile(up):
+        return None
+    if os.path.isfile(tp):
+        return tp
+    _gen_filtered(parent, name, up, tp)
+    return tp
+
+
+def _anchor(tr, up, idx):
+    """在 tr 里找插入点：紧随「上游中位于目标行之前、且本树里也有」的最后一行"""
+    prior = set(up[:idx])
+    for k in range(len(tr) - 1, -1, -1):
+        if tr[k] in prior:
+            return k + 1
+    return 0
+
+
+def _restore_mk(parent, child):
+    tp = _ensure(parent, "Makefile")
+    up = os.path.join(UP, parent, "Makefile")
+    if not tp or not os.path.isfile(up):
+        return []
+    up_l, tr_l = _logical(up), _logical(tp)
+    pat = _ref_pat(child)
+    if any(pat.search(x) for x in tr_l):
+        return []                                    # 已有引用
+    want = [(i, ln) for i, ln in enumerate(up_l)
+            if not ln.lstrip().startswith("#") and pat.search(ln)]
+    if not want:
+        if not parent:
+            return ["· 顶层目录走根 Makefile 的 drivers-y，无需挂接"]
+        return ["! 上游 %s/Makefile 里没有 %s/ 的引用行" % (parent, child)]
+    added = []
+    for i, ln in want:
+        # 只保留本树里真实存在的目录 token，避免挂上没回填的兄弟目录
+        toks = [t for t in ln.split("=", 1)[1].split()
+                if not (t.endswith("/") and "$" not in t and not _dir_exists(parent, t.rstrip("/")))]
+        if not toks:
+            continue
+        lhs = ln.split("=")[0]
+        line = lhs + "=" + " " + " ".join(toks)
+        up_tok = set(toks)
+        hit = None
+        for j, tl in enumerate(tr_l):
+            if "+=" not in tl and "=" not in tl:
+                continue
+            if tl.split("=")[0].strip() != lhs.strip():
+                continue
+            # 只有当这一行是上游目标行的「子集」时才追加（obj-y += 有很多行，别串行）
+            if set(tl.split("=", 1)[1].split()) <= up_tok:
+                hit = j
+                break
+        if hit is not None:
+            add = [t for t in toks if t not in tr_l[hit].split()]
+            tr_l[hit] = tr_l[hit].rstrip() + " " + " ".join(add)
+            added.append("%s/Makefile: 追加 %s → %s" % (parent or ".", " ".join(add), tr_l[hit].strip()))
+        else:
+            tr_l.insert(_anchor(tr_l, up_l, i), line)
+            added.append("%s/Makefile: 补行 %s" % (parent or ".", line.strip()))
+    open(tp, "w").write("\n".join(tr_l))
+    return added
+
+
+def _restore_kc(parent, child):
+    tp = _ensure(parent, "Kconfig")
+    up = os.path.join(UP, parent, "Kconfig")
+    if not tp or not os.path.isfile(up):
+        return []
+    up_l = _logical(up, merge=False)
+    tr_l = _logical(tp, merge=False)
+    pre = ("%s/%s/" % (parent, child)) if parent else ("%s/" % child)
+    def is_src(ln):
+        m = re.match(r'\s*source\s+"([^"]+)"', ln)
+        return bool(m) and (m.group(1).startswith(pre) or m.group(1) == pre.rstrip("/") + "/Kconfig")
+    if any(is_src(x) for x in tr_l):
+        return []
+    for i, ln in enumerate(up_l):
+        if not is_src(ln):
+            continue
+        p = re.match(r'\s*source\s+"([^"]+)"', ln).group(1)
+        if not os.path.isfile(os.path.join(TREE, p)):   # 指向的 Kconfig 没回填就跳过
+            continue
+        tr_l.insert(_anchor(tr_l, up_l, i), ln)
+        open(tp, "w").write("\n".join(tr_l))
+        return ["%s/Kconfig: 补行 %s" % (parent or ".", ln.strip())]
+    return ["! 上游 %s/Kconfig 里没有 %s 下的 source 行" % (parent or ".", pre)]
+
+
+def refs(args):
+    """把 fetch 回来的目录重新挂回父 Makefile / Kconfig（裁剪时这两处被删了）"""
+    global UP
+    p = os.path.join(NOTES, "adapt-plan.json")
+    if not os.path.exists(p):
+        sys.exit("先跑 probe + plan")
+    planj = json.load(open(p))
+    dirs = sorted({w["dir"] for w in planj["missing_dirs"]})
+    dirs = [d for d in dirs if os.path.isdir(os.path.join(TREE, d))]
+    if not dirs:
+        print("没有已回填的目录，无可挂接")
+        return
+    UP = upstream_tree(args.tar, os.path.join(NOTES, ".cache"))
+    roster = []
+    for d in dirs:
+        parts = d.split("/")
+        for k in range(len(parts)):
+            key = ("/".join(parts[:k]), parts[k])
+            if key not in roster:
+                roster.append(key)
+    roster.sort(key=lambda x: x[0].count("/"))
+
+    print("要重新挂接 %d 处父级引用：" % len(roster))
+    for parent, child in roster:
+        print("   %s/  ←  %s/" % (parent or ".", child))
+    if not args.apply:
+        print("\n（未加 --apply，仅预演）")
+        return
+    log = []
+    for parent, child in roster:
+        log += _restore_mk(parent, child)
+        log += _restore_kc(parent, child)
+    for line in log:
+        print("   " + line)
+    n_add = len([x for x in log if not x.startswith("!")])
+    print("\n✅ 补回 %d 处引用，符号现在能在 menuconfig 里看到了" % n_add)
+    print("接着改 config： python3 tools/trim/adapt.py config --apply")
+
+
 def main():
     ap = argparse.ArgumentParser(description="把裁剪内核适配到本机硬件")
-    ap.add_argument("cmd", choices=["probe", "plan", "fetch", "config"])
+    ap.add_argument("cmd", choices=["probe", "plan", "fetch", "refs", "config"])
     ap.add_argument("--tar", default=DEFAULT_TAR, help="上游 tarball")
     ap.add_argument("--upstream", default="", help="已解包的上游目录（仅用于检查）")
-    ap.add_argument("--apply", action="store_true", help="真的执行（fetch/config）")
+    ap.add_argument("--tree", default="", help="内核源码树（默认 src/linux-7.2.12 或 $KERNEL_TREE）")
+    ap.add_argument("--apply", action="store_true", help="真的执行（fetch/refs/config）")
     a = ap.parse_args()
+    global TREE
+    if a.tree:
+        TREE = os.path.abspath(a.tree)
     os.makedirs(NOTES, exist_ok=True)
 
     if a.cmd == "probe":
@@ -322,6 +540,8 @@ def main():
         plan(a)
     elif a.cmd == "fetch":
         fetch(a)
+    elif a.cmd == "refs":
+        refs(a)
     elif a.cmd == "config":
         config(a)
 
