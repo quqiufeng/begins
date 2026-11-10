@@ -56,7 +56,8 @@ L2  Linux 驱动（原样编入）     ← 复用，不改
 ## 目录
 
 ```
-src/linux-7.2.12/   裁剪中的内核树（真正的工作面）
+src/linux-7.2.12/   裁剪中的内核树（真正的工作面，本地，不入库）
+src-archive/        裁剪后源码快照 tar.zst（88.1 MB，入库，解包即用）
 build/              构建产物与日志
 tools/trim/         lint_includes.py（找彻底缺失的头文件）
 tools/abi/          check_symvers.py（零编译 CRC 对表）
