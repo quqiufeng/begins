@@ -133,7 +133,33 @@ sudo update-grub
 
 - **显卡驱动**：用发行版自带的就行，本仓库不含 NVIDIA 闭源 blob（再分发违反 EULA）。`kpi/abi/nvidia.contract` 只是 CRC 清单文本（610 个符号 = 内核侧 521 + 模块间 89），用来校验裁剪有没有破坏 ABI。
 - **不是自研内核**：这就是被裁过的 Linux 7.2.12，驱动、文件系统、网络协议栈全是原样的。
-- 换了机器（不是 RTX 3080 / 6 核）也能编能跑，但 `.config` 是针对那台机器裁的，外设多的话可能要 `make menuconfig` 补回几个驱动。
+- **驱动只服务一台机器**：这份树的驱动是按本机（Ryzen / RTX 3080 / NVMe / AMD SATA / RTL8168 / USB xHCI）裁的，**换别的 x86 机器，驱动需要专门处理**，不能照搬。
+
+### 换机器：驱动要补回来
+
+砍驱动是**连目录一起删**，不是只关 `.config` 开关。所以 `make menuconfig` 补不回来——符号背后已经没代码了，得先把目录从上游解包回去。
+
+常见缺的：
+
+| 目录 | 上游文件数 | 谁会用 |
+|---|---|---|
+| `drivers/net/wireless/` | 2422 | 笔记本、无线网卡（现树 0 文件） |
+| `drivers/net/ethernet/intel/` | 428 | Intel 有线网卡 e1000e/igb/i40e |
+| `drivers/gpu/drm/amd` `i915` `nouveau` | — | AMD/Intel 核显、开源 NVIDIA |
+| `drivers/{mmc,ufs,watchdog,iio,reset,pmdomain,pcmcia,staging}` | — | 传感器、看门狗、老笔记本 |
+
+补法（上游 `linux-7.2.12.tar.xz` 153 MB 就够，不用解整棵树）：
+
+```bash
+tar -xf linux-7.2.12.tar.xz \
+    linux-7.2.12/drivers/net/ethernet/intel \
+    linux-7.2.12/drivers/net/wireless
+cp -r linux-7.2.12/drivers/net/{ethernet/intel,wireless} ./drivers/net/
+make menuconfig      # 这时符号才有代码可开
+make -j6
+```
+
+x86 核心链路（ACPI / PCI / AHCI / NVMe / USB xHCI / input / DRM core）是完整的，所以换机器**能进桌面**，典型问题是能开机但没网。
 
 ## P0 验收清单（2026-11-10 23:33 实测 PASS）
 
