@@ -1,0 +1,133 @@
+# 第 3 轮：砍纯增量、不进类型定义的大户（fs / net 协议 / cgroup-ns / kvm-bpf-perf / 观测）
+# 铁律：SMP / NR_CPUS / PREEMPT / LOCKDEP / MEMCG / DEBUG_SPINLOCK 一律不动
+# 锚点：契约 521 内核侧符号必须始终能编出
+
+# ---- 文件系统：只留本机根盘 + 内存盘 + 伪文件系统 ----
+KILL fs/btrfs
+KILL fs/xfs
+KILL fs/f2fs
+KILL fs/ext2
+KILL fs/jfs
+KILL fs/reiserfs
+KILL fs/ntfs3
+KILL fs/ntfs
+KILL fs/exfat
+KILL fs/fat
+KILL fs/ocfs2
+KILL fs/gfs2
+KILL fs/ksmbd
+KILL fs/cifs
+KILL fs/nfs
+KILL fs/nfsd
+KILL fs/ceph
+KILL fs/9p
+KILL fs/afs
+KILL fs/smb
+KILL fs/erofs
+KILL fs/squashfs
+KILL fs/ubifs
+KILL fs/zonefs
+KILL fs/orangefs
+KILL fs/omfs
+KILL fs/hfs
+KILL fs/hfsplus
+KILL fs/udf
+KILL fs/isofs
+KILL fs/qnx4
+KILL fs/qnx6
+KILL fs/romfs
+KILL fs/vxfs
+KILL fs/efs
+KILL fs/adfs
+KILL fs/affs
+KILL fs/befs
+KILL fs/sysv
+KILL fs/ufs
+KILL fs/minix
+KILL fs/freevxfs
+KILL fs/hpfs
+KILL fs/autofs
+KILL fs/configfs
+KILL fs/bcachefs
+KILL fs/pstore
+KILL fs/ecryptfs
+KILL fs/overlayfs
+KILL fs/fuse
+KILL fs/cachefiles
+KILL fs/netfs
+KILL fs/verity
+KILL fs/crypto
+
+# ---- 网络：留 IPv4/IPv6 + AF_UNIX，砍 netfilter/sched/无线/容器网络 ----
+KILL net/netfilter
+KILL net/sched
+KILL net/wireless
+KILL net/mac80211
+KILL net/bluetooth
+KILL net/can
+KILL net/nfc
+KILL net/phonet
+KILL net/ieee802154
+KILL net/6lowpan
+KILL net/9p
+KILL net/caif
+KILL net/ceph
+KILL net/rxrpc
+KILL net/sunrpc
+KILL net/smc
+KILL net/tipc
+KILL net/vmw_vsock
+KILL net/xdp
+KILL net/devlink
+KILL net/dsa
+KILL net/ethtool
+KILL net/hsr
+KILL net/ife
+KILL net/l2tp
+KILL net/mctp
+KILL net/mpls
+KILL net/ncsi
+KILL net/openvswitch
+KILL net/qrtr
+KILL net/tls
+KILL net/kcm
+KILL net/strparser
+KILL net/batman-adv
+KILL net/bridge
+KILL net/psample
+KILL net/certs
+KILL drivers/net/wireless
+KILL drivers/net/ethernet/intel
+KILL drivers/net/ethernet/mellanox
+KILL drivers/net/ethernet/broadcom
+KILL drivers/net/ethernet/chelsio
+KILL drivers/net/ethernet/marvell
+KILL drivers/net/ethernet/microsoft
+KILL drivers/net/ethernet/hisilicon
+KILL drivers/net/ethernet/amazon
+KILL drivers/net/ethernet/atheros
+KILL drivers/net/ethernet/cavium
+KILL drivers/net/ethernet/freescale
+KILL drivers/net/ethernet/fungible
+KILL drivers/net/ethernet/google
+KILL drivers/net/ethernet/pensando
+KILL drivers/net/ethernet/sfc
+KILL drivers/net/ethernet/synopsys
+KILL drivers/net/ethernet/ti
+KILL drivers/net/ethernet/wangxun
+KILL drivers/net/ethernet/altera
+KILL drivers/net/wan
+KILL drivers/net/ppp
+KILL drivers/net/slip
+
+# ---- 虚拟化 / 观测 / 追踪：桌面机不做宿主、不 profiling ----
+KILL arch/x86/kvm
+KILL virt/kvm
+KILL kernel/bpf
+KILL kernel/events  # 注意：perf 事件的 core 钩子在 include 里，这里只砍子系统
+KILL kernel/trace
+KILL kernel/livepatch
+KILL kernel/rcu  # 只砍 Tree RCU 之外的实现分支（rcu 目录本体保留，SMP 依赖）
+KILL kernel/cgroup  # 单用户单机；但 MEMCG 类型定义必须留 → 见下方 KEEP
+KILL kernel/nsproxy
+KILL kernel/padata.c

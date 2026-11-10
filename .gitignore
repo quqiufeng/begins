@@ -1,0 +1,15 @@
+# 内核源码树（12G，不进仓库；裁剪靠 tools/ 脚本复现）
+src/
+
+# 构建产物：二进制与日志可重建
+build/artifacts/
+build/initrd/init
+build/initrd/root/
+*.log
+*.o
+*.ko
+*.so
+
+# 编辑器/系统
+*.swp
+.DS_Store
