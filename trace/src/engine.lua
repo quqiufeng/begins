@@ -27,7 +27,9 @@ ffi.C.signal(2,  _sigcb)   -- SIGINT
 
 local PAGE = 4096
 local RING_PAGES = 8      -- ring data 页数，--ring-size 可调；高频探针要大
-local SAMPLE_TID, SAMPLE_TIME, SAMPLE_CALLCHAIN, SAMPLE_RAW = 2, 4, 32, 1024
+local SAMPLE_TID, SAMPLE_TIME, SAMPLE_CALLCHAIN, SAMPLE_CPU, SAMPLE_RAW = 2, 4, 32, 128, 1024
+-- 攒够多少个样本才唤醒一次 poll：1=每个样本都唤醒，开销最大
+local WAKEUP_BATCH = 64
 
 local TS = ffi.typeof("struct timespec")
 local function now_s()
@@ -198,15 +200,19 @@ end
 ------------------------------------------------------------------------
 -- perf ring
 ------------------------------------------------------------------------
-local function perf_open(trace_id, pid, cpu, sample_type, period)
+-- t 可省略：{ inherit = bool, wakeup = n }
+-- flags(attr+40) 低位：1=disabled 2=inherit（fork/新线程跟着走）
+-- wakeup_events(attr+48)：攒够 n 个样本才唤醒一次 poll
+local function perf_open(trace_id, pid, cpu, sample_type, period, t)
+  t = t or {}
   local attr = ffi.new("uint8_t[?]", 136)
   ffi.cast("uint32_t*", attr)[0] = 2
   ffi.cast("uint32_t*", attr+4)[0] = 128
   ffi.cast("uint64_t*", attr+8)[0] = trace_id
   ffi.cast("uint64_t*", attr+16)[0] = period or 1
   ffi.cast("uint64_t*", attr+24)[0] = sample_type
-  ffi.cast("uint64_t*", attr+40)[0] = 1            -- disabled
-  ffi.cast("uint32_t*", attr+48)[0] = 1
+  ffi.cast("uint64_t*", attr+40)[0] = 1 + (t.inherit and 2 or 0)
+  ffi.cast("uint32_t*", attr+48)[0] = t.wakeup or 1
   local fd = tonumber(ffi.C.syscall(ffi.cast("long", SYS_perf_event_open), ffi.cast("void*", attr),
       ffi.cast("int", pid), ffi.cast("int", cpu), ffi.cast("int", -1), ffi.cast("unsigned long", 0)))
   if fd < 0 then return nil, ffi.errno() end
@@ -221,32 +227,150 @@ local function online_cpus()
   return l
 end
 
-local function open_ring(trace_id, pid, cpu, sample_type, cc)
-  local fd, err = perf_open(trace_id, pid, cpu, sample_type, 1)
-  if not fd then return nil, err end
+------------------------------------------------------------------------
+-- 采样目标枚举
+------------------------------------------------------------------------
+-- perf 的 pid 维度只有两种语义，不能混：
+--   pid=P, cpu=-1    per-task：计数器属于该线程，fork 的子进程要 inherit 才跟
+--   pid=-1, cpu=C    per-CPU ：该 CPU 上所有进程共享，噪声照样占 ring 槽
+-- 所以「跟某个进程」= 展开 /proc/PID/task 的每个 tid 各开一条 per-task 事件 + inherit，
+-- 才能覆盖多线程（common_pid 是 tid 不是 tgid）和之后 fork 出来的线程。
+local MAX_TIDS = 256
+
+local function task_tids(pid)
+  local l = {}
+  local f = io.popen("ls -1 /proc/"..pid.."/task 2>/dev/null")
+  if not f then return l end
+  for line in f:lines() do local x = tonumber(line) if x then l[#l+1] = x end end
+  f:close()
+  table.sort(l)
+  return l
+end
+
+local function targets(pid, want_inherit, wakeup)
+  local l = {}
+  if pid then
+    local tids = task_tids(pid)
+    if #tids == 0 then tids = { pid } end
+    if #tids > MAX_TIDS then
+      io.stderr:write(("[trace_engine] 警告：pid %d 有 %d 个线程，超过上限 %d，只跟主线程\n")
+        :format(pid, #tids, MAX_TIDS))
+      tids = { pid }
+    end
+    for _, t in ipairs(tids) do
+      l[#l+1] = { pid = t, cpu = -1, inherit = want_inherit, wakeup = wakeup, tid = t }
+    end
+  else
+    for _, cpu in ipairs(online_cpus()) do
+      l[#l+1] = { pid = -1, cpu = cpu, inherit = false, wakeup = wakeup }
+    end
+  end
+  return l
+end
+
+local ring_errs = {}
+local function rerr(k) ring_errs[k] = (ring_errs[k] or 0) + 1 end
+local function ring_err_note()
+  local l = {}
+  for k, v in pairs(ring_errs) do l[#l+1] = ("%s×%d"):format(k, v) end
+  if #l == 0 then return "" end
+  table.sort(l)
+  return "（" .. table.concat(l, " ") .. "）"
+end
+
+local function open_ring(trace_id, t, sample_type, cc)
+  local fd, err = perf_open(trace_id, t.pid, t.cpu, sample_type, 1, t)
+  if not fd then rerr("open errno=" .. tostring(err)) return nil, err end
   local mmap_len = PAGE * (1 + RING_PAGES)
   local bp = ffi.cast("uint8_t*", ffi.C.mmap(nil, mmap_len, 3, 1, fd, 0))
-  if ffi.cast("intptr_t", bp) == -1 then ffi.C.close(fd) return nil, "mmap 失败" end
+  if ffi.cast("intptr_t", bp) == -1 then
+    rerr("mmap errno=" .. tostring(ffi.errno()))
+    ffi.C.close(fd)
+    return nil, "mmap 失败"
+  end
   -- data_offset/data_size 一律按 perf_event_mmap_page ABI 读（1040/1048），不再假设 = PAGE
   local doff = tonumber(ffi.cast("uint64_t*", bp+1040)[0])
   local dsz  = tonumber(ffi.cast("uint64_t*", bp+1048)[0])
   if doff == 0 or doff >= mmap_len then doff = PAGE end
   if dsz == 0 or doff + dsz > mmap_len then dsz = mmap_len - doff end
   local r = { fd = fd, bp = bp, d = bp + doff, dsz = dsz, mmap_len = mmap_len,
-              off = doff, size = dsz, tail = 0, cpu = cpu, cc = cc }
+              off = doff, size = dsz, tail = 0, cpu = t.cpu, tid = t.tid, cc = cc,
+              scpu = bit.band(sample_type, SAMPLE_CPU) ~= 0 }
   all_rings[#all_rings+1] = r
   return r
 end
 local function ring_on(r)  ffi.C.ioctl(r.fd, 0x2400, ffi.cast("long", 1)) end
 local function ring_off(r) ffi.C.ioctl(r.fd, 0x2401, ffi.cast("long", 0)) end
 
--- 等 ring 有数据：忙等会吃满一个核，还会把被测系统的调度搅乱，这里用 poll 睡在 fd 上
-local function mkpollfd(rings)
-  local npfd = #rings
-  local pfd = ffi.new("struct pollfd[?]", npfd)
-  for i = 1, npfd do pfd[i-1].fd = rings[i].fd pfd[i-1].events = 1 end   -- POLLIN
-  return pfd, npfd
+local function ring_close(r)
+  if r.closed then return end
+  r.closed = true                 -- cleanup 见到这个标记就不重复 close（fd 可能已被复用）
+  ring_off(r)
+  pcall(function() ffi.C.munmap(r.bp, r.mmap_len) end)
+  pcall(function() ffi.C.close(r.fd) end)
 end
+
+------------------------------------------------------------------------
+-- ring 池
+------------------------------------------------------------------------
+-- 内核拒绝 mmap「带 inherit 的 per-task 事件」（mmap 返回 EINVAL），
+-- 所以 ring 模式跟进程时不开 inherit，而是定期重扫 /proc/PID/task 给新线程补 ring。
+local function ring_pool(st, cc, pid)
+  local P = { rings = {}, seen = {}, pfd = ffi.new("struct pollfd[?]", 0), npfd = 0 }
+
+  local function rebuild()
+    P.npfd = #P.rings
+    P.pfd = ffi.new("struct pollfd[?]", P.npfd)
+    for i = 1, P.npfd do P.pfd[i-1].fd = P.rings[i].fd P.pfd[i-1].events = 1 end
+  end
+
+  -- 给还没 ring 的目标补坑，返回新增数量
+  function P.sync()
+    local added = 0
+    for _, p in ipairs(probes) do
+      for _, t in ipairs(targets(pid, false, WAKEUP_BATCH)) do
+        local k = p.id .. ":" .. t.pid .. ":" .. (t.cpu or -1)   -- 全机模式 pid 恒为 -1，必须用 cpu 区分
+        if not P.seen[k] then
+          local r = open_ring(p.id, t, st, cc)
+          if r then
+            P.seen[k] = true
+            ring_on(r)
+            P.rings[#P.rings+1] = r
+            added = added + 1
+          else
+            P.seen[k] = "fail"        -- 记下失败，别每轮对同一目标反复试
+          end
+        end
+      end
+    end
+    if added > 0 then rebuild() end
+    return added
+  end
+
+  -- 线程退出后 ring 上会挂 POLLHUP：残留数据已 drain，收掉 fd 免得 poll 空转
+  function P.reap()
+    local dead = 0
+    for i = P.npfd, 1, -1 do
+      if bit.band(P.pfd[i-1].revents, 0x18) ~= 0 then     -- POLLERR|POLLHUP
+        ring_close(P.rings[i])
+        table.remove(P.rings, i)
+        dead = dead + 1
+      end
+    end
+    if dead > 0 then rebuild() end
+    return dead
+  end
+
+  function P.close_all()
+    for _, r in ipairs(P.rings) do ring_close(r) end
+    P.rings = {}
+    rebuild()
+  end
+
+  return P
+end
+
+-- 等 ring 有数据：忙等会吃满一个核，还会把被测系统的调度搅乱，这里用 poll 睡在 fd 上
 local function wait_ready(pfd, npfd, deadline)
   while _stop[0] == 0 do
     local rem = deadline - now_s()
@@ -254,9 +378,14 @@ local function wait_ready(pfd, npfd, deadline)
     local ms = math.floor(rem * 1000)
     if ms > 100 then ms = 100 end
     if ms < 1 then ms = 1 end
-    local rc = tonumber(ffi.C.poll(pfd, ffi.cast("unsigned long", npfd), ms))
-    if rc > 0 then return true end
-    if rc < 0 and ffi.errno() ~= 4 then return true end     -- 非 EINTR：交给 walk 兜底
+    local rc = tonumber(ffi.C.poll(pfd, ffi.cast("unsigned long", npfd), ms))   -- npfd=0 时纯 sleep
+    -- 超时（rc==0）也要交回上层：只有回到主循环才会 P.sync()/P.reap()，
+    -- 否则一次 poll 一路阻塞到 deadline，期间新起的线程永远挂不上 ring（曾导致 events=0）。
+    if rc < 0 and ffi.errno() == 4 then
+      -- 被信号打断，原地重试
+    else
+      return true
+    end
   end
   return false
 end
@@ -314,6 +443,13 @@ local function walk(r, by_id, cb)
   local h = tonumber(ffi.cast("uint64_t*", r.bp+1024)[0])
   local d0, dsz = r.d, r.dsz
   local scratch = nil
+  -- data_head / data_tail 都是「绝对累加值」，不是环内偏移。
+  -- 之前把 tail 取模写回，内核看到用户进度回退 → 认为 ring 满 → 大量丢样本并自己推进 tail，
+  -- 我们再从旧位置读到填充区（size=0）就永久 break（folded 全机 events=0 的真因）。
+  local kt = tonumber(ffi.cast("uint64_t*", r.bp+1032)[0])
+  if kt and kt ~= r.tail and kt - r.tail < 0x7fffffffffffffff then
+    r.tail = kt                    -- 内核已丢弃 [旧 tail, kt)，跟着跳
+  end
   while r.tail < h do
     local d, off = d0, r.tail % dsz
     local ty = ffi.cast("uint32_t*", d+off)[0]
@@ -331,17 +467,27 @@ local function walk(r, by_id, cb)
       local pid = ffi.cast("uint32_t*", d+p)[0]
       local tid = ffi.cast("uint32_t*", d+p+4)[0]
       local tm  = tonumber(ffi.cast("uint64_t*", d+p+8)[0])
+      -- 内核 perf_output_sample 的落盘顺序是固定的：
+      --   TID → TIME → CPU{u32 cpu; u32 reserved} → CALLCHAIN{u64 nr; nr*8} → RAW{u32 len; bytes}
+      -- 之前把 CPU 读在 callchain 之后，只要 cc 与 scpu 同时开（folded 模式）整个偏移就错位，
+      -- raw 里的 common_type 读成 0 → 一条样本都认不出来。
       local q = p + 16
+      local cpu = nil
+      if r.scpu then
+        cpu = tonumber(ffi.cast("uint32_t*", d+q)[0])
+        q = q + 8
+      end
       local nr, ccp = 0, nil
       if r.cc then
         nr = tonumber(ffi.cast("uint64_t*", d+q)[0])
         ccp = d + q + 8
         q = q + 8 + nr*8
       end
+      if q + 4 > off + sz then break end    -- 头里写的 nr 大得离谱：停在这条，别越界读
       local rl = ffi.cast("uint32_t*", d+q)[0]
       local raw = d + q + 4
       local pr = by_id[tonumber(ffi.cast("uint16_t*", raw)[0])]   -- common_type 是 u16，别读成 u32
-      if pr then cb(pr, pid, tid, tm, raw, rl, ccp, nr) end
+      if pr then cb(pr, pid, tid, tm, raw, rl, ccp, nr, cpu) end
     elseif ty == 2 then                               -- LOST: hdr(8)+id(8)+lost(8)
       stats.lost = stats.lost + tonumber(ffi.cast("uint64_t*", d+off+16)[0])
     elseif ty == 5 then                               -- THROTTLE：内核限流，同样丢数据
@@ -349,7 +495,7 @@ local function walk(r, by_id, cb)
     end
     r.tail = r.tail + sz
   end
-  ffi.cast("uint64_t*", r.bp+1032)[0] = r.tail % dsz
+  ffi.cast("uint64_t*", r.bp+1032)[0] = r.tail   -- 绝对偏移，绝不取模
 end
 
 ------------------------------------------------------------------------
@@ -456,12 +602,12 @@ local result = { mode = opt.mode, duration = opt.duration,
 local function run_count()
   local res, total = {}, 0
   local fds = {}
-  -- pid>0 + cpu=-1 只挂住单线程；per-CPU 挂进程才能覆盖该进程全部线程
-  for _, cpu in ipairs(online_cpus()) do
-    local fd = perf_open(probes[1].id, opt.pid or -1, cpu, 0, 0)
+  -- count 用 period=0（只计数不采样）：--pid 时按 tid 展开 + inherit，否则每 CPU 一条
+  for _, t in ipairs(targets(opt.pid, true, 1)) do
+    local fd = perf_open(probes[1].id, t.pid, t.cpu, 0, 0, t)
     if fd then
       ffi.C.ioctl(fd, 0x2400, ffi.cast("long", 1))
-      fds[#fds+1] = { fd = fd, cpu = cpu }
+      fds[#fds+1] = { fd = fd, cpu = t.cpu, tid = t.tid }
     end
   end
   if #fds == 0 then fail("perf_event_open 全部失败（需 root + perf_event_paranoid<=0）") end
@@ -472,7 +618,7 @@ local function run_count()
     ffi.C.read(f.fd, b, ffi.cast("unsigned long", 8))
     local c = tonumber(b[0])
     total = total + c
-    if c > 0 then res[#res+1] = { cpu = f.cpu, count = c } end
+    if c > 0 then res[#res+1] = { cpu = f.cpu, tid = f.tid, count = c } end
     ffi.C.close(f.fd)
   end
   table.sort(res, function(a, b) return a.count > b.count end)
@@ -481,36 +627,32 @@ local function run_count()
 end
 
 local function run_samples()
-  local rings = {}
-  local st = bit.bor(SAMPLE_TID, SAMPLE_TIME, SAMPLE_RAW)
-  -- 每个探针 × 每个 CPU 一份 ring：多 --probe 不再被静默丢掉
-  for _, p in ipairs(probes) do
-    for _, cpu in ipairs(online_cpus()) do
-      local r = open_ring(p.id, opt.pid or -1, cpu, st, false)
-      if r then rings[#rings+1] = r end
-    end
-  end
-  if #rings == 0 then fail("ring 建立失败") end
-  for _, r in ipairs(rings) do ring_on(r) end
-  local pfd, npfd = mkpollfd(rings)
+  local st = bit.bor(SAMPLE_TID, SAMPLE_TIME, SAMPLE_CPU, SAMPLE_RAW)
+  -- 每个探针 × 每个目标一份 ring：多 --probe 不再被静默丢掉
+  local P = ring_pool(st, false, opt.pid)
+  P.sync()
+  if #P.rings == 0 then fail("ring 建立失败" .. ring_err_note()) end
   local out, total = {}, 0
   local deadline = now_s() + opt.duration
   local function drain()
-    for _, r in ipairs(rings) do
-      walk(r, by_id, function(pr, pid, tid, tm, raw, rl)
+    for _, r in ipairs(P.rings) do
+      walk(r, by_id, function(pr, pid, tid, tm, raw, rl, ccp, nr, cpu)
         total = total + 1
         if #out < opt.limit then
           local ev = decode(pr, raw, pid, opt.strfield)
-          ev.pid, ev.tid, ev.cpu, ev.time_ns = pid, tid, r.cpu, tm
+          ev.pid, ev.tid, ev.time_ns = pid, tid, tm
+          ev.cpu = cpu or r.cpu
           ev.probe, ev.comm = pr.name, comm_of(pid)
           out[#out+1] = ev
         end
       end)
     end
   end
-  while wait_ready(pfd, npfd, deadline) do drain() end
+  while wait_ready(P.pfd, P.npfd, deadline) do
+    drain() P.reap() P.sync()               -- 先取数，再收死 ring，再给新线程补 ring
+  end
   drain()                                  -- 收尾：已到 ring 里但没唤醒 poll 的尾巴
-  for _, r in ipairs(rings) do ring_off(r) end
+  P.close_all()
   result.samples, result.events = out, total
 end
 
@@ -527,30 +669,23 @@ local function key_of(ev)
 end
 
 local function run_latency()
-  local rings = {}
-  local st = bit.bor(SAMPLE_TID, SAMPLE_TIME, SAMPLE_RAW)
-  -- entry / exit 各一份 ring，挂到所有 cpu
-  for _, p in ipairs(probes) do
-    for _, cpu in ipairs(online_cpus()) do
-      local r = open_ring(p.id, opt.pid or -1, cpu, st, false)
-      if r then rings[#rings+1] = r end
-    end
-  end
-  if #rings == 0 then fail("ring 建立失败") end
-  for _, r in ipairs(rings) do ring_on(r) end
+  local st = bit.bor(SAMPLE_TID, SAMPLE_TIME, SAMPLE_CPU, SAMPLE_RAW)
+  -- entry / exit 各一份 ring，挂到所有目标
+  local P = ring_pool(st, false, opt.pid)
+  P.sync()
+  if #P.rings == 0 then fail("ring 建立失败" .. ring_err_note()) end
 
   local pend, hists = {}, {}
   local paired, unpaired, total = 0, 0, 0
   local eid, xid = opt.entry_probe.id, opt.exit_probe.id
-  local pfd, npfd = mkpollfd(rings)
   local deadline = now_s() + opt.duration
   local function drain()
-    for _, r in ipairs(rings) do
-      walk(r, by_id, function(pr, pid, tid, tm, raw)
+    for _, r in ipairs(P.rings) do
+      walk(r, by_id, function(pr, pid, tid, tm, raw, rl, ccp, nr, c) 
         total = total + 1
         if pr.id == eid then
           local ev = decode(pr, raw, pid, opt.strfield)
-          ev.pid, ev.tid, ev.cpu = pid, tid, r.cpu
+          ev.pid, ev.tid, ev.cpu = pid, tid, c or r.cpu
           -- 同一 tid 可能有多条 entry 没等到 exit：排队，别用后一条覆盖前一条
           local q = pend[tid]
           if not q then q = {} pend[tid] = q end
@@ -577,9 +712,11 @@ local function run_latency()
       end)
     end
   end
-  while wait_ready(pfd, npfd, deadline) do drain() end
+  while wait_ready(P.pfd, P.npfd, deadline) do
+    drain() P.reap() P.sync()
+  end
   drain()
-  for _, r in ipairs(rings) do ring_off(r) end
+  P.close_all()
   -- 只有 entry 没等到 exit 的也记成未配对，别让它悄悄消失
   for _, q in pairs(pend) do unpaired = unpaired + #q end   -- 队列里每条没配上的 entry 都算未配对
   pend = {}
@@ -645,23 +782,16 @@ local function sym(key)
 end
 
 local function run_folded()
-  local rings = {}
-  local st = bit.bor(SAMPLE_TID, SAMPLE_TIME, SAMPLE_RAW, SAMPLE_CALLCHAIN)
-  for _, pr in ipairs(probes) do
-    for _, cpu in ipairs(online_cpus()) do
-      local r = open_ring(pr.id, opt.pid or -1, cpu, st, true)
-      if r then rings[#rings+1] = r end
-    end
-  end
-  if #rings == 0 then fail("ring 建立失败") end
-  for _, r in ipairs(rings) do ring_on(r) end
-  local pfd, npfd = mkpollfd(rings)
+  local st = bit.bor(SAMPLE_TID, SAMPLE_TIME, SAMPLE_CPU, SAMPLE_RAW, SAMPLE_CALLCHAIN)
+  local P = ring_pool(st, true, opt.pid)
+  P.sync()
+  if #P.rings == 0 then fail("ring 建立失败" .. ring_err_note()) end
   local acc, total = {}, 0
   local np = #probes
   local function short(p) return p:match("([^:]+)$") or p end
   local deadline = now_s() + opt.duration
   local function drain()
-    for _, r in ipairs(rings) do
+    for _, r in ipairs(P.rings) do
       walk(r, by_id, function(pr, pid, tid, tm, raw, rl, ccp, nr)
         total = total + 1
         local frames = {}
@@ -681,9 +811,11 @@ local function run_folded()
       end)
     end
   end
-  while wait_ready(pfd, npfd, deadline) do drain() end
+  while wait_ready(P.pfd, P.npfd, deadline) do
+    drain() P.reap() P.sync()
+  end
   drain()
-  for _, r in ipairs(rings) do ring_off(r) end
+  P.close_all()
   local arr = {}
   for k, v in pairs(acc) do arr[#arr+1] = { stack = k, count = v } end
   table.sort(arr, function(a, b) return a.count > b.count end)
@@ -723,7 +855,10 @@ else
   local function human(n) if n > 1e6 then return ("%.1fM"):format(n/1e6) elseif n > 1e3 then return ("%.1fk"):format(n/1e3) end return tostring(n) end
   if opt.mode == "count" then
     print(("%s  %s 次 / %gs  (%.0f/s)"):format(result.probes[1], human(result.count), opt.duration, result.rate))
-    for _, r in ipairs(result.per_cpu) do print(("  cpu%-2s %s"):format(r.cpu, human(r.count))) end
+    for _, r in ipairs(result.per_cpu) do
+      local lab = r.tid and ("tid "..r.tid) or ("cpu"..r.cpu)
+      print(("  %-8s %s"):format(lab, human(r.count)))
+    end
   elseif opt.mode == "latency" then
     print(("%s → %s  events=%d paired=%d unpaired=%d%s"):format(result.probes[1], result.probes[2],
       result.events, result.paired, result.unpaired, lostnote()))
