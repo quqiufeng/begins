@@ -40,6 +40,10 @@ P0 的验收标准就是能日常用：进桌面、nvidia 驱动起来、网络�
 早期定过"自研 L0 内核 + linuxkpi 兼容层"的方案 A（`docs/scope.md`）：
 内核自己写、驱动复用 Linux。这条路需要年，且和 P1 抢同一份精力。
 
+方案 A 的替代路径是 **分块重写**（[`docs/design.md`](docs/design.md)）：驱动层原样复用，
+内核**实现层**按块替换（RCU → locking → timer/wq → mm 分配器 → sched → blk），
+每块一个 `CONFIG_MK_*` 开关、默认关、随时回退。首个块的契约清单见 [`notes/mk-rcu.md`](notes/mk-rcu.md)。
+
 ```
 L3  桌面（现成）              ← 现在用的
 L2  Linux 驱动（原样编入）     ← 复用，不改
@@ -70,6 +74,7 @@ tools/abi/          check_symvers.py（零编译 CRC 对表）
 docs/               设计文档
   build.md          **裁剪→编译→安装 完整流程**（照着敲就能复现装机内核）
   trim.md           裁剪方法与五轮账本（主文档）
+  design.md         **分块重写方案**：驱动复用 + 实现层按块替换，M1~M7 路线
 notes/              踩坑记录
 kpi/                API 面清单（愿景期产物，暂不推进）
 ```
