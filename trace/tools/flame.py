@@ -235,8 +235,8 @@ def flatten(root):
 
 
 JS = r"""
-var N=__DATA__,W=__W__,H=__H__,HEAD=__HEAD__,ROW=__ROW__,FOOT=__FOOT__,M=__M__,WU=__WU__;
-function fmt(v){return Math.abs(v)>=100?String(Math.round(v)):String(Math.round(v*10)/10)}
+var N=__DATA__,W=__W__,H=__H__,HEAD=__HEAD__,ROW=__ROW__,FOOT=__FOOT__,M=__M__,WU=__WU__,DIV=__DIV__,DG=__DG__;
+function fmt(v){v=v/DIV;var s=v.toFixed(DG);if(DG>0){s=s.replace(/\.0+$/,'')}return s}
 var NS='http://www.w3.org/2000/svg',kids=[],root=0;
 for(var i=0;i<N.length;i++)kids.push([]);
 for(var i=1;i<N.length;i++)kids[N[i][2]].push(i);
@@ -307,9 +307,10 @@ def draw_svg(j, root, out_svg, title):
     scale = (SW - 2 * SM) / (total or 1)
     bottom = H - SFOOT
 
+    div, dg = (1000.0, 1) if j.get("unit") == "ms" and total > 100000 else (1, 0)
     if j.get("unit") == "ms":
-        tot = total / 1000.0 if total > 100000 else total
-        sub = "阻塞 %.1fms · 栈种类 %d · 最深 %d 层 · 权重=阻塞时长" % (tot, max(len(nodes) - 1, 0), depth)
+        sub = "阻塞 %.1fms · 栈种类 %d · 最深 %d 层 · 权重=阻塞时长" % (
+            total / div, max(len(nodes) - 1, 0), depth)
     else:
         fr = j.get("freq")
         sub = "样本 %d · 栈种类 %d · 最深 %d 层 · %s" % (
@@ -372,6 +373,7 @@ text{font-size:11px;fill:#1a1a1a;pointer-events:none}
     js = (JS.replace("__DATA__", data).replace("__W__", str(SW)).replace("__H__", str(H))
             .replace("__HEAD__", str(SHEAD)).replace("__ROW__", str(SROW))
             .replace("__WU__", json.dumps(" ms" if j.get("unit") == "ms" else " 样本", ensure_ascii=False))
+            .replace("__DIV__", str(div)).replace("__DG__", str(dg))
             .replace("__FOOT__", str(SFOOT)).replace("__M__", str(SM)))
     out.append("<script><![CDATA[%s]]></script>" % js)
     out.append("</svg>")
