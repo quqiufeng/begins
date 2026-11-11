@@ -239,6 +239,33 @@ sudo luajit src/engine.lua --mode oncpu --duration 3 --rank /tmp/rank.svg --rank
     bash 包装进程（`STAT S`），真忙的 python 在子进程里；直接 trace 那个 pid 立刻出 59 个样本、全部命中。
     **结论：不是 bug**，只是目标选错了——排查 perf 类问题时先 `ps -o stat,pcpu` 确认目标是 `R` 且在跑。
 
+### 测试桩的孤儿进程（2026-11-11 16:16，把整机拖到卡死）
+
+造负载验证 `--sym` / 火焰图时用的桩脚本（`/tmp/spin.py` 之类）跑完没有收尾，19 个 python3
+空转进程挂在 `lxqt-session` 下继续烧 CPU：**合计 657% / 600%，load 20.3**，桌面明显卡顿。
+桩脚本长这样，`while True` 没有出口：
+
+```python
+data = bytes(random.getrandbits(8) for _ in range(200000))
+while True:
+    for _ in range(20):
+        hashlib.sha256(data).digest()
+    x = [i*i for i in range(200000)]; x.sort(reverse=True)
+```
+
+三处该记住的：
+
+1. **桩一律挂 `timeout`**：`timeout 60 python3 spin.py &`。别指望测试脚本的 trap 能兜住，
+   它自己被 kill 时子进程照跑（孤儿进程被 init/session 收养，cwd 还留在 `trace/`）。
+2. **`pkill -f` 会匹配到自己**。`pgrep -f 'while True: pass'` 的执行命令行里本身含这串，
+   于是 shell 把自己 SIGTERM 了（表现为工具返回 `[terminated]`，看着像环境故障）。
+   想干净：`pgrep -f 'while Tru[e]: pass'` 用字符类断开自匹配，或 `pgrep -f -- pat | grep -v $$`。
+3. **认领依据**：这些进程 `ppid` 全是 `lxqt-session`（从终端起的）、`cwd` 是 `trace/`、
+   `stdout` 指向已删除的 `/tmp/lua_*`。系统包不会这么起，看到这组合就是自己留下的。
+
+收尾用 `kill -TERM` 即可；load 是移动平均，1 分钟值要过几分钟才回落到真实水平，
+`vmstat 1 3` 的 idle 立刻从 0% 回到 90%+ 才是真干净。
+
 ### 已知限制
 
 - glibc 的 `malloc`/`getpid` 是 IFUNC，符号本身没有实体指令地址；探针要落在 ifunc 的 resolver
