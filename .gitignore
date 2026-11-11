@@ -29,3 +29,8 @@ notes/adapt-*.config
 build/out/
 # 19M 二进制，从 artifacts 取即可
 build/bzImage-*
+
+# lite 会话记忆（本地状态，不入库）
+/mem.bin
+/mem.idx
+/mem.lock

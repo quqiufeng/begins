@@ -65,7 +65,7 @@ L2  Linux 驱动（原样编入）     ← 复用，不改
 
 ```
 src/linux-7.2.12/   裁剪中的内核树（真正的工作面，本地，不入库）
-src-archive/        裁剪后源码快照 tar.zst（88.1 MB，入库，解包即用）
+src-archive/        源码快照 tar.zst（两份：hwreal 68.9 MB / sandy-dbg2 77.2 MB，入库，解包即用）
 build/              构建产物与日志
 tools/trim/         lint_includes.py（找彻底缺失的头文件）
                     clean-build.sh（真·全新构建+计时，绕开不删 .o 的 make clean）
@@ -82,7 +82,8 @@ kpi/                API 面清单（愿景期产物，暂不推进）
 
 ## 怎么玩这份源码（clone → 编译 → 跑起来）
 
-不用先跑裁剪流程。`src-archive/` 里是 `make clean` 过的完整裁剪树，解包即可编译。
+不用先跑裁剪流程。`src-archive/` 里是清空构建产物的完整源码树（`.config` 已就位），解包即可编译。
+两份：`hwreal`（本机装机内核）与 `sandy-dbg2`（小机箱追踪/调试内核，ftrace/BTF/netfilter 全开）。
 
 ### 1. 取下来
 
