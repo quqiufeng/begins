@@ -551,6 +551,7 @@ do
     elseif a == "--event"    then opt.event = val()
     elseif a == "--ring-size" then RING_PAGES = math.max(1, math.min(1024, tonumber(val()) or 8))
     elseif a == "--flame"    then opt.flame = val()
+    elseif a == "--sym"      then opt.sym = true
     elseif a == "--json"     then opt.json = true
     else io.stderr:write("未知参数: "..tostring(a).."\n") os.exit(2) end
     i = i + 1
@@ -838,8 +839,9 @@ local function load_maps(pid)
       local a, b, off = line:match("^(%x+)%-(%x+)%s+%S+%s+(%x+)")
       if a then
         local path = line:match("%s(/[^%s]*)$")
+        if path then path = path:gsub(" %(deleted%)$", "") end   -- 已删模块打不开，只留名字兜底
         m[#m+1] = { s = tonumber(a,16), e = tonumber(b,16), off = tonumber(off,16),
-                    n = path and path:match("([^/]+)$") or nil }
+                    p = path, n = path and path:match("([^/]+)$") or nil }
       end
     end
     f:close()
@@ -848,16 +850,203 @@ local function load_maps(pid)
   if maps_n < MAPS_MAX then maps_cache[pid] = m maps_n = maps_n + 1 end
   return m
 end
+-- ---------------------------------------------------------------------
+-- --sym：把「模块+文件偏移」变成函数名。两路来源：
+--   ① /tmp/perf-<pid>.map —— JIT（LuaJIT/Node/JVM）的运行时地址表，绝对地址
+--   ② 模块自己的 ELF —— maps 给的是文件偏移，先按 PT_LOAD 折回 vaddr，
+--      再在 .symtab（被 strip 的库只有 .dynsym）里二分最近的 STT_FUNC
+-- 找不到符号就退回原来的「模块+偏移」，不加 --sym 时这段完全不参与。
+-- ---------------------------------------------------------------------
+local elf_cache, elf_n = {}, 0
+local ELF_MAX = 32                     -- 别把几百个 .so 的符号表一直留着
+local pmap_cache = {}
+local sym_hit = 0                      -- 命中计数，只在报告里露一面
+
+local function read_build_id(path)
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local data = f:read("*a") f:close()
+  if #data < 64 or data:sub(1, 4) ~= "\127ELF" then return nil end
+  local buf = ffi.cast("const uint8_t*", data)
+  local function u16(o) return ffi.cast("const uint16_t*", buf+o)[0] end
+  local function u32(o) return ffi.cast("const uint32_t*", buf+o)[0] end
+  local function u64(o) return tonumber(ffi.cast("const uint64_t*", buf+o)[0]) end
+  local shoff, shentsize, shnum = u64(40), u16(58), u16(60)
+  for i = 0, shnum - 1 do
+    local o = shoff + i * shentsize
+    if u32(o+4) == 7 then                                 -- SHT_NOTE
+      local noff, nsz = u64(o+24), u64(o+32)
+      local q = noff
+      while q + 12 <= noff + nsz do
+        local nsz2, descsz, ty = u32(q), u32(q+4), u32(q+8)
+        local name_end = q + 12
+        while buf[name_end] ~= 0 do name_end = name_end + 1 end
+        if ty == 3 and ffi.string(buf+q+12, name_end-q-12) == "GNU" then
+          local d = q + 12 + nsz2
+          local t = {}
+          for b = 0, math.min(descsz, 20) - 1 do t[#t+1] = ("%02x"):format(buf[d+b]) end
+          return table.concat(t)
+        end
+        q = q + 12 + math.floor((nsz2 + 3) / 4) * 4 + math.floor((descsz + 3) / 4) * 4
+      end
+    end
+  end
+  return nil
+end
+
+local function elf_syms(path)
+  local c = elf_cache[path]
+  if c ~= nil then return c or nil end
+  local f = io.open(path, "rb")
+  if not f then elf_cache[path] = false return nil end
+  local data = f:read("*a") f:close()
+  if #data < 64 or data:sub(1, 4) ~= "\127ELF" then elf_cache[path] = false return nil end
+  local buf = ffi.cast("const uint8_t*", data)      -- data 活着，指针有效
+  local function u8(o) return buf[o] end
+  local function u16(o) return ffi.cast("const uint16_t*", buf+o)[0] end
+  local function u32(o) return ffi.cast("const uint32_t*", buf+o)[0] end
+  local function u64(o) return tonumber(ffi.cast("const uint64_t*", buf+o)[0]) end
+  local shoff, shentsize, shnum = u64(40), u16(58), u16(60)
+  local phoff, phnum, phentsize = u64(32), u16(56), u16(54)
+  local pl = {}
+  for i = 0, phnum - 1 do
+    local o = phoff + i * phentsize
+    if u32(o) == 1 then pl[#pl+1] = { o = u64(o+8), v = u64(o+16), f = u64(o+32) } end
+  end
+  local pick
+  for i = 0, shnum - 1 do
+    local o = shoff + i * shentsize
+    if u32(o+4) == 2 then pick = o break end          -- .symtab 优先
+  end
+  if not pick then
+    for i = 0, shnum - 1 do
+      local o = shoff + i * shentsize
+      if u32(o+4) == 11 then pick = o break end       -- strip 过的只剩 .dynsym
+    end
+  end
+  local syms = {}
+  if pick then
+    local link, off, size, ent = u32(pick+40), u64(pick+24), u64(pick+32), u64(pick+56)
+    if ent > 0 then
+      local stroff = u64(shoff + link * shentsize + 24)
+      for j = 0, math.floor(size / ent) - 1 do
+        local so = off + j * ent
+        local nm, info, va, sz = u32(so), u8(so+4), u64(so+8), u64(so+16)
+        local ty = info % 16
+        if nm ~= 0 and va ~= 0 and (ty == 2 or ty == 10) then   -- FUNC / GNU_IFUNC
+          local e = stroff + nm
+          local q = e
+          while buf[q] ~= 0 do q = q + 1 end
+          syms[#syms+1] = { v = va, sz = sz, n = ffi.string(buf+e, q-e) }
+        end
+      end
+    end
+  end
+  table.sort(syms, function(a, b) return a.v < b.v end)
+  for i = 1, #syms - 1 do           -- 汇编标签常没 st_size，用下一个符号当上界
+    if syms[i].sz == 0 then syms[i].sz = syms[i+1].v - syms[i].v end
+  end
+  local r = { pl = pl, syms = syms }
+  if elf_n < ELF_MAX then elf_cache[path] = r elf_n = elf_n + 1 end
+  return r
+end
+
+-- 发行版把符号表单独放进 debuginfo 包：模块里没有 FUNC 时，
+-- 按 .note.gnu.build-id 找 /usr/lib/debug/.build-id/xx/rest.debug，
+-- 那个文件段布局与自身一致，pl/syms 可以直接顶替。
+local function elf_debug_syms(path)
+  local id = read_build_id(path)
+  if not id then return nil end
+  local dbg = ("/usr/lib/debug/.build-id/%s/%s.debug"):format(id:sub(1, 2), id:sub(3))
+  if not io.open(dbg) then return nil end
+  return elf_syms(dbg)
+end
+
+local function elf_lookup(path, fileoff)
+  local e = elf_syms(path)
+  if e and #e.syms == 0 then e = elf_debug_syms(path) end
+  if not e or #e.syms == 0 then return nil end
+  local va
+  for _, s in ipairs(e.pl) do
+    if fileoff >= s.o and fileoff < s.o + s.f then va = s.v + (fileoff - s.o) break end
+  end
+  if not va then return nil end
+  local syms = e.syms
+  local lo, hi, best = 1, #syms, nil
+  while lo <= hi do
+    local mid = math.floor((lo + hi) / 2)
+    if syms[mid].v <= va then best = syms[mid] lo = mid + 1 else hi = mid - 1 end
+  end
+  if not best then return nil end
+  local d = va - best.v
+  if d >= best.sz then return nil end       -- 落在函数尾巴外的空洞，别硬塞个名字
+  return best.n, d
+end
+
+local function perf_map(pid)
+  local c = pmap_cache[pid]
+  if c ~= nil then return c or nil end
+  local hs = {}
+  for line in (rf("/tmp/perf-"..pid..".map") or ""):gmatch("[^\n]+") do
+    local a, sz, nm = line:match("^(%x+)%s+(%x+)%s+(.+)$")
+    if a then
+      local st = tonumber(a, 16)
+      hs[#hs+1] = { s = st, e = st + tonumber(sz, 16), n = nm }
+    end
+  end
+  table.sort(hs, function(x, y) return x.s < y.s end)
+  pmap_cache[pid] = (#hs > 0) and hs or false
+  return pmap_cache[pid] or nil
+end
+
+local function sym_lookup(pid, a, best, fileoff)
+  local pm = perf_map(pid)
+  if pm then                                    -- JIT 代码：maps 里是 anon，只有 perf map 认识
+    local lo, hi, hit = 1, #pm, nil
+    while lo <= hi do
+      local mid = math.floor((lo + hi) / 2)
+      if pm[mid].s <= a then hit = pm[mid] lo = mid + 1 else hi = mid - 1 end
+    end
+    if hit and a < hit.e then sym_hit = sym_hit + 1 return hit.n end
+  end
+  if best and best.p then
+    local nm, off = elf_lookup(best.p, fileoff)
+    if nm then
+      sym_hit = sym_hit + 1
+      return off == 0 and nm or ("%s+0x%x"):format(nm, off)
+    end
+  end
+  return nil
+end
+
+local ucache, ucache_n = {}, 0
+local USCACHE_MAX = 65536
+
 local function usym(pid, a)
+  local c = ucache[pid]
+  local v = c and c[a]
+  if v then return v end
   local m = load_maps(pid)
   local lo, hi, best = 1, #m, nil
   while lo <= hi do
     local mid = math.floor((lo + hi) / 2)
     if m[mid].s <= a then best = m[mid] lo = mid + 1 else hi = mid - 1 end
   end
-  if not best or a >= best.e then return ("[anon+0x%x]"):format(a) end
-  -- 用户态地址 < 2^47，double 精确，可以直接算
-  return ("%s+0x%x"):format(best.n or "[anon]", a - best.s + best.off)
+  local name
+  if not best or a >= best.e then
+    name = (opt.sym and sym_lookup(pid, a, nil, 0)) or ("[anon+0x%x]"):format(a)
+  else
+    -- 用户态地址 < 2^47，double 精确，可以直接算文件偏移
+    local fileoff = a - best.s + best.off
+    name = (opt.sym and sym_lookup(pid, a, best, fileoff))
+        or ("%s+0x%x"):format(best.n or "[anon]", fileoff)
+  end
+  if ucache_n < USCACHE_MAX then             -- 同一叶子地址会反复出现，缓存省掉二分
+    if not c then c = {} ucache[pid] = c end
+    c[a] = name
+    ucache_n = ucache_n + 1
+  end
+  return name
 end
 
 -- 一帧：内核地址走 sym()，用户地址走 usym()；
@@ -978,7 +1167,7 @@ local function run_oncpu()
   for i = 1, math.min(#cl, opt.limit) do ctop[#ctop+1] = cl[i] end
   result.freq, result.events, result.stacks = freq, total, #arr
   result.top, result.comms = top, ctop
-  result.frame_dir = "leaf-first"    -- 渲染器据此决定要不要反转
+  result.frame_dir = "root-first"    -- stack_str(_, true) 已反成 root;...;leaf，叶子在末尾
 end
 
 ------------------------------------------------------------------------
@@ -1137,7 +1326,7 @@ local function run_offcpu()
   result.seeded = seeded
   result.migrated = migrated
   result.top, result.overall = top, hist_json(allh)
-  result.frame_dir = "root-first"    -- 阻塞点(leaf)在末尾，与 oncpu 相反
+  result.frame_dir = "root-first"    -- stack_str(_, true) 反成 root;...;leaf，阻塞点(leaf)在末尾
   result.unit = "ms"                 -- 权重是阻塞时长，不是样本数
 end
 
@@ -1200,12 +1389,14 @@ else fail("未知 mode: "..opt.mode) end
 for _, p in ipairs(probes) do result.probes[#result.probes+1] = p.name end
 cleanup()
 result.lost, result.throttled = stats.lost, stats.throttled
+if opt.sym then result.sym, result.sym_hits = true, sym_hit end
 if stats.lost > 0 or stats.throttled > 0 then
   io.stderr:write(("[trace_engine] 警告：ring 溢出，丢事件 %d 个 / throttle %d 次，" ..
                    "统计偏小；用 --ring-size 调大或收窄探针范围重跑\n"):format(stats.lost, stats.throttled))
 end
 
--- --flame：采完直接出 PNG（折叠栈是叶子在前的文本，非 root 时 python 侧反转折根）
+-- --flame：采完直接出图。后缀 .svg -> 可交互火焰图（悬停/点击缩放，无依赖）；
+-- 其他后缀 -> PIL 位图 PNG。反转与否由 JSON 的 frame_dir 决定，python 侧统一处理。
 if opt.flame and (opt.mode == "oncpu" or opt.mode == "folded" or opt.mode == "offcpu") then
   local self = arg[0] or "src/engine.lua"
   local dir = self:match("^(.*)/[^/]*$") or "."
@@ -1228,7 +1419,9 @@ if opt.flame and (opt.mode == "oncpu" or opt.mode == "folded" or opt.mode == "of
   local cmd = ("%spython3 %q %q %q %q"):format(pre, fp, tmp, opt.flame, t)
   local ok = os.execute(cmd)
   os.remove(tmp)
-  io.stderr:write(("[trace_engine] 火焰图 -> %s %s\n"):format(opt.flame, ok == 0 and "" or "(渲染失败)"))
+  local kind = opt.flame:lower():match("%.svg$") and "SVG(可交互)" or "PNG"
+  io.stderr:write(("[trace_engine] 火焰图 %s -> %s %s\n"):format(kind, opt.flame,
+                   ok == 0 and "" or "(渲染失败)"))
 end
 
 if opt.json then

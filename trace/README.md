@@ -77,23 +77,31 @@ sudo luajit src/engine.lua --mode folded  --probe kprobe:do_sys_openat2 --limit 
 | `--ring-size` | ring data 页数，默认 8（32KB/CPU）；高频探针必须调大 |
 | `--limit` | 样本输出条数上限，默认 8 |
 | `--json` | JSON 输出 |
-| `--flame PNG` | oncpu/folded 采完直接渲染火焰图，见下 |
+| `--flame FILE` | oncpu/offcpu/folded 采完直接出火焰图：`.svg` 可交互（悬停/点击缩放），其他后缀走 PIL 出 PNG，见下 |
 
 ## 火焰图（`--flame`）
 
-`tools/flame.py` 纯 PIL 渲染，不依赖 Chrome/brendangregg 脚本：
+`tools/flame.py` 双后端、零 Chrome、零 brendangregg 脚本：
+
+- `--flame x.svg` → **可交互 SVG**（首选，只需标准库）：悬停任意框看样本数与占比，点击框放大到该子树，
+  点空白退回全图；同一份文件里还内嵌了静态 rect，丢进没有 JS 的查看器（Inkscape/rsvg）照样能看。
+- `--flame x.png` → PIL 位图（需要 PIL，纯 pip --user 装即可；root 跑时会 `sudo -u $SUDO_USER` 回落渲染）。
 
 ```bash
-# 盯住某个进程的 CPU 热点（pid 全线程），顺便出图
+# 盯住某个进程的 CPU 热点（pid 全线程），顺便出可交互图
 sudo luajit src/engine.lua --mode oncpu --freq 199 --duration 5 --limit 40 \
-     --pid $(pgrep -f 'make|gcc' | head -1) --flame /tmp/oncpu.png
-# 折叠栈也能直接出图
-sudo luajit src/engine.lua --mode folded --probe kprobe:vfs_read --duration 3 --flame /tmp/vfs.png
+     --pid $(pgrep -f 'make|gcc' | head -1) --flame /tmp/oncpu.svg
+# 折叠栈、off-CPU 同样能出（off-CPU 的框宽=阻塞时长）
+sudo luajit src/engine.lua --mode folded --probe kprobe:vfs_read --duration 3 --flame /tmp/vfs.svg
+sudo luajit src/engine.lua --mode offcpu --pid $(pgrep -f nginx | head -1) --duration 5 --flame /tmp/block.svg
+# 要位图汇报材料就换 .png 后缀
+sudo luajit src/engine.lua --mode oncpu --pid $$ --duration 3 --flame /tmp/oncpu.png
 ```
 
 要点：
 
-- **方向**：内核给的是「叶子在前」，`flame.py` 反转折根，根在下、热点在顶。
+- **方向**：内核给的是「叶子在前」，出栈时已反成 `root;…;leaf`（JSON 的 `frame_dir` 标明方向），
+  `flame.py` 据此归一，根在下、热点在顶，两种模式都不会画反。
 - **折叠重复帧**：unwind 在不靠谱的栈帧上会扫出几十层同一地址，连续同址压成一帧并在副标题记数量。
 - **用户态裸地址**：kprobe 只符号化内核栈，用户态一截是 `0x00007ef8…`，ASLR 下每条都不同——直接展开会炸成上万节点，
   因此统一归并成 `[user-addr]` 占位帧（纯 ASCII，mono 字体没有 CJK 字形），保留栈深度但不保留区分度。
