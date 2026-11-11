@@ -71,14 +71,12 @@ grep -E '^CONFIG_(ATA|SATA_AHCI|SCSI|BLK_DEV_SD|MD|BLK_DEV_DM|DM_CRYPT|EXT4_FS|D
 |---|---|---|
 | `config-baseline-2026-11-11` | **基线**：发行版原版，184 K | 裁剪起点，也是回退终点 |
 | `trim-conservative.fragment` / `trim-fast.fragment` | **fragment**：只写要改的开关 | 配合 `scripts/config` 应用，可审计 |
-| `config-round{2..5}-*.ok` | **每轮快照**（`.ok` = 该轮验收过） | 出问题回退到上一轮 |
-| `config-round6-hw-real` | 轮5 + 修复 439 项（事故补救版） | 事故后重建 |
-| `config-7.2.12-20261111-hwreal` | **当前装机版**（round6 + `LOCALVERSION`） | 编译此文件即得在跑的内核 |
+| `config-7.2.12-20261111-hwreal` | **当前装机版**（round6 + `LOCALVERSION` + `SOUND/SND` 全开），与 `.config` md5 一致 | 编译此文件即得在跑的内核 |
 
 > **改 config 的正确姿势**：不要把 `.config` 当源码手改。写 fragment →
 > `scripts/config --file .config -e XXX -d YYY` → `make olddefconfig` →
-> 立刻 `cp .config configs/config-roundN-<描述>`。
-> `.config` 是产物，`configs/` 里的快照才是资产。
+> 立刻 `cp .config configs/config-<version>`（覆盖同名，不建 `current` 之类的别名）。
+> `.config` 是产物，`configs/` 里的快照才是资产；一个内核版本只留一份。
 
 ---
 
@@ -217,18 +215,134 @@ sudo update-grub     # 菜单自动清理，`grep -c hwreal.prev /boot/grub/grub
 
 ---
 
+## 4.6 补回音频：三个坑，一个比一个阴
+
+裁剪把 `SOUND` 整个子系统当成"桌面功能"砍掉了。`.config` 里只剩一行：
+
+```
+# CONFIG_SOUND is not set
+```
+
+后果：**38 个 snd 模块一个都不编**，`/dev/snd` 不存在，`aplay -l` 报 no soundcards，
+而 `lspci` 里声卡明明在（`[1022:1487]` 板载 + `[10de:1aef]` 显卡 HDMI）。
+看起来像 codec 问题，实际是内核里根本没有 ALSA。
+
+补法（全模块，别往 vmlinux 里塞）：
+
+```bash
+cd ~/kernel/src/linux-7.2.12
+scripts/config --file .config \
+  -e SND -e SND_PCI -m SND_HDA_INTEL \
+  -m SND_HDA_CODEC_REALTEK -m SND_HDA_CODEC_HDMI \
+  -m SND_USB_AUDIO -m SND_SEQUENCER
+# SOUND 是 SND 的父依赖，olddefconfig 会自己补 =m；确认后再编
+make olddefconfig
+grep -E '^CONFIG_(SOUND|SND)=' .config
+```
+
+### 坑 1：`CONFIG_ACPI_NHLT` 是 bool —— 只编模块必然失败
+
+`SND_INTEL_DSP_CONFIG` 会 **无条件 `select ACPI_NHLT`**，而 `sound/hda/core/intel-dsp-config.c`
+调用 `acpi_nhlt_get_gbl_table()` 等函数**没有 `#ifdef` 兜底**。`ACPI_NHLT` 是 bool，只能进 vmlinux。
+
+所以"只 `make modules` 装新 snd 模块"这条路走不通：
+
+```
+snd_hda_intel: Unknown symbol acpi_nhlt_get_gbl_table (err -2)
+```
+
+**必须整编 vmlinux**（`make -j6`，不是 `make modules`），让 `acpi_nhlt_*` 进镜像。
+好消息是 `CONFIG_ACPI_NHLT=y` 在基线和裁剪后都还是 `y`，不用改开关，只是别指望增量编模块蒙混过去。
+
+> 同一个坑附带修好了 `sunrpc.ko` 的 `tls_handshake_*` unknown symbol
+> （`CONFIG_NET_HANDSHAKE=y` 之前也没真进 vmlinux）。
+
+### 坑 2：`modprobe` 的 install 钩子，报错信息完全误导
+
+`/etc/modprobe.d/alsa-base.conf` 里有一条：
+
+```
+install snd /sbin/modprobe --use-blacklist snd-seq; /sbin/modprobe --ignore-install snd $CMDLINE_OPTS
+```
+
+`snd-seq` 不存在时这条 install 规则 **返回 rc=1**，`snd_hda_intel` 的依赖链断在第一步，
+`insmod` 失败但报的是 `Invalid argument`——去查 codec、查 `model=` 参数、查 BIOS 全是白费。
+
+判据：`modprobe -v snd_hda_intel` 打印到 `install /sbin/modprobe --use-blacklist snd-seq ...` 就停住
+→ 缺 `CONFIG_SND_SEQUENCER`。补上 `snd-seq` 即可，**不用改 alsa-base.conf**。
+（链中间的 `snd-ioctl32` 缺失不致命，那条是 `;` 分隔，失败不影响后面。）
+
+### 坑 3：无音频的快照会让音频静默消失
+
+任何写着 `# CONFIG_SOUND is not set` 的快照，拿去铺 `.config` 就是重演一遍静默丢声，
+而且因为坑 1，等你发现时又得整编一次。
+
+所以 `configs/` 里只留两份：`config-baseline-2026-11-11`（回退用）和
+`config-7.2.12-20261111-hwreal`（装机用，与 `src/linux-7.2.12/.config` md5 一致）。
+改完 config 直接覆盖同名文件，不留中间态、不留 `current` 这种会过期的别名。
+
+### 装完怎么验（重启前就能查）
+
+```bash
+V=7.2.12-20261111-hwreal
+ls /lib/modules/$V/kernel/sound/core/snd.ko*           # 存在
+grep -c '^CONFIG_SND.*=m' /boot/config-$V              # 38
+nm vmlinux | grep -w acpi_nhlt_get_gbl_table           # 在 vmlinux，不在 .ko
+sudo depmod -a $V 2>&1 | grep -c 'unknown symbol'      # 0
+```
+
+重启后：`ls /dev/snd`、`aplay -l` 应列出 ALC1220（analog）与 NVIDIA HDMI 两张卡。
+若仍无声，先查用户层默认设备（`pactl info | grep 'Default Sink'`），再查 `snd-hda-intel model=`。
+
+---
+
 ## 5. DKMS（nvidia 闭源驱动）
 
 新内核串意味着 nvidia 模块需要**为新内核重编**，否则进桌面是黑屏 / 软件渲染。
 
-```bash
-V=7.2.12-20261111-hwreal
-sudo dkms autoinstall -k $V
-dkms status | grep $V
-# 期望：nvidia/595.99.02, $V: installed
-#       gpu-unlock/1.0.0, $V: installed
-# v4l2loopback 报 BUILD_EXCLUSIVE 不匹配 → 正常跳过，不是错误
+### 不要用 `dkms autoinstall`
+
+`LOCALVERSION` 不变时，DKMS 拿**内核版本串**当 key，认为"这个内核已经构建过"→ 直接跳过，
+`/lib/modules/$V/updates/dkms/*.ko` 还是上一版编的。因为 vermagic 相同、`module_layout`
+的 CRC 也常常相同，模块能"半个"加载进去，只在个别符号上报：
+
 ```
+nvidia: disagrees about version of symbol fget
+nvidia: Unknown symbol fget (err -22)
+```
+
+看起来像驱动坏了，实际是没重编。本次实测 nvidia.ko 有 5 个符号 CRC 不一致
+（fget / fd_install / iterate_fd / wake_up_process / dev_driver_string），`gpu_unlock` 2 个。
+
+### 强制同步：`tools/kernel/sync-drivers.sh`
+
+```bash
+tools/kernel/sync-drivers.sh --check      # 只体检，逐符号比对 CRC，不改任何东西
+tools/kernel/sync-drivers.sh             # dkms build/install --force + 校验 + 重打 initrd
+```
+
+它做四件事：`dkms build/install --force`（绕开跳过逻辑）→ 用源码树 `Module.symvers`
+逐符号验 CRC → 校验不过就中止（不重打 initrd）→ `update-initramfs -u`。
+`nv*` / `nvKms*` 这类模块间互供的符号不算缺失，脚本已排除。
+
+### 已经自动化：`make install` 里挂了钩子
+
+`arch/x86/boot/install.sh` 末尾加了本地补丁（原版备份为 `install.sh.orig`），
+`sudo make install` 收尾时自动调 `sync-drivers.sh -k $1`，**每次重编内核都会强制重装显卡驱动**，
+失败会打印 `警告：显卡驱动同步失败，重启会丢显卡`。临时跳过：
+
+```bash
+LITE_SKIP_DRIVER_SYNC=1 sudo make install
+```
+
+注意顺序：钩子依赖 `/lib/modules/$V/build` 软链，那是 `make modules_install` 建的。
+**必须先 `modules_install` 再 `install`**。一条命令做完全套（含改版前自动备份）：
+
+```bash
+tools/kernel/build-install.sh          # make -j → modules_install → install → 强制同步 → update-grub
+```
+
+`v4l2loopback` 因 `BUILD_EXCLUSIVE` 不为本内核构建 → 正常跳过，不是错误。
 
 `/lib/modules/$V/build` 必须指向源码树（`make modules_install` 已建软链）：
 
@@ -295,11 +409,14 @@ sudo grep -n 'set default=' /boot/grub/grub.cfg | head -2   # 确认落到 grub.
 sudo cp /etc/default/grub.bak-20261111 /etc/default/grub && sudo update-grub
 ```
 
-裁 config 出错回退到上一轮快照（这就是 `.ok` 后缀的意义）：
+裁 config 出错回退到**基线**（发行版原版，是唯一保证能启动的 config）：
 
 ```bash
-cp ~/kernel/configs/config-round5-7m53s.ok ~/kernel/src/linux-7.2.12/.config
+cp ~/kernel/configs/config-baseline-2026-11-11 ~/kernel/src/linux-7.2.12/.config
+cd ~/kernel/src/linux-7.2.12 && make olddefconfig
 ```
+
+想回到"能用的裁剪态"就编 `config-7.2.12-20261111-hwreal`，别退到中间轮次。
 
 ---
 
@@ -328,9 +445,10 @@ V=7.2.12-20261111-hwreal
 cd ~/kernel/src/linux-7.2.12
 cp ~/kernel/configs/config-7.2.12-20261111-hwreal .config
 make olddefconfig
-make -j6 && sudo make -j6 install && sudo make modules_install
-sudo dkms autoinstall -k $V
-sudo mkinitramfs -o /boot/initrd.img-$V $V
+# 顺序：modules_install 必须在 install 之前（DKMS 靠 /lib/modules/$V/build 软链找源码）
+make -j6 && sudo make -j6 modules_install && sudo make install
+# install 的钩子已强制重建显卡驱动；想显式确认再跑一次 --check：
+tools/kernel/sync-drivers.sh --check
 sudo update-grub
 echo "装完。重启前先跑 §6 的 grub 默认项检查。"
 ```

@@ -150,7 +150,7 @@ find drivers -name '*.o' -printf '%h\n' | awk -F/ 'NF>=3{print $1"/"$2"/"$3} NF=
 | 轮4 | 9m18s | 5141 | 733 | 50M | 9.8M | 1794 | 719 |
 | **轮5** | **7m53s** | **4584** | **656** | **48M** | **9.0M** | **1710** | **644** |
 
-5 轮共砍 **49% 的编译单元 / 61% 的时间**。配置与日志：`configs/config-round5-7m53s.ok`、`logs/round5-*.log`。
+5 轮共砍 **49% 的编译单元 / 61% 的时间**。账本在 `logs/round{2..5}-*.{log,txt}`，数字以日志为准。
 
 **复现校验（同配置再跑一遍 `clean-build.sh`）**：7分29秒 / 4584 单元 / 656 `.ko` / 48M vmlinux / 9.0M bzImage / warning 3，
 随后 `verify-boot.sh` → `EXT4-MOUNT-OK` PASS。**单元数、`.ko` 数、两个镜像尺寸全部逐项相同**，
@@ -176,11 +176,16 @@ find drivers -name '*.o' -printf '%h\n' | awk -F/ 'NF>=3{print $1"/"$2"/"$3} NF=
 
 ## 四、砍不动的边界（补充新踩的坑）
 
-原表那 6 条（`NR_CPUS` / `PREEMPT_RT` / `DEBUG_SPINLOCK` / `SMP` / `LOCKDEP` / `MEMCG`）依然成立。新增两条：
+原表那 6 条（`NR_CPUS` / `PREEMPT_RT` / `DEBUG_SPINLOCK` / `SMP` / `LOCKDEP` / `MEMCG`）依然成立。新增三条：
 
 - **`DEVTMPFS` 不能砍成 n**：没有它 `/dev` 空白，所有 block 设备访问全废。`DEVTMPFS_MOUNT` 可以留着。
 - **`VIRTIO_PCI` 不能砍**：QEMU 里所有 virtio 设备走它。砍了会出现"virtio_blk 符号在、设备不注册"的假象——
   `nm vmlinux` 查 `virtio_blk_init` 存在并不等于能用，**必须走一次真实挂载**。
+- **`SOUND` / `SND` 不能整块砍**：声卡在 `lspci` 里、驱动缺失时**不报任何错**，只是 `/dev/snd` 不存在。
+  更阴的是补回来也不便宜：`SND_INTEL_DSP_CONFIG` 无条件 `select ACPI_NHLT`（bool，只能进 vmlinux），
+  所以"只编模块"必然 `Unknown symbol acpi_nhlt_get_gbl_table`，得整编 vmlinux。
+  外加 `alsa-base.conf` 的 `install snd` 钩子依赖 `snd-seq`，缺了报的是误导性的 `Invalid argument`。
+  完整流程与三个坑见 **build.md §4.6**。
 
 另有一条判据：**`=m` 的模块同样消耗编译时间**。轮2 之前有 1780 个 `=m`，编译成 `.ko` 一样要编一次编译单元。
 所以"砍时间"的正确做法是把 `=m` 直接 `--disable`，而不是留 `=m` 以为省了——省的是链接和安装，不是编译。
@@ -198,9 +203,12 @@ find drivers -name '*.o' -printf '%h\n' | awk -F/ 'NF>=3{print $1"/"$2"/"$3} NF=
 ## 六、复现（两条命令）
 
 ```bash
-tools/trim/clean-build.sh configs/config-round5-7m53s.ok 6   # 清场+计时+记账
-tools/trim/verify-boot.sh                                     # QEMU 真启动+ext4 挂载断言
+tools/trim/clean-build.sh configs/config-baseline-2026-11-11 6   # 基线：20m05s 起点
+tools/trim/clean-build.sh configs/config-7.2.12-20261111-hwreal 6 # 装机版：实际在跑的那份
+tools/trim/verify-boot.sh                                        # QEMU 真启动+ext4 挂载断言
 ```
+
+重走某一轮：以 `config-baseline-2026-11-11` 为起点，按 `logs/round{N}-summary.txt` 的开关清单逐条重放。
 
 两步都绿，才算这一轮成立。单看第一步会漏掉"能编不能启动"，单看第二步会漏掉"时间没变"。
 
@@ -312,7 +320,7 @@ MODULES IO_URING                             # nvidia DKMS 需要 MODULES
 |---|---|
 | 全量编译 + 装机 | PASS，7m53s，已设为 GRUB 默认 |
 | 二次改动补 6 项（squashfs/xz、vfat、fat、fuse、ipv6） | PASS，增量 274 s，覆盖安装 |
-| 当前 config | `configs/config-7.2.12-20261111-hwreal`，`=y 2175 / =m 645`，659 个 `.ko` |
+| 当前 config | `configs/config-7.2.12-20261111-hwreal`，`=y 2200 / =m 701`，701 个 `.ko`（含音频） |
 | 旧 `.prev` 备份 | 已清理，释放 441 M |
 
 **唯一未完成的一项**：新内核尚未重启验证（§4.5 的八项验收跑在重启之后）。

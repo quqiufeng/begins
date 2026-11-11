@@ -10,7 +10,7 @@
 | 网卡 | `[10ec:8168]` RTL8168 | `r8169` |
 | SATA | `[1022:43c8] [1022:7901]` | `ahci` + `libata` |
 | USB | `[1022:43d5] [1022:149c]` | `xhci_hcd` |
-| 声卡 | `[1022:1487]` HD Audio | `snd_hda_intel` |
+| 声卡 | `[1022:1487]` HD Audio | `snd_hda_intel` + `snd_hda_codec_realtek`（**曾被整块裁掉，见 build.md §4.6**） |
 
 ## ⚠️ 关于 `.config` 的一个纠正
 

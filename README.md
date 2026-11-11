@@ -43,6 +43,8 @@ P0 的验收标准就是能日常用：进桌面、nvidia 驱动起来、网络�
 ```
 L3  桌面（现成）              ← 现在用的
 L2  Linux 驱动（原样编入）     ← 复用，不改
+```
+
 ## 环境事实（与索引/构建精确对应）
 
 | 项 | 路径 |
@@ -138,7 +140,8 @@ sudo update-grub
 **已实测跑通五轮：全新构建 20m05s → 7m53s，编译单元 9000 → 4584。** 方法与账本在 `docs/trim.md` 第 82 行起（含真清场、记账口径、QEMU 验证的三个坑）。复现两条命令：
 
 ```bash
-tools/trim/clean-build.sh configs/config-round5-7m53s.ok 6
+tools/trim/clean-build.sh configs/config-baseline-2026-11-11 6      # 基线 20m05s
+tools/trim/clean-build.sh configs/config-7.2.12-20261111-hwreal 6   # 装机版（在跑的）
 tools/trim/verify-boot.sh
 ```
 

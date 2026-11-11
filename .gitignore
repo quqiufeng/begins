@@ -19,3 +19,8 @@ notes/.cache/
 notes/hw.json
 notes/adapt-plan.json
 notes/adapt-*.config
+
+# KBUILD_OUTPUT 生成的壳 Makefile，含绝对路径
+build/out/
+# 19M 二进制，从 artifacts 取即可
+build/bzImage-*
