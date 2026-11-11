@@ -186,8 +186,13 @@ end
 local all_rings = {}
 local function cleanup()
   for _, r in ipairs(all_rings) do        -- 先放掉 ring 引用，否则删探针 EIO
-    pcall(function() ffi.C.close(r.fd) end)
-    pcall(function() ffi.C.munmap(r.bp, r.mmap_len or PAGE*(1+RING_PAGES)) end)
+    -- ring_close 已经收过的绝不能再 munmap：那段虚拟内存可能已被 malloc 复用，
+    -- 二次 munmap 会连 LuaJIT 自己的堆一起卸掉，表现为退出时在 GC 里随机段错误。
+    if not r.closed then
+      r.closed = true
+      pcall(function() ffi.C.close(r.fd) end)
+      pcall(function() ffi.C.munmap(r.bp, r.mmap_len or PAGE*(1+RING_PAGES)) end)
+    end
   end
   all_rings = {}
   for _, spec in ipairs({ {"/kprobe_events", "kprobes"}, {"/uprobe_events", "uprobes"} }) do
@@ -545,6 +550,7 @@ do
     elseif a == "--freq"     then opt.freq = tonumber(val())
     elseif a == "--event"    then opt.event = val()
     elseif a == "--ring-size" then RING_PAGES = math.max(1, math.min(1024, tonumber(val()) or 8))
+    elseif a == "--flame"    then opt.flame = val()
     elseif a == "--json"     then opt.json = true
     else io.stderr:write("未知参数: "..tostring(a).."\n") os.exit(2) end
     i = i + 1
@@ -972,6 +978,7 @@ local function run_oncpu()
   for i = 1, math.min(#cl, opt.limit) do ctop[#ctop+1] = cl[i] end
   result.freq, result.events, result.stacks = freq, total, #arr
   result.top, result.comms = top, ctop
+  result.frame_dir = "leaf-first"    -- 渲染器据此决定要不要反转
 end
 
 ------------------------------------------------------------------------
@@ -1130,6 +1137,8 @@ local function run_offcpu()
   result.seeded = seeded
   result.migrated = migrated
   result.top, result.overall = top, hist_json(allh)
+  result.frame_dir = "root-first"    -- 阻塞点(leaf)在末尾，与 oncpu 相反
+  result.unit = "ms"                 -- 权重是阻塞时长，不是样本数
 end
 
 local function run_folded()
@@ -1174,6 +1183,7 @@ local function run_folded()
   for i = 1, math.min(#arr, opt.limit) do top[#top+1] = arr[i] end
   result.events, result.folded = total, top
   result.stacks = #arr
+  result.frame_dir = "leaf-first"
 end
 
 ------------------------------------------------------------------------
@@ -1193,6 +1203,32 @@ result.lost, result.throttled = stats.lost, stats.throttled
 if stats.lost > 0 or stats.throttled > 0 then
   io.stderr:write(("[trace_engine] 警告：ring 溢出，丢事件 %d 个 / throttle %d 次，" ..
                    "统计偏小；用 --ring-size 调大或收窄探针范围重跑\n"):format(stats.lost, stats.throttled))
+end
+
+-- --flame：采完直接出 PNG（折叠栈是叶子在前的文本，非 root 时 python 侧反转折根）
+if opt.flame and (opt.mode == "oncpu" or opt.mode == "folded" or opt.mode == "offcpu") then
+  local self = arg[0] or "src/engine.lua"
+  local dir = self:match("^(.*)/[^/]*$") or "."
+  local fp
+  for _, c in ipairs({ dir.."/tools/flame.py", dir.."/../tools/flame.py", "tools/flame.py" }) do
+    if io.open(c) then fp = c break end
+  end
+  if not fp then fail("找不到 tools/flame.py") end
+  local tmp = os.tmpname()
+  local f = io.open(tmp, "w") f:write(require("cjson").encode(result)) f:close()
+  os.execute(("chmod 644 %q"):format(tmp))   -- 渲染以调用者身份跑，得让它读得到
+  local label = ({ oncpu = "on-CPU", offcpu = "off-CPU 阻塞时长", folded = "折叠栈" })[opt.mode] or opt.mode
+  local rate = result.freq and ("@"..result.freq.."Hz") or (result.unit == "ms" and "@阻塞时长" or "")
+  local t = ("%s · %s · %ds %s%s"):format(label,
+    os.date("%m-%d %H:%M"), opt.duration, rate,
+    opt.pid and (" · pid "..opt.pid) or "")
+  -- PIL 通常是 pip --user 装的，root 的 site-packages 里没有；渲染要回到调用者身份
+  local su = os.getenv("SUDO_USER")
+  local pre = (su and su ~= "") and ("sudo -n -u "..su.." -H ") or ""
+  local cmd = ("%spython3 %q %q %q %q"):format(pre, fp, tmp, opt.flame, t)
+  local ok = os.execute(cmd)
+  os.remove(tmp)
+  io.stderr:write(("[trace_engine] 火焰图 -> %s %s\n"):format(opt.flame, ok == 0 and "" or "(渲染失败)"))
 end
 
 if opt.json then

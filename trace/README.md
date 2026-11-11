@@ -66,7 +66,7 @@ sudo luajit src/engine.lua --mode folded  --probe kprobe:do_sys_openat2 --limit 
 
 | 参数 | 说明 |
 |---|---|
-| `--mode` | `count`（默认）/ `samples` / `latency` / `folded` |
+| `--mode` | `count`（默认）/ `samples` / `latency` / `folded` / `oncpu` / `offcpu` |
 | `--probe` | 探针规格，**可重复**；samples/folded 每个探针 × 每个 CPU 都建 ring |
 | `--entry` `--exit` | latency 模式的进入/退出探针 |
 | `--arg` | 附加到探针定义的 fetchargs 字符串（拼进 `argstr`） |
@@ -77,6 +77,29 @@ sudo luajit src/engine.lua --mode folded  --probe kprobe:do_sys_openat2 --limit 
 | `--ring-size` | ring data 页数，默认 8（32KB/CPU）；高频探针必须调大 |
 | `--limit` | 样本输出条数上限，默认 8 |
 | `--json` | JSON 输出 |
+| `--flame PNG` | oncpu/folded 采完直接渲染火焰图，见下 |
+
+## 火焰图（`--flame`）
+
+`tools/flame.py` 纯 PIL 渲染，不依赖 Chrome/brendangregg 脚本：
+
+```bash
+# 盯住某个进程的 CPU 热点（pid 全线程），顺便出图
+sudo luajit src/engine.lua --mode oncpu --freq 199 --duration 5 --limit 40 \
+     --pid $(pgrep -f 'make|gcc' | head -1) --flame /tmp/oncpu.png
+# 折叠栈也能直接出图
+sudo luajit src/engine.lua --mode folded --probe kprobe:vfs_read --duration 3 --flame /tmp/vfs.png
+```
+
+要点：
+
+- **方向**：内核给的是「叶子在前」，`flame.py` 反转折根，根在下、热点在顶。
+- **折叠重复帧**：unwind 在不靠谱的栈帧上会扫出几十层同一地址，连续同址压成一帧并在副标题记数量。
+- **用户态裸地址**：kprobe 只符号化内核栈，用户态一截是 `0x00007ef8…`，ASLR 下每条都不同——直接展开会炸成上万节点，
+  因此统一归并成 `[user-addr]` 占位帧（纯 ASCII，mono 字体没有 CJK 字形），保留栈深度但不保留区分度。
+- **暖/冷色**：含偏移的裸地址/内核符号暖色，`libc.so.6` 这类用户态冷色。
+- **PIL 权限**：pip `--user` 装的 PIL 在 root 的 site-packages 里没有，引擎按 `$SUDO_USER` 切回调用者身份跑渲染，临时 JSON 也 chmod 644。
+- **高度自适应**：`ROW=17`，图高 = 头 + 最深栈层数；过窄（<0.7px）的框省略并在页脚计数。
 
 ## 当前状态（实测，2026-11-11 14:29）
 
@@ -91,6 +114,9 @@ sudo luajit src/engine.lua --mode folded  --probe kprobe:do_sys_openat2 --limit 
 | `folded` | **可用** | `events=291 stacks=60`，内核栈已符号化 |
 | `uprobe` | **可用，支持符号名** | `uprobe:/tmp/t:target_fn` 自动算出文件偏移 0x1106，1.4M/s，与手工 `:0x1106` 一致 |
 | `--pid` | **可用** | 目标 `python3` 刷 `getpid`：count 5.4M/s 落在单核，samples 只出该 pid |
+| `oncpu` | **可用** | 全机 3s@99Hz：`样本=1591 栈种类=219`，comm 分布 `python3=1594 luajit=97 chrome=12…`；`--pid` 时 59 样本全落在目标 python3 |
+| `offcpu` | **可用** | `--pid` 后台 bash：`events=1035 配对=3 阻塞=3 未回切=1`，瓶颈栈落到 `do_wait→__do_sys_wait4→…→bash` |
+| `--flame PNG` | **可用** | oncpu/offcpu/folded 三种模式直出火焰图，见上节 |
 
 ### 已修的问题（早期 README 的「进 ring 就读不到样本」已不成立）
 
@@ -124,6 +150,17 @@ sudo luajit src/engine.lua --mode folded  --probe kprobe:do_sys_openat2 --limit 
    引擎自己解析 ELF（symtab/dynsym + PT_LOAD 换 vaddr→文件偏移），`uprobe:/路径:符号` 可用。
 15. **杂项**：decode 过滤 `common_type/flags/preempt_count/pid` 噪音列；`read_cstr` 256→4096；
    comm 缓存封顶 4096 条；samples 里 u64 指针不再打成 `1.84e+19`。
+
+### 三轮（2026-11-11 15:37）：火焰图 + 一处稳定性
+
+16. **退出时段错误**：`cleanup()` 对 `all_rings` 里每个 ring 无条件 `munmap`，但 `ring_close` 已经收过的也在表里；
+    二次 `munmap` 可能卸载已被 malloc 复用的地址（连 LuaJIT 堆一起），表现为偶发 SIGSEGV。加 `r.closed` 哨兵。
+17. **`frame_dir` 显式化**：oncpu/folded 的折叠栈是**叶子在前**，offcpu 是**根在前**，渲染器不能猜。
+    JSON 里加 `frame_dir` 字段，`offcpu` 另加 `unit:"ms"`（权重是阻塞时长而非样本数，但条目同样带 `count`，
+    只能靠 `unit` 区分）。
+18. **`--pid` 出一堆 0 样本（假警报）**：一度怀疑 perf 的 pid 过滤失效，实测是测试脚本 `$!` 抓到的是
+    bash 包装进程（`STAT S`），真忙的 python 在子进程里；直接 trace 那个 pid 立刻出 59 个样本、全部命中。
+    **结论：不是 bug**，只是目标选错了——排查 perf 类问题时先 `ps -o stat,pcpu` 确认目标是 `R` 且在跑。
 
 ### 已知限制
 
