@@ -67,17 +67,21 @@ sudo luajit src/engine.lua --mode folded  --probe kprobe:do_sys_openat2 --limit 
 | 参数 | 说明 |
 |---|---|
 | `--mode` | `count`（默认）/ `samples` / `latency` / `folded` |
-| `--probe` | 探针规格，**可重复**（但 samples 只给 `probes[1]` 建 ring，多给只采第一个） |
+| `--probe` | 探针规格，**可重复**；samples/folded 每个探针 × 每个 CPU 都建 ring |
 | `--entry` `--exit` | latency 模式的进入/退出探针 |
 | `--arg` | 附加到探针定义的 fetchargs 字符串（拼进 `argstr`） |
 | `--key` | 聚合键，默认 `comm` |
 | `--str` | 指定要按字符串解的字段名 |
-| `--pid` | 只跟某个 pid（count 模式走 `perf_open(id, pid, -1)`） |
-| `--duration` | 秒，默认 2 |
+| `--pid` | 只跟某个进程：四模式全生效，走 `pid>0 + 每 CPU` 覆盖该进程**全部线程** |
+| `--duration` | 秒，默认 2，支持小数；`CLOCK_MONOTONIC` 计时，不受改系统时间影响 |
+| `--ring-size` | ring data 页数，默认 8（32KB/CPU）；高频探针必须调大 |
 | `--limit` | 样本输出条数上限，默认 8 |
 | `--json` | JSON 输出 |
 
-## 当前状态（实测，2026-11-11 14:20）
+## 当前状态（实测，2026-11-11 14:29）
+
+> 轮询已从忙等改为 `poll()` 睡在 ring fd 上（不再吃满一个核），并如实统计 ring 溢出：
+> `events=787387（丢失 516 ...）`，不再把丢事件报成精确值。
 
 | 模式 | 状态 | 证据 |
 |---|---|---|
@@ -85,7 +89,8 @@ sudo luajit src/engine.lua --mode folded  --probe kprobe:do_sys_openat2 --limit 
 | `samples` | **可用** | `events=214`，字段全解出（含 `__data_loc` 串、`--str` 跨进程读串） |
 | `latency` | **可用** | `events=569 paired=268 unpaired=19`，按 comm 出 avg/p50/p99/max |
 | `folded` | **可用** | `events=291 stacks=60`，内核栈已符号化 |
-| `uprobe` | **可用** | `uprobe:/tmp/t:0x1129 34.4k 次 / 3s (11466/s)` |
+| `uprobe` | **可用，支持符号名** | `uprobe:/tmp/t:target_fn` 自动算出文件偏移 0x1106，1.4M/s，与手工 `:0x1106` 一致 |
+| `--pid` | **可用** | 目标 `python3` 刷 `getpid`：count 5.4M/s 落在单核，samples 只出该 pid |
 
 ### 已修的问题（早期 README 的「进 ring 就读不到样本」已不成立）
 
@@ -103,12 +108,28 @@ sudo luajit src/engine.lua --mode folded  --probe kprobe:do_sys_openat2 --limit 
    （后续注册全 `EBUSY`）。补了启动自清、SIGTERM/SIGINT 置标志优雅退出、`cleanup` 前先
    `close`+`munmap` ring（否则删探针 `EIO`）。
 
+### 二轮修复（2026-11-11 14:29）
+
+7. **`--pid` 三个模式失效**：samples/latency/folded 硬编码 `open_ring(...,-1,...)`，`--pid` 被无视；
+   count 又用 `pid + cpu=-1`，只挂单线程。统一改成 `pid or -1` + 每 CPU，覆盖整进程线程。
+8. **丢事件无感知**：`walk()` 只认 `SAMPLE(9)`，`LOST(2)`/`THROTTLE(5)` 被静默跳过。
+   现在统计 `lost`/`throttled`，输出带「（丢失 N ...）」并在 stderr 告警，JSON 里也有字段。
+9. **忙等烧 CPU**：`repeat ... until os.time() > deadline` 空转。改成 `poll(rings, ≤100ms)`
+   + `CLOCK_MONOTONIC` deadline，顺带支持 `--duration 0.5` 亚秒。
+10. **ring 尺寸写死**：`DP=8` 不可调，高频探针必丢。加 `--ring-size`，页数 1..1024。
+11. **`data_offset` 硬编码**：`r.d = bp + PAGE`。改为按 header 的 1040/1048 读，并对越界兜底。
+12. **多探针只采第一个**：samples/folded 用 `probes[1]` 建 ring，其余静默丢弃。改为全建。
+13. **latency 残留 entry**：有 entry 无 exit 的样本既不配对也不计 unpaired。现在计入 unpaired。
+14. **uprobe 符号名必失败**：本机内核 `uprobe_events` 只认文件偏移（写 `:malloc` 直接 EIO）。
+   引擎自己解析 ELF（symtab/dynsym + PT_LOAD 换 vaddr→文件偏移），`uprobe:/路径:符号` 可用。
+15. **杂项**：decode 过滤 `common_type/flags/preempt_count/pid` 噪音列；`read_cstr` 256→4096；
+   comm 缓存封顶 4096 条；samples 里 u64 指针不再打成 `1.84e+19`。
+
 ### 已知限制
 
-- **uprobe 不支持符号名**：`uprobe:/lib/.../libc.so.6:malloc` 报 `EIO`（内核侧不认），
-  要用 `nm` 拿偏移再写 `uprobe:文件:0x偏移`；`malloc`/`getpid` 在 glibc 里是 IFUNC，本身无实体地址。
-- `walk()` 用硬编码 `r.d = bp + PAGE`，而 header 的 `data_offset` 已缓存未用；本机报的正是 4096，
-  属隐患非当前症状。
+- glibc 的 `malloc`/`getpid` 是 IFUNC，符号本身没有实体指令地址；探针要落在 ifunc 的 resolver
+  或具体实现上（`uprobe` 能注册成功，但命中数取决于解析器调用路径）。
+- folded 的 user 帧只打 `0x地址`，不做用户态符号化（内核帧才查 kallsyms）。
 
 ## 前提
 
