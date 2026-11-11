@@ -75,6 +75,7 @@ docs/               设计文档
   build.md          **裁剪→编译→安装 完整流程**（照着敲就能复现装机内核）
   trim.md           裁剪方法与五轮账本（主文档）
   design.md         **分块重写方案**：驱动复用 + 实现层按块替换，M1~M7 路线
+  tracing-capture.md **动态追踪/网络抓包/TLS 明文依赖清单**（bpftrace、tcpdump、ecapture 真机实测）
 notes/              踩坑记录
 kpi/                API 面清单（愿景期产物，暂不推进）
 ```

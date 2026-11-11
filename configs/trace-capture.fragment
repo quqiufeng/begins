@@ -1,0 +1,52 @@
+# trace-capture.fragment — 第四次改动：动态追踪 + 网络抓包支持
+#
+# 目标：让这些工具在内核上真能跑
+#   bpftrace / BCC / perf + kprobe/uprobe/tracepoint/ftrace
+#   eCapture（OpenSSL/BoringSSL uprobe 抓 TLS 明文）
+#   tcpdump / tshark（AF_PACKET，本来就 y）
+#   tc-bpf / XDP（NET_CLS_BPF / NET_ACT_BPF / XDP_SOCKETS）
+#
+# 应用方式（见 docs/build.md §2）：把本文件里的 CONFIG_X=y/n 逐条喂给 scripts/config
+#   scripts/config --file .config -e X     # =y
+#   scripts/config --file .config -d X     # not set
+#   make olddefconfig
+#
+# 注意：DEBUG_INFO 是 choice，DEBUG_INFO_NONE 与 DEBUG_INFO_DWARF5 互斥，必须显式 -d NONE。
+
+# ---- 1. 调试信息（BTF 的地基；当前 DEBUG_INFO_NONE=y，得让位）----
+CONFIG_DEBUG_INFO_NONE=n
+CONFIG_DEBUG_INFO_DWARF5=y
+CONFIG_DEBUG_INFO_REDUCED=n
+CONFIG_DEBUG_INFO_SPLIT=n
+CONFIG_DEBUG_INFO_COMPRESSED_NONE=y
+CONFIG_DEBUG_INFO_BTF=y
+CONFIG_DEBUG_INFO_BTF_MODULES=y
+
+# ---- 2. ftrace 骨架（当前整块 FTRACE=n，等于追踪子系统不存在）----
+CONFIG_FTRACE=y
+CONFIG_TRACEPOINTS=y
+CONFIG_TRACING=y
+CONFIG_GENERIC_TRACER=y
+CONFIG_FUNCTION_TRACER=y
+CONFIG_FUNCTION_GRAPH_TRACER=y
+CONFIG_DYNAMIC_FTRACE=y
+CONFIG_FTRACE_SYSCALLS=y
+CONFIG_STACK_TRACER=y
+CONFIG_SCHED_TRACER=y
+
+# ---- 3. 探针（bpftrace / BCC / ecapture 的核心）----
+CONFIG_KPROBES=y
+CONFIG_KPROBE_EVENTS=y
+CONFIG_UPROBES=y
+CONFIG_UPROBE_EVENTS=y
+CONFIG_BPF_EVENTS=y
+CONFIG_FPROBE=y
+
+# ---- 4. 网络抓包 / tc-bpf（PACKET 已 y；抓包本身不需要改）----
+CONFIG_PACKET=y
+CONFIG_NET_SCHED=y
+CONFIG_NET_CLS_ACT=y
+CONFIG_NET_CLS_BPF=y
+CONFIG_NET_ACT_BPF=y
+CONFIG_NET_SCH_INGRESS=y
+CONFIG_XDP_SOCKETS=y

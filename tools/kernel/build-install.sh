@@ -42,7 +42,7 @@ sudo make install
 
 echo
 echo "=== 兜底：再跑一次强制同步（钩子已跑过则为幂等快路径）==="
-tools/kernel/sync-drivers.sh -k "$VER"
+"$(cd "$(dirname "$0")" && pwd)/sync-drivers.sh" -k "$VER"
 
 echo
 echo "=== 收尾 ==="
