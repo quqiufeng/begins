@@ -64,8 +64,10 @@ local function parse_format(txt)
   for line in txt:gmatch("[^\n]+") do
     local decl = line:match("^%s*field:(.-);")
     if decl then
-      local name = decl:match("([%w_%.]+)%s*$")
-      f[#f+1] = { name = name,
+      -- 数组字段声明形如 "char prev_comm[16]" / "char[]"，末尾的 ']' 会让
+      -- 直接取尾部标识符失败（name=nil → out[nil] 崩）。先剥掉维度再取名。
+      local base = decl:gsub("%[%d*%]%s*$", "")
+      f[#f+1] = { name = base:match("([%w_%.]+)%s*$"),
                   off  = tonumber(line:match("offset:(%d+)")),
                   size = tonumber(line:match("size:(%d+)")),
                   dyn  = decl:find("__data_loc") ~= nil,
@@ -201,17 +203,31 @@ end
 -- perf ring
 ------------------------------------------------------------------------
 -- t 可省略：{ inherit = bool, wakeup = n }
--- flags(attr+40) 低位：1=disabled 2=inherit（fork/新线程跟着走）
+-- flags(attr+40) 按 perf_event_attr 的位域：
+--   bit0=disabled(1) bit1=inherit(2) bit2=pinned(4) bit3=exclusive(8)
+--   bit7=exclude_idle(128) bit10=freq(1024)
+--   注意 8 是 exclusive 不是 exclude_idle（早先写错过，采样率虚高就是这个）
+--   freq 置位时 attr+16 解释为采样频率 Hz（不是 period）
 -- wakeup_events(attr+48)：攒够 n 个样本才唤醒一次 poll
-local function perf_open(trace_id, pid, cpu, sample_type, period, t)
+-- spec 两种写法：
+--   number = tracefs 事件 id（type=PERF_TYPE_TRACEPOINT 2）
+--   table  = 任意 perf 事件 { type, config, freq=bool, exclude_idle=bool }
+--            软件时钟 {type=1,config=0}，硬件周期 {type=0,config=0}
+local PERF_TYPE_HARDWARE, PERF_TYPE_SOFTWARE = 0, 1
+local PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_SW_CPU_CLOCK = 0, 0
+local function perf_open(spec, pid, cpu, sample_type, period, t)
   t = t or {}
   local attr = ffi.new("uint8_t[?]", 136)
-  ffi.cast("uint32_t*", attr)[0] = 2
+  local etype, econfig, freq, idle = 2, spec, false, false
+  if type(spec) == "table" then
+    etype, econfig, freq, idle = spec.type, spec.config, spec.freq, spec.exclude_idle
+  end
+  ffi.cast("uint32_t*", attr)[0] = etype
   ffi.cast("uint32_t*", attr+4)[0] = 128
-  ffi.cast("uint64_t*", attr+8)[0] = trace_id
+  ffi.cast("uint64_t*", attr+8)[0] = econfig
   ffi.cast("uint64_t*", attr+16)[0] = period or 1
   ffi.cast("uint64_t*", attr+24)[0] = sample_type
-  ffi.cast("uint64_t*", attr+40)[0] = 1 + (t.inherit and 2 or 0)
+  ffi.cast("uint64_t*", attr+40)[0] = 1 + (t.inherit and 2 or 0) + (idle and 128 or 0) + (freq and 1024 or 0)
   ffi.cast("uint32_t*", attr+48)[0] = t.wakeup or 1
   local fd = tonumber(ffi.C.syscall(ffi.cast("long", SYS_perf_event_open), ffi.cast("void*", attr),
       ffi.cast("int", pid), ffi.cast("int", cpu), ffi.cast("int", -1), ffi.cast("unsigned long", 0)))
@@ -278,8 +294,8 @@ local function ring_err_note()
   return "（" .. table.concat(l, " ") .. "）"
 end
 
-local function open_ring(trace_id, t, sample_type, cc)
-  local fd, err = perf_open(trace_id, t.pid, t.cpu, sample_type, 1, t)
+local function open_ring(spec, t, sample_type, cc, period)
+  local fd, err = perf_open(spec, t.pid, t.cpu, sample_type, period or 1, t)
   if not fd then rerr("open errno=" .. tostring(err)) return nil, err end
   local mmap_len = PAGE * (1 + RING_PAGES)
   local bp = ffi.cast("uint8_t*", ffi.C.mmap(nil, mmap_len, 3, 1, fd, 0))
@@ -295,7 +311,8 @@ local function open_ring(trace_id, t, sample_type, cc)
   if dsz == 0 or doff + dsz > mmap_len then dsz = mmap_len - doff end
   local r = { fd = fd, bp = bp, d = bp + doff, dsz = dsz, mmap_len = mmap_len,
               off = doff, size = dsz, tail = 0, cpu = t.cpu, tid = t.tid, cc = cc,
-              scpu = bit.band(sample_type, SAMPLE_CPU) ~= 0 }
+              scpu = bit.band(sample_type, SAMPLE_CPU) ~= 0,
+              sraw = bit.band(sample_type, SAMPLE_RAW) ~= 0 }
   all_rings[#all_rings+1] = r
   return r
 end
@@ -315,7 +332,8 @@ end
 ------------------------------------------------------------------------
 -- 内核拒绝 mmap「带 inherit 的 per-task 事件」（mmap 返回 EINVAL），
 -- 所以 ring 模式跟进程时不开 inherit，而是定期重扫 /proc/PID/task 给新线程补 ring。
-local function ring_pool(st, cc, pid)
+-- srcs 省略时用 probes；每项只需 { id=<perf spec>, key=名字, period=采样频率 }
+local function ring_pool(st, cc, pid, srcs)
   local P = { rings = {}, seen = {}, pfd = ffi.new("struct pollfd[?]", 0), npfd = 0 }
 
   local function rebuild()
@@ -327,11 +345,11 @@ local function ring_pool(st, cc, pid)
   -- 给还没 ring 的目标补坑，返回新增数量
   function P.sync()
     local added = 0
-    for _, p in ipairs(probes) do
+    for _, p in ipairs(srcs or probes) do
       for _, t in ipairs(targets(pid, false, WAKEUP_BATCH)) do
-        local k = p.id .. ":" .. t.pid .. ":" .. (t.cpu or -1)   -- 全机模式 pid 恒为 -1，必须用 cpu 区分
+        local k = (p.key or tostring(p.id)) .. ":" .. t.pid .. ":" .. (t.cpu or -1)   -- 全机模式 pid 恒为 -1，必须用 cpu 区分
         if not P.seen[k] then
-          local r = open_ring(p.id, t, st, cc)
+          local r = open_ring(p.id, t, st, cc, p.period)
           if r then
             P.seen[k] = true
             ring_on(r)
@@ -479,15 +497,21 @@ local function walk(r, by_id, cb)
       end
       local nr, ccp = 0, nil
       if r.cc then
+        if q + 8 > off + sz then break end      -- callchain 头都放不下
         nr = tonumber(ffi.cast("uint64_t*", d+q)[0])
+        if nr < 0 or q + 8 + nr*8 > off + sz then break end   -- 垃圾 nr：别按它越界读
         ccp = d + q + 8
         q = q + 8 + nr*8
       end
-      if q + 4 > off + sz then break end    -- 头里写的 nr 大得离谱：停在这条，别越界读
-      local rl = ffi.cast("uint32_t*", d+q)[0]
-      local raw = d + q + 4
-      local pr = by_id[tonumber(ffi.cast("uint16_t*", raw)[0])]   -- common_type 是 u16，别读成 u32
-      if pr then cb(pr, pid, tid, tm, raw, rl, ccp, nr, cpu) end
+      if not r.sraw then                    -- on-CPU：sample_type 里没有 RAW，callchain 就是记录尾
+        cb(nil, pid, tid, tm, nil, 0, ccp, nr, cpu)
+      else
+        if q + 4 > off + sz then break end  -- 头里写的 nr 大得离谱：停在这条，别越界读
+        local rl = ffi.cast("uint32_t*", d+q)[0]
+        local raw = d + q + 4
+        local pr = by_id[tonumber(ffi.cast("uint16_t*", raw)[0])]   -- common_type 是 u16，别读成 u32
+        if pr then cb(pr, pid, tid, tm, raw, rl, ccp, nr, cpu) end
+      end
     elseif ty == 2 then                               -- LOST: hdr(8)+id(8)+lost(8)
       stats.lost = stats.lost + tonumber(ffi.cast("uint64_t*", d+off+16)[0])
     elseif ty == 5 then                               -- THROTTLE：内核限流，同样丢数据
@@ -518,6 +542,8 @@ do
     elseif a == "--str"      then opt.strfield = val()
     elseif a == "--pid"      then opt.pid = tonumber(val())
     elseif a == "--limit"    then opt.limit = tonumber(val())
+    elseif a == "--freq"     then opt.freq = tonumber(val())
+    elseif a == "--event"    then opt.event = val()
     elseif a == "--ring-size" then RING_PAGES = math.max(1, math.min(1024, tonumber(val()) or 8))
     elseif a == "--json"     then opt.json = true
     else io.stderr:write("未知参数: "..tostring(a).."\n") os.exit(2) end
@@ -534,7 +560,15 @@ end
 local argstr = (#args > 0) and table.concat(args, " ") or nil
 cleanup()   -- 启动自愈：清掉上次异常退出遗留的 lite_* 探针
 
-if opt.mode == "latency" then
+if opt.mode == "oncpu" then                       -- 纯 perf 事件采样，一个探针都不需要
+  -- 什么都不注册
+elseif opt.mode == "offcpu" then
+  if #probe_specs == 0 then probe_specs = { "tracepoint:sched:sched_switch" } end
+  for _, s in ipairs(probe_specs) do
+    local p, err = add_probe(s, argstr)
+    if not p then fail(err) end
+  end
+elseif opt.mode == "latency" then
   local pe, e1 = add_probe(entry_spec, argstr)
   if not pe then fail(e1) end
   local px, e2 = add_probe(exit_spec)
@@ -546,7 +580,7 @@ else
     if not p then fail(err) end
   end
 end
-if #probes == 0 then fail("没有探针") end
+if #probes == 0 and opt.mode ~= "oncpu" then fail("没有探针") end
 local by_id = {}
 for _, p in ipairs(probes) do by_id[p.id] = p end
 
@@ -781,6 +815,323 @@ local function sym(key)
   return off == 0 and best[2] or ("%s+0x%x"):format(best[2], off)
 end
 
+------------------------------------------------------------------------
+-- util：一帧地址 → 名字
+------------------------------------------------------------------------
+-- 内核帧走 kallsyms；用户帧走 /proc/pid/maps（给 模块+文件偏移，
+-- 能直接喂 addr2line -e libfoo.so <偏移>），否则一屏 0x55b3... 什么都看不出来。
+local maps_cache, maps_n = {}, 0
+local MAPS_MAX = 256                       -- 长跑 / 大量进程时不再无限缓存
+local function load_maps(pid)
+  local m = maps_cache[pid]
+  if m then return m end
+  m = {}
+  local f = io.open("/proc/"..pid.."/maps")
+  if f then
+    for line in f:lines() do
+      local a, b, off = line:match("^(%x+)%-(%x+)%s+%S+%s+(%x+)")
+      if a then
+        local path = line:match("%s(/[^%s]*)$")
+        m[#m+1] = { s = tonumber(a,16), e = tonumber(b,16), off = tonumber(off,16),
+                    n = path and path:match("([^/]+)$") or nil }
+      end
+    end
+    f:close()
+  end
+  table.sort(m, function(x, y) return x.s < y.s end)
+  if maps_n < MAPS_MAX then maps_cache[pid] = m maps_n = maps_n + 1 end
+  return m
+end
+local function usym(pid, a)
+  local m = load_maps(pid)
+  local lo, hi, best = 1, #m, nil
+  while lo <= hi do
+    local mid = math.floor((lo + hi) / 2)
+    if m[mid].s <= a then best = m[mid] lo = mid + 1 else hi = mid - 1 end
+  end
+  if not best or a >= best.e then return ("[anon+0x%x]"):format(a) end
+  -- 用户态地址 < 2^47，double 精确，可以直接算
+  return ("%s+0x%x"):format(best.n or "[anon]", a - best.s + best.off)
+end
+
+-- 一帧：内核地址走 sym()，用户地址走 usym()；
+-- PERF_CONTEXT_* 是标记不是地址（值域 -4096..-1，即 lo32 >= 0xfffff000），跳过
+local function frame_name(pid, hi32, lo32)
+  if hi32 == 0xffffffff and lo32 >= 0xfffff000 then return nil end
+  if hi32 >= 0xffff8000 then                        -- 内核空间：高位全 1
+    local key = ("%08x%08x"):format(hi32, lo32)
+    return sym(key) or ("0x" .. key)
+  end
+  return usym(pid, hi32 * 4294967296 + lo32)
+end
+-- callchain → 名字数组（内核给的就是 innermost-first）
+local function stack_frames(pid, ccp, nr)
+  local frames = {}
+  for i = 0, nr-1 do
+    local w = ffi.cast("uint32_t*", ccp + i*8)
+    local n = frame_name(pid, w[1], w[0])           -- little-endian: [0]=低 [1]=高
+    if n then frames[#frames+1] = n end
+  end
+  return frames
+end
+-- 反向拼成 root;...;leaf：leaf 才是「此刻忙/阻塞在这个函数」
+local function stack_str(frames, rev)
+  local t = {}
+  if rev then for i = #frames, 1, -1 do t[#t+1] = frames[i] end
+  else          for i = 1, #frames do t[#t+1] = frames[i] end end
+  return table.concat(t, ";")
+end
+
+local SCHED_DROP = { ["__schedule"] = true, ["schedule"] = true,
+                     ["schedule_idle"] = true, ["__schedule_loop"] = true,
+                     ["finish_task_switch"] = true, ["finish_task_switch.isra.0"] = true,
+                     ["__perf_event_task_sched_out"] = true, ["__perf_event_task_sched_in"] = true }
+local function trim_sched(frames)
+  local i = 1
+  while i <= #frames and SCHED_DROP[(frames[i]:gsub("%+0x%x+$", ""))] do i = i + 1 end
+  local o = {}
+  for j = i, #frames do o[#o+1] = frames[j] end
+  return o
+end
+-- 单调 ns（与 sched_switch 的 ftrace 时间戳同一时钟）。double 在 1.7e18 上
+-- 只剩 ~400ns 分辨率，对 ms 级阻塞足够；换成两个 u64 桥接得不偿失。
+local function now_ns()
+  local ts = TS()
+  ffi.C.clock_gettime(1, ts)
+  return tonumber(ts.tv_sec) * 1e9 + tonumber(ts.tv_nsec)
+end
+
+-- /proc/<tid>/stat 的第 3 字段：R/S/D/t/Z。comm 可能带空格，得先吃掉括号。
+local function proc_state(tid)
+  local s = rf("/proc/"..tid.."/stat")
+  if not s then return nil end
+  return s:match("^%d+ %b() (%a)")
+end
+
+-- 已阻塞任务的真实内核栈（root 可读）。方向与 perf callchain 一致：内层在头。
+local function proc_kstack(tid)
+  local s = rf("/proc/"..tid.."/stack")
+  if not s then return nil end
+  local fr = {}
+  for line in s:gmatch("[^\n]+") do
+    local sym = line:match("^%s*%[<%d+>%]%s*(%S+)")
+    if sym and sym ~= "0xffffffffffffffff" then
+      fr[#fr+1] = (sym:gsub("%+0x%x+", ""):gsub("/0x%x+$", ""))
+    end
+  end
+  if #fr == 0 then return nil end
+  return stack_str(trim_sched(fr), true)
+end
+
+------------------------------------------------------------------------
+-- oncpu：perf 软件时钟采样，看 CPU 时间烧在哪段代码
+------------------------------------------------------------------------
+-- sample_type 里绝不能带 RAW —— 这不是 tracepoint，没有 payload。
+-- walk() 按「TID→TIME→CPU→CALLCHAIN」解，sraw=false 时直接把 callchain 交上来。
+local function run_oncpu()
+  local freq = opt.freq or 99
+  if freq < 1 then freq = 1 end
+  if freq > 100000 then freq = 100000 end
+  local st = bit.bor(SAMPLE_TID, SAMPLE_TIME, SAMPLE_CPU, SAMPLE_CALLCHAIN)
+  local src = { id = { type = PERF_TYPE_SOFTWARE, config = PERF_COUNT_SW_CPU_CLOCK,
+                       freq = true, exclude_idle = true },
+                key = "oncpu", period = freq }
+  local P = ring_pool(st, true, opt.pid, { src })
+  P.sync()
+  if #P.rings == 0 then fail("ring 建立失败" .. ring_err_note()) end
+
+  local acc, comms, total = {}, {}, 0
+  local deadline = now_s() + opt.duration
+  local function drain()
+    for _, r in ipairs(P.rings) do
+      walk(r, by_id, function(_, pid, _tid, _tm, _raw, _rl, ccp, nr)
+        total = total + 1
+        local line = stack_str(stack_frames(pid, ccp, nr), true)
+        if line == "" then line = "[unknown]" end
+        acc[line] = (acc[line] or 0) + 1
+        local c = comm_of(pid)
+        comms[c] = (comms[c] or 0) + 1
+      end)
+    end
+  end
+  while wait_ready(P.pfd, P.npfd, deadline) do
+    drain() P.reap() P.sync()
+  end
+  drain()
+  P.close_all()
+
+  local arr = {}
+  for k, v in pairs(acc) do arr[#arr+1] = { stack = k, count = v } end
+  table.sort(arr, function(a, b) return a.count > b.count end)
+  local top = {}
+  for i = 1, math.min(#arr, opt.limit) do top[#top+1] = arr[i] end
+  local cl = {}
+  for k, v in pairs(comms) do cl[#cl+1] = { comm = k, count = v } end
+  table.sort(cl, function(a, b) return a.count > b.count end)
+  local ctop = {}
+  for i = 1, math.min(#cl, opt.limit) do ctop[#ctop+1] = cl[i] end
+  result.freq, result.events, result.stacks = freq, total, #arr
+  result.top, result.comms = top, ctop
+end
+
+------------------------------------------------------------------------
+-- offcpu：sched_switch 配对 —— 切出到下次切入的间隔 = 阻塞/等锁/等 IO
+------------------------------------------------------------------------
+-- 切出那一刻的 callchain 就是「阻塞点」，所以栈必须和 prev 一起存下来。
+-- 内核给的这个栈天然从 __schedule 开始，头几帧没有信息量，剥掉。
+
+local function run_offcpu()
+  local st = bit.bor(SAMPLE_TID, SAMPLE_TIME, SAMPLE_CPU, SAMPLE_RAW, SAMPLE_CALLCHAIN)
+  -- 一律 per-CPU ring：sched_switch 的 prev/next 得同时看到，
+  -- 按任务挂事件只会拿到自己那侧（切出），配对永远配不上。
+  local P = ring_pool(st, true, nil)
+  P.sync()
+  if #P.rings == 0 then fail("ring 建立失败" .. ring_err_note()) end
+
+  local want
+  if opt.pid then
+    want = { [opt.pid] = true }
+    for _, t in ipairs(task_tids(opt.pid)) do want[t] = true end
+  end
+
+  local pend, np = {}, 0            -- pend[tid] = {tm, stack, state}
+  local hists = {}
+  local total, matched, blocked, preempted, unmatched = 0, 0, 0, 0, 0
+  local MAX_PEND = 65536
+  local migrated = 0                  -- 跨 CPU 迁回的任务数（仅诊断，区间本身是真的）            -- 全机模式下别让 pend 无限涨
+  local deadline = now_s() + opt.duration
+  local t0 = now_ns()
+  local function hit(tid) return (not want) or want[tid] end
+
+  -- 起始就已睡下的任务永远不会产生「切出」事件，直接配对会漏掉整段阻塞
+  -- （拿 lite 自身测就是这样：全程卡在 wait4，配对=0）。用 /proc 状态+内核栈
+  -- 把它假装成在 t0 切出，后面真切回时自然闭合。
+  local seeded = 0
+  if want then
+    for tid in pairs(want) do
+      local stt = proc_state(tid)
+      if stt and stt ~= "R" and stt ~= "Z" and np < MAX_PEND then
+        pend[tid] = { tm = t0, stack = proc_kstack(tid) or ("[起始已阻塞 "..stt.."]"), state = 1 }
+        np = np + 1
+        seeded = seeded + 1
+      end
+    end
+  end
+
+  local function close_at(ntid, tm, cpu)
+    local p = pend[ntid]
+    if not p then return end
+    pend[ntid] = nil np = np - 1
+    local dur = tm - p.tm
+    if dur < 0 then return end
+    if cpu and p.cpu and cpu ~= p.cpu then migrated = migrated + 1 end
+    local h = hists[p.stack]
+    if not h then h = new_hist() hists[p.stack] = h end
+    hist_add(h, dur)
+    matched = matched + 1
+    if p.state == 0 then preempted = preempted + 1 else blocked = blocked + 1 end
+  end
+
+  -- 跨 CPU 合并重排。
+  -- per-CPU ring 各自独立，drain 的顺序不代表事件发生的顺序：ring A 的「切出」
+  -- 可能比 ring B 的「切回」更晚被读到。直接顺序配对会配不上（区间丢失），
+  -- 或者把几段相邻的阻塞粘成一段超长区间（实测全机 100ms 睡眠报出 801ms，
+  -- 绑单核就正常 —— 这就是病因）。像 perf 的 ordered_events 一样按时间戳
+  -- 排序，并压住 HOLD_NS 不结算，等落后的 ring 追上来。
+  local HOLD_NS = 200e6
+  local mbuf, mlen = {}, 0
+
+  local function apply(e)
+    if e.ntid then close_at(e.ntid, e.tm, e.cpu) end
+    local ptid = e.ptid
+    -- 压缓冲期间 pend 状态会变，开区间前必须重新判空；line 也可能算不出
+    if e.line and ptid and ptid ~= 0 and hit(ptid) and not pend[ptid] and np < MAX_PEND then
+      pend[ptid] = { tm = e.tm, stack = e.line, state = e.st, cpu = e.cpu }
+      np = np + 1
+    end
+  end
+
+  local function flush(upto)
+    if mlen == 0 then return end
+    -- 待处理项必须连续存放：中途置 nil 会在数组里留洞，table.sort 依赖 # 求边界，
+    -- 边界一错就会拿 nil 去比较。所以整表排序，再重建残留列表。
+    local arr = mbuf
+    table.sort(arr, function(a, b) return a.tm < b.tm end)
+    local keep, kn = {}, 0
+    for k = 1, mlen do
+      local e = arr[k]
+      if e.tm <= upto then apply(e)
+      else kn = kn + 1 keep[kn] = e end
+    end
+    mbuf, mlen = keep, kn
+  end
+
+  local function drain()
+    local newest = 0
+    for _, r in ipairs(P.rings) do
+      walk(r, by_id, function(pr, pid, _tid, tm, raw, _rl, ccp, nr, cpu)
+        total = total + 1
+        if tm > newest then newest = tm end
+        local ev = decode(pr, raw, pid)
+        local ntid, ptid = tonumber(ev.next_pid), tonumber(ev.prev_pid)
+        local line
+        if ptid and ptid ~= 0 and hit(ptid) then
+          line = stack_str(trim_sched(stack_frames(ptid, ccp, nr)), true)
+          if line == "" then line = "[unknown]" end
+        end
+        mlen = mlen + 1
+        mbuf[mlen] = { tm = tm, ntid = ntid, ptid = ptid, line = line,
+                       st = tonumber(ev.prev_state) or 0, cpu = cpu }
+      end)
+    end
+    if mlen > 200000 then flush(math.huge)      -- 兜底，别让缓冲撑爆
+    else flush(newest - HOLD_NS) end
+  end
+
+  while wait_ready(P.pfd, P.npfd, deadline) do
+    drain() P.reap() P.sync()
+  end
+  drain()
+  flush(math.huge)                              -- 收尾：把压住的窗口全部结算
+  P.close_all()
+  -- 结束时仍睡着的区间：截到 deadline 结算并标为截断，而不是扔掉。
+  -- 否则「采样窗口内一直阻塞」这种最该被抓到的样本反而消失。
+  local t_end = now_ns()
+  local trunc = 0
+  for tid, p in pairs(pend) do
+    local dur = t_end - p.tm
+    if dur > 0 then
+      local h = hists[p.stack]
+      if not h then h = new_hist() hists[p.stack] = h end
+      hist_add(h, dur)
+      matched = matched + 1
+      blocked = blocked + 1
+      trunc = trunc + 1
+    end
+  end
+  unmatched = trunc                    -- 未回切（区间被截断）
+  pend, np = {}, 0
+
+  local arr, allh = {}, new_hist()
+  for k, h in pairs(hists) do
+    local j = hist_json(h)
+    j.stack = k
+    j.total_ms = h.sum / 1e6
+    arr[#arr+1] = j
+    allh.n, allh.sum = allh.n + h.n, allh.sum + h.sum
+    if h.max > allh.max then allh.max = h.max end
+    for b, c in pairs(h.b) do allh.b[b] = (allh.b[b] or 0) + c end
+  end
+  table.sort(arr, function(a, b) return a.total_ms > b.total_ms end)
+  local top = {}
+  for i = 1, math.min(#arr, opt.limit) do top[#top+1] = arr[i] end
+  result.events, result.matched = total, matched
+  result.blocked, result.preempted, result.unmatched = blocked, preempted, unmatched
+  result.seeded = seeded
+  result.migrated = migrated
+  result.top, result.overall = top, hist_json(allh)
+end
+
 local function run_folded()
   local st = bit.bor(SAMPLE_TID, SAMPLE_TIME, SAMPLE_CPU, SAMPLE_RAW, SAMPLE_CALLCHAIN)
   local P = ring_pool(st, true, opt.pid)
@@ -832,6 +1183,8 @@ if opt.mode == "count" then run_count()
 elseif opt.mode == "samples" then run_samples()
 elseif opt.mode == "latency" then run_latency()
 elseif opt.mode == "folded" then run_folded()
+elseif opt.mode == "oncpu" then run_oncpu()
+elseif opt.mode == "offcpu" then run_offcpu()
 else fail("未知 mode: "..opt.mode) end
 
 for _, p in ipairs(probes) do result.probes[#result.probes+1] = p.name end
@@ -870,6 +1223,28 @@ else
   elseif opt.mode == "folded" then
     print(("%s  events=%d stacks=%d%s"):format(pname, result.events, result.stacks, lostnote()))
     for _, f in ipairs(result.folded) do print(("  %6d  %s"):format(f.count, f.stack)) end
+  elseif opt.mode == "oncpu" then
+    print(("oncpu  %dHz  样本=%d 栈种类=%d%s"):format(result.freq, result.events, result.stacks, lostnote()))
+    for _, f in ipairs(result.top) do
+      local pct = result.events > 0 and (f.count * 100 / result.events) or 0
+      print(("  %5.1f%% %6d  %s"):format(pct, f.count, f.stack))
+    end
+    if #result.comms > 0 then
+      local cs = {}
+      for _, c in ipairs(result.comms) do cs[#cs+1] = ("%s=%d"):format(c.comm, c.count) end
+      print("  comm: " .. table.concat(cs, " "))
+    end
+  elseif opt.mode == "offcpu" then
+    print(("offcpu  events=%d 配对=%d 阻塞=%d 被抢占=%d 未回切=%d 补种=%d 迁移=%d%s"):format(
+      result.events, result.matched, result.blocked, result.preempted, result.unmatched,
+      result.seeded or 0, result.migrated or 0, lostnote()))
+    local o = result.overall
+    print(("  overall n=%d avg=%.1fus p50=%dus p99=%dus max=%.1fus"):format(
+      o.count, o.avg_us, o.p50_us, o.p99_us, o.max_us))
+    for _, t in ipairs(result.top) do
+      print(("  total=%8.2fms n=%-6d avg=%7.1fus p99=%-6dus max=%8.2fms  %s"):format(
+        t.total_ms, t.count, t.avg_us, t.p99_us, t.max_us/1000, t.stack))
+    end
   else
     local np = #result.probes
     local function short(p) return p:match("([^:]+)$") or p end
