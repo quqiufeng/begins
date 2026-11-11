@@ -209,13 +209,25 @@ sudo cp -a /lib/modules/$V{,.prev}
 sudo update-grub     # .prev 自动变成菜单里独立一项，等于白送一层保险
 ```
 
-跑稳后删掉（本次已删，释放 441 M：/boot 289 M + 模块目录 151 M）：
+跑稳后删掉（二次改动释放 441 M：/boot 289 M + 模块目录 151 M；三次改动又清掉 `.old` 95 M）：
 
 ```bash
-sudo rm -f /boot/{vmlinuz,initrd.img,config,System.map}-$V.prev
-sudo rm -rf /lib/modules/$V.prev
-sudo update-grub     # 菜单自动清理，`grep -c hwreal.prev /boot/grub/grub.cfg` 应为 0
+sudo rm -f /boot/{vmlinuz,initrd.img,config,System.map}-$V.{prev,old}
+sudo rm -rf /lib/modules/$V.prev          # .old 那次没跑 modules_install，没有对应模块目录
+# vmlinuz.old / initrd.img.old 原本指向刚被删掉的 .old，必须改指真回退内核
+sudo ln -sfn vmlinuz-7.2.12-rtx3080-20261025 vmlinuz.old
+sudo ln -sfn initrd.img-7.2.12-rtx3080-20261025 initrd.img.old
+sudo update-grub     # 菜单自动清理，`sudo grep -c 'hwreal\.prev\|hwreal\.old' /boot/grub/grub.cfg` 应为 0
 ```
+
+> **坑：`.prev` / `.old` 是版本串后缀，`update-grub` 的 `vmlinuz-*` 通配会把它们当成独立内核**，
+> 生成 `Ubuntu, with Linux 7.2.12-20261111-hwreal.prev` 这样的菜单项。所以备份命令里那句
+> `update-grub` 是**双刃剑**：给了一层保险，也多了两个选了就崩的菜单项。
+> 删文件后**不跑 `update-grub`** 就会留下死菜单项——删完必须复查：
+>
+> ```bash
+> sudo grep -oP "menuentry '\K[^']+" /boot/grub/grub.cfg   # 只应剩 10-25 与 hwreal 各 2 项
+> ```
 
 ---
 
@@ -455,6 +467,7 @@ sudo grep -n 'set default=' /boot/grub/grub.cfg | head -2   # 确认落到 grub.
 # 临时：开机 GRUB 菜单选 Advanced → Ubuntu, with Linux 7.2.12-rtx3080-20261025
 # 永久：
 sudo cp /etc/default/grub.bak-20261111 /etc/default/grub && sudo update-grub
+# .prev/.old 已清理，`vmlinuz.old`/`initrd.img.old` 现指向 10-25 内核，作兜底
 ```
 
 裁 config 出错回退到**基线**（发行版原版，是唯一保证能启动的 config）：
@@ -470,17 +483,16 @@ cd ~/kernel/src/linux-7.2.12 && make olddefconfig
 
 ## 8. 磁盘余量（提前算账）
 
-`/boot` 只有 2.0 G，两个内核的 initrd 就吃掉 752 M。**保留 `.prev`/`.old` 备份时**（当前状态）：
+`/boot` 只有 2.0 G，两个内核的 initrd 就吃掉 752 M。**清掉 `.prev`/`.old` 之后**（当前状态）：
 
 | 文件 | 大小 |
 |---|---|
 | `initrd.img-7.2.12-rtx3080-20261025` | 480 M |
 | `initrd.img-7.2.12-20261111-hwreal` | 271 M |
-| `initrd.img-7.2.12-20261111-hwreal.prev` | 271 M |
-| 已用 / 剩余 | **1.1 G / 706 M**（62%） |
+| 已用 / 剩余 | **812 M / 1017 M**（45%） |
 
-> 确认新内核跑稳、删掉 `.prev` 和 `.old` 后可回收到约 811 M / 1017 M（45%）；
-> 反过来，余量只剩 700 M 时**再加一套就装不下**——这是先算账再动手的理由。
+> 留 `.prev` + `.old` 备份时余量只剩 706 M（62%），再加一套就装不下——这是先算账再动手的理由。
+> 现在 1017 M 够装第三个内核，但装完又得清，**别指望能同时养三个**。
 
 **下次装内核前必须先清一个旧内核**，否则 `mkinitramfs` 半路 No space 会留下一个坏 initrd
 （比装失败更危险：它能被 GRUB 选到）。
