@@ -103,6 +103,20 @@ find . -name '*.ko' -delete
 
 清完必须断言归零，再 `cp` 回配置跑 `make olddefconfig`。**每轮都从 0 开始计时，否则轮与轮不可比。**
 
+> **裁到后段时，`make clean` 会直接报错退出（不只是"没删干净"）。**
+> 2026-11-11 复测：`make clean` → `exit 2`，报错
+> `scripts/Makefile.clean:12: rust/Makefile: 没有那个文件或目录` /
+> `没有规则可制作目标"rust/Makefile"`。
+> 原因是 `rust/` 整目录被裁掉了，但构建系统下潜的目录清单里仍有 `rust`
+> （`scripts/Makefile.clean` 对 `obj=rust` 执行 `include $(kbuild-file)`，
+> 而 `rust/Makefile` 已不存在）。`make mrproper` 停在同一处。
+> **推论：不能靠 make 收尾，清场一律用上面的 `find -delete` 序列**——
+> 这条从"推荐"变成"唯一可行"。顺带一个反直觉点：报错发生时 `.config`/`.config.old`
+> **仍然完好**（错误在下潜阶段，还没走到删配置），所以不必担心 make clean 弄丢 config；
+> 真正需要防的是它根本没删 `.o`，却让人以为清干净了。
+> 若哪天想恢复 `make clean` 可用，最小修法是在 `Makefile` 里给 `rust/` 加条件
+> （`$(if $(wildcard rust/Makefile),rust/)`），但裁过的树没必要为它留口子。
+
 **脚本化时的连带坑**：`clean-build.sh` 要先 `cd` 进源码树再干活，此时命令行传进来的 `configs/xxx.ok`
 这种相对路径就失效了（`cp: stat 失败`，且因为 `set -e` 直接退出，清场已做完、构建没开始，
 树处于"干净但没编"的状态）。所以路径参数必须 `realpath` 绝对化后再 `cd`——
@@ -252,7 +266,7 @@ ccache 热缓存阶段 `Hits 4459/8854 (50.36%)`，产物 `vmlinux 48M / bzImage
 
 ### 采用的工作流
 
-**决定：不启用 ccache，不为链接做优化。**
+**决定：不启用 ccache，不为链接做优化。**（2026-11-11 已 `apt purge ccache`，并清空 `~/.cache/ccache`、`~/.config/ccache`，本机不再保留。）
 
 - 改代码验证语法 → `make <目标>.o`，约 2 秒
 - 需要确认能挂上 → 完整 `make -j6`，约 40 秒
