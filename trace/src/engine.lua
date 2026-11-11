@@ -551,6 +551,11 @@ do
     elseif a == "--event"    then opt.event = val()
     elseif a == "--ring-size" then RING_PAGES = math.max(1, math.min(1024, tonumber(val()) or 8))
     elseif a == "--flame"    then opt.flame = val()
+    elseif a == "--heat"     then opt.heat = val()
+    elseif a == "--heat-top" then opt.heat_top = tonumber(val())
+    elseif a == "--rank"     then opt.rank = val()
+    elseif a == "--rank-top" then opt.rank_top = tonumber(val())
+    elseif a == "--rank-by"  then opt.rank_by = tostring(val())
     elseif a == "--sym"      then opt.sym = true
     elseif a == "--json"     then opt.json = true
     else io.stderr:write("未知参数: "..tostring(a).."\n") os.exit(2) end
@@ -1395,19 +1400,29 @@ if stats.lost > 0 or stats.throttled > 0 then
                    "统计偏小；用 --ring-size 调大或收窄探针范围重跑\n"):format(stats.lost, stats.throttled))
 end
 
--- --flame：采完直接出图。后缀 .svg -> 可交互火焰图（悬停/点击缩放，无依赖）；
--- 其他后缀 -> PIL 位图 PNG。反转与否由 JSON 的 frame_dir 决定，python 侧统一处理。
-if opt.flame and (opt.mode == "oncpu" or opt.mode == "folded" or opt.mode == "offcpu") then
+-- --flame / --heat：采完直接出图。两者共用同一份 JSON，只是渲染脚本不同
+local RENDER = {
+  flame = { file = "flame.py", what = "火焰图", modes = { oncpu = 1, offcpu = 1, folded = 1 } },
+  heat  = { file = "heat.py",  what = "热力图", modes = { oncpu = 1, offcpu = 1, folded = 1 } },
+  rank  = { file = "rank.py",  what = "卡点排行", modes = { oncpu = 1, offcpu = 1, folded = 1 } },
+}
+local function render(kind, out)
+  local cfg = RENDER[kind]
+  local mode_ok = cfg.modes[opt.mode]
+  if not mode_ok then
+    io.stderr:write(("[trace_engine] --%s 只支持 oncpu/offcpu/folded，当前 %s 跳过\n"):format(kind, tostring(opt.mode)))
+    return
+  end
   local self = arg[0] or "src/engine.lua"
   local dir = self:match("^(.*)/[^/]*$") or "."
   local fp
-  for _, c in ipairs({ dir.."/tools/flame.py", dir.."/../tools/flame.py", "tools/flame.py" }) do
+  for _, c in ipairs({ dir.."/tools/"..cfg.file, dir.."/../tools/"..cfg.file, "tools/"..cfg.file }) do
     if io.open(c) then fp = c break end
   end
-  if not fp then fail("找不到 tools/flame.py") end
+  if not fp then fail("找不到 tools/"..cfg.file) end
   local tmp = os.tmpname()
   local f = io.open(tmp, "w") f:write(require("cjson").encode(result)) f:close()
-  os.execute(("chmod 644 %q"):format(tmp))   -- 渲染以调用者身份跑，得让它读得到
+  os.execute(("chmod 644 %q"):format(tmp))   -- 以调用者身份渲染，得让它读得到
   local label = ({ oncpu = "on-CPU", offcpu = "off-CPU 阻塞时长", folded = "折叠栈" })[opt.mode] or opt.mode
   local rate = result.freq and ("@"..result.freq.."Hz") or (result.unit == "ms" and "@阻塞时长" or "")
   local t = ("%s · %s · %ds %s%s"):format(label,
@@ -1416,13 +1431,25 @@ if opt.flame and (opt.mode == "oncpu" or opt.mode == "folded" or opt.mode == "of
   -- PIL 通常是 pip --user 装的，root 的 site-packages 里没有；渲染要回到调用者身份
   local su = os.getenv("SUDO_USER")
   local pre = (su and su ~= "") and ("sudo -n -u "..su.." -H ") or ""
-  local cmd = ("%spython3 %q %q %q %q"):format(pre, fp, tmp, opt.flame, t)
+  local extra = ""
+  if kind == "heat" then
+    extra = " " .. tostring(opt.heat_top or 24)
+  elseif kind == "rank" then
+    extra = (" %d %s"):format(opt.rank_top or 18, opt.rank_by or "self")
+  end
+  local cmd = ("%spython3 %q %q %q %q%s"):format(pre, fp, tmp, out, t, extra)
   local ok = os.execute(cmd)
   os.remove(tmp)
-  local kind = opt.flame:lower():match("%.svg$") and "SVG(可交互)" or "PNG"
-  io.stderr:write(("[trace_engine] 火焰图 %s -> %s %s\n"):format(kind, opt.flame,
+  local kindtxt = out:lower():match("%.svg$") and "SVG(可交互)" or "PNG"
+  io.stderr:write(("[trace_engine] %s %s -> %s %s\n"):format(cfg.what, kindtxt, out,
                    ok == 0 and "" or "(渲染失败)"))
 end
+if opt.flame and opt.heat and opt.flame == opt.heat then
+  fail("--flame 和 --heat 不能写到同一个文件（会互相覆盖）；给两个不同路径")
+end
+if opt.flame then render("flame", opt.flame) end
+if opt.heat  then render("heat",  opt.heat)  end
+if opt.rank  then render("rank",  opt.rank)  end
 
 if opt.json then
   print(require("cjson").encode(result))

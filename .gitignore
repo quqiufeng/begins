@@ -11,6 +11,10 @@ build/initrd/root/
 *.ko
 *.so
 
+# Python
+__pycache__/
+*.pyc
+
 # 编辑器/系统
 *.swp
 .DS_Store

@@ -44,7 +44,8 @@ CONFIG_DYNAMIC_FTRACE=y      CONFIG_FPROBE=y           CONFIG_FRAME_POINTER=y
 
 | 路径 | 说明 |
 |---|---|
-| `src/engine.lua` | 主线引擎，589 行。探针解析、perf 属性、ring 读取、通用 format 解码、kallsyms 符号化 |
+| `src/engine.lua` | 主线引擎，1521 行。探针解析、perf 属性、ring 读取、通用 format 解码、kallsyms 符号化 |
+| `tools/flame.py` `tools/heat.py` `tools/rank.py` | 火焰图 / 热力图 / 卡点排行渲染，共用 `flame.load` 归一 |
 | `proto/` | 演进原型，**保留作对照，不是稳定接口** |
 | `proto/v4.lua` | 最后一代原型，**实测可用**：kprobe `do_sys_openat2` + `file=+0(%si):string`，2s 收 36758 样本，跨进程读出 `file="/dev/bus/usb/006/001"` |
 | `proto/v3.lua` | v4 前身（去掉字符串提取） |
@@ -78,6 +79,11 @@ sudo luajit src/engine.lua --mode folded  --probe kprobe:do_sys_openat2 --limit 
 | `--limit` | 样本输出条数上限，默认 8 |
 | `--json` | JSON 输出 |
 | `--flame FILE` | oncpu/offcpu/folded 采完直接出火焰图：`.svg` 可交互（悬停/点击缩放），其他后缀走 PIL 出 PNG，见下 |
+| `--heat FILE` | 同样三种模式采完直接出**函数调用热力图**（行=调用者/列=被调用者），`.svg` 可交互悬停高亮同行同列，见下 |
+| `--heat-top N` | 热力图取前 N 个热门函数，默认 24 |
+| `--rank FILE` | 同样三种模式采完直接出**卡点排行榜**（结论一句话 + 排序表），见下 |
+| `--rank-top N` | 排行榜行数，默认 18 |
+| `--rank-by K` | 排行口径：`self`（默认，自身权重）/ `incl`（含下游）/ `count`（命中次数） |
 
 ## 火焰图（`--flame`）
 
@@ -109,6 +115,60 @@ sudo luajit src/engine.lua --mode oncpu --pid $$ --duration 3 --flame /tmp/oncpu
 - **PIL 权限**：pip `--user` 装的 PIL 在 root 的 site-packages 里没有，引擎按 `$SUDO_USER` 切回调用者身份跑渲染，临时 JSON 也 chmod 644。
 - **高度自适应**：`ROW=17`，图高 = 头 + 最深栈层数；过窄（<0.7px）的框省略并在页脚计数。
 
+## 调用热力图（`--heat`）
+
+火焰图回答「谁最热」，热力图回答「谁调的谁热」——把每条调用边摊成矩阵，一眼看出热点是从哪条路径烧过来的。
+
+```bash
+# 全机 CPU 热点 + 调用关系，可交互 SVG
+sudo luajit src/engine.lua --mode oncpu --freq 199 --duration 3 --heat /tmp/heat.svg
+# 汇报用的位图，取前 16 个热门函数
+sudo luajit src/engine.lua --mode oncpu --pid $(pgrep -f 'make|gcc' | head -1) \
+     --duration 5 --heat /tmp/heat.png --heat-top 16
+# off-CPU 的阻塞调用链同样适用（单元格权重 = 阻塞时长）
+sudo luajit src/engine.lua --mode offcpu --pid $$ --duration 5 --heat /tmp/block.svg
+```
+
+图里三块：
+
+- **左上 热门函数**：按包含权重排名，浅色条=包含自身及被调用者，深色条=自身；右侧 `自身 / 包含`。
+- **右 调用边矩阵**：行 = 调用者，列 = 被调用者，格子颜色 = 该边权重占总权重的比例（`log(1+w)` 归一，否则长尾全白），
+  够热的格子直接印数值。对角线的自递归（有重复帧折叠时常见）画灰底。
+  SVG 版悬停任意格子会把**同一行同一列**点亮、其余压暗，快速定位「谁在调它、它又调了谁」。
+- **左下 最热调用边**：Top 8 边平铺成 `A → B 权重 · 占比`，直接抄进报告。
+
+与火焰图共用同一套归一规则（复用 `tools/flame.py` 的 `load/scrub`）：重复帧折叠、用户态裸地址归并为
+`[user-addr]`、CJK 字体回退都一致，所以两图里函数名可以互相对照；`--heat` 与 `--flame` 也可以一次采样同时出。
+
+## 卡点排行（`--rank`）
+
+火焰图告诉你形状，热力图告诉你边，排行直接给结论——一行字说清「卡在哪」，下面一张按权重排好序的表。
+
+```bash
+# 盯一个进程，出排行榜 PNG（汇报截图直接可用）
+sudo luajit src/engine.lua --mode oncpu --pid $(pgrep -f python3 | head -1) \
+     --duration 3 --freq 199 --limit 400 --rank /tmp/rank.png --rank-top 14
+# off-CPU 排行榜 = 阻塞排行榜，权重单位是毫秒
+sudo luajit src/engine.lua --mode offcpu --pid $$ --duration 5 --rank /tmp/block.png
+# 换排序口径：incl=含下游（找"瓶颈子系统"），count=命中次数（找"经常发生但每次很短"）
+sudo luajit src/engine.lua --mode oncpu --duration 3 --rank /tmp/rank.svg --rank-by incl
+```
+
+图里三块：
+
+- **顶部结论框**（一句话 + 卡点链）：`最热卡点 X：自身 N 样本，占已列栈 M%；Y 含下游…`，
+  如果最重的包含权重落在共同入口上（`incl ≈ 全量` 而 `self` 极小），会明说「它是全栈共同入口，不是热点」，
+  免得把 `_start` 当成凶手。卡点链取最重那条栈的最后 6 帧，直接给出调用路径。
+- **排行表**：`结论（自热/混合/纯转发）· 函数 · 相对权重条（深色=自身，浅色=含下游）· 自身% · 包含% · 命中 · 累计%`。
+  自身%=采样点正落在这个函数，包含%=含它下面所有被调用者；包含列的 `·` 表示该函数全是叶子帧（自身=包含，不重复刷数字）。
+  悬停 SVG 的任意行会出明细：自身/包含绝对值、累计占比、出现在多少种不同调用栈里。
+- **底部红字警告**：`--limit` 截断（`top[]` 默认只留 40 条）时报「只收 A/共 B，覆盖 x%」，并提示调大 `--limit`；
+  裸偏移占比过半时提示加 `--sym` 或给 pid 对应 ELF，否则排行榜全是 `python3.12+0x15bd25` 这种没法看的地址。
+
+排序口径 `--rank-by`：`self`（默认，自身权重，找真热点）、`incl`（含下游，找瓶颈子系统）、`count`（命中次数）。
+`--rank-top N` 控制行数（默认 18）。`.svg` 纯标准库、`.png` 走 PIL，没有 PIL 自动退回 SVG。
+与火焰图/热力图共用 `tools/flame.py` 的 `load` 归一，三张图函数名可互相对照，也可以一次采样同时出。
+
 ## 当前状态（实测，2026-11-11 14:29）
 
 > 轮询已从忙等改为 `poll()` 睡在 ring fd 上（不再吃满一个核），并如实统计 ring 溢出：
@@ -125,6 +185,7 @@ sudo luajit src/engine.lua --mode oncpu --pid $$ --duration 3 --flame /tmp/oncpu
 | `oncpu` | **可用** | 全机 3s@99Hz：`样本=1591 栈种类=219`，comm 分布 `python3=1594 luajit=97 chrome=12…`；`--pid` 时 59 样本全落在目标 python3 |
 | `offcpu` | **可用** | `--pid` 后台 bash：`events=1035 配对=3 阻塞=3 未回切=1`，瓶颈栈落到 `do_wait→__do_sys_wait4→…→bash` |
 | `--flame PNG` | **可用** | oncpu/offcpu/folded 三种模式直出火焰图，见上节 |
+| `--heat SVG/PNG` | **可用** | 同三模式直出调用边热力矩阵；SVG 1112x634、悬停高亮，PNG 带色阶图例；`--heat-top` 控制在 24/18/12 档都排版正常 |
 
 ### 已修的问题（早期 README 的「进 ring 就读不到样本」已不成立）
 
@@ -158,6 +219,14 @@ sudo luajit src/engine.lua --mode oncpu --pid $$ --duration 3 --flame /tmp/oncpu
    引擎自己解析 ELF（symtab/dynsym + PT_LOAD 换 vaddr→文件偏移），`uprobe:/路径:符号` 可用。
 15. **杂项**：decode 过滤 `common_type/flags/preempt_count/pid` 噪音列；`read_cstr` 256→4096；
    comm 缓存封顶 4096 条；samples 里 u64 指针不再打成 `1.84e+19`。
+
+### 四轮（2026-11-11 16:00）：卡点排行 `--rank`
+
+`tools/rank.py` 复用 `flame.load` / `heat.agg` 的归一，输入同一次采样，输出「结论一句话 + 排序表」。
+排序三口径（self/incl/count）、`--rank-top N` 控行数、SVG 悬停出行明细（自身/包含/累计/出现在多少种栈里）。
+两个当初踩到的判断坑已在图上显式规避：① `--limit` 会截断 `top[]`，底部红字报「只收 A/共 B，覆盖 x%」；
+② 最重包含权重常落在共同入口（`_start` 类），此时明说「它是全栈共同入口，不是热点」而不是当成凶手。
+自身=包含的纯叶子行，包含列显示 `·` 避免刷两遍同一个数。
 
 ### 三轮（2026-11-11 15:37）：火焰图 + 一处稳定性
 
