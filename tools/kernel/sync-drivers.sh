@@ -18,7 +18,7 @@
 set -euo pipefail
 
 KDIR=${KDIR:-/home/quqiufeng/kernel/src/linux-7.2.12}
-MODULES=("nvidia 595.99.02" "gpu-unlock 1.0.0")
+MODULES=("nvidia 595.99.02" "gpu-unlock 1.0.0" "v4l2loopback 0.12.7")
 CHECK=0
 INITRAMFS=1
 VER=""

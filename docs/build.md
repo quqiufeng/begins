@@ -10,15 +10,19 @@
 | 版本串 | `7.2.12-20261111-hwreal` |
 | 内核源码 | Linux 7.2.12（`src/linux-7.2.12/`） |
 | config | `configs/config-7.2.12-20261111-hwreal`（**就是装机那一份，逐字节复制**） |
-| `=y` / `=m` | 2175 / 645（CONFIG_ 行 2959） |
-| vmlinuz | 12.0 M |
-| 模块目录 | 151 M / 659 个 `.ko` |
+| `=y` / `=m` | 2243 / 924（CONFIG_ 行 3310） |
+| vmlinuz | 12.1 M |
+| 模块目录 | 165 M / 918 个 `.ko` |
 | initrd | 271 M（含 nvidia 5 个模块） |
-| 构建耗时 | 7m53s（6 核，全新构建）；二次改动增量 274 s |
-| 状态 | 已装、已设为 GRUB 默认 |
+| 构建耗时 | 7m53s（6 核，全新构建）；二次改动增量 274 s；三次改动增量约 3 min |
+| 状态 | 已装、已设为 GRUB 默认、**正在跑**，`#29` 重启验证全绿 |
 
-> 2026-11-11 09:00 做过一次**二次改动**：补回被误裁的 `SQUASHFS`/`VFAT_FS`/`FAT_FS`/`FUSE_FS`/`IPV6`，
-> 详见 §4.5。上表是二次改动**之后**的数字。
+> 上表是**三次改动之后**（即当前正在跑的这个内核）的实测数字。
+>
+> - 2026-11-11 09:00 **二次改动**：补回被误裁的 `SQUASHFS`/`VFAT_FS`/`FAT_FS`/`FUSE_FS`/`IPV6`，详见 §4.5。
+> - 2026-11-11 10:48 **三次改动**（`#29`）：`GPIO_IT87`/`GPIO_WINBOND`/`INPUT_IDEAPAD_SLIDEBAR`
+>   由 `=y` 改 `=m` 消掉三行开机探测噪音，并补回整条 netfilter 链（238 个 CONFIG 行），详见 §4.7。
+>   版本串不变，同名覆盖安装；这也是 `=m` 从 645 涨到 924、`.ko` 从 659 涨到 918 的原因。
 
 ---
 
@@ -296,6 +300,49 @@ sudo depmod -a $V 2>&1 | grep -c 'unknown symbol'      # 0
 
 ---
 
+## 4.7 三次改动：关掉探测噪音 + 补回 netfilter
+
+这一轮改了两件事，都**不改版本串**，同名覆盖安装（覆盖前 build-install.sh 已留 `.prev`）。
+
+### (a) 三个探测型驱动 `=y` → `=m`
+
+`GPIO_IT87` / `GPIO_WINBOND` / `INPUT_IDEAPAD_SLIDEBAR` 在**没有对应硬件**的机器上照样 probe，
+各吐一行 err/warn，于是 `dmesg -l err,warn` 永远不干净，真问题被埋掉。
+本机既无 IT87/Winbond 传感器也无 IdeaPad 滑条，改 `=m`：噪音消失，硬件真出现时 udev 仍会加载。
+
+```bash
+scripts/config --file .config -m GPIO_IT87 -m GPIO_WINBOND -m INPUT_IDEAPAD_SLIDEBAR
+make olddefconfig && grep -E 'CONFIG_(GPIO_IT87|GPIO_WINBOND|INPUT_IDEAPAD_SLIDEBAR)=' .config
+```
+
+### (b) 补回 netfilter：裁剪时整条链被误判成"没硬件"
+
+防火墙/VPN/容器网桥全靠它，`nft`、`iptables`、`docker` 一用就报 `Table does not exist`。
+成片符号在 `configs/netfilter.fragment`（238 个 CONFIG 行），合并进 config：
+
+```bash
+cd ~/kernel/src/linux-7.2.12
+make LSMOD=/dev/null olddefconfig >/dev/null            # 先收敛到确定状态
+scripts/kconfig/merge_config.sh -m .config ~/kernel/configs/netfilter.fragment
+make olddefconfig
+grep -E '^CONFIG_(NETFILTER|NF_TABLES|IP_NF_IPTABLES|NF_CONNTRACK)=' .config   # 必须都不是 n
+```
+
+### 装完必查（编译成功 ≠ 生效）
+
+```bash
+V=7.2.12-20261111-hwreal
+ls /lib/modules/$V/kernel/drivers/gpio/gpio-it87.ko* \
+   /lib/modules/$V/kernel/drivers/gpio/gpio-winbond.ko* \
+   /lib/modules/$V/kernel/drivers/input/input-ideapad-slidebar.ko*   # 三个 =m 真落地
+sudo nft list tables; sudo iptables -L -n >/dev/null && echo iptables-ok
+sudo modprobe nf_tables && echo nf_tables-ok
+```
+
+重启后 `dmesg | grep -iE 'it87|winbond|ideapad'` 应为空，§6 的九项验收一项都不许退化。
+
+---
+
 ## 5. DKMS（nvidia 闭源驱动）
 
 新内核串意味着 nvidia 模块需要**为新内核重编**，否则进桌面是黑屏 / 软件渲染。
@@ -382,7 +429,7 @@ grep -E '^GRUB_DEFAULT' /etc/default/grub
 sudo grep -n 'set default=' /boot/grub/grub.cfg | head -2   # 确认落到 grub.cfg
 ```
 
-**重启后四项验收（缺一不可）：**
+**重启后九项验收（缺一不可）：**
 
 | # | 命令 | 期望 |
 |---|---|---|
@@ -394,8 +441,9 @@ sudo grep -n 'set default=' /boot/grub/grub.cfg | head -2   # 确认落到 grub.
 | 6 | `mount \| grep /boot/efi` | 有 vfat 行（§4.5 改动生效） |
 | 7 | `ip -6 addr \| grep inet6` | 有地址（IPV6 恢复） |
 | 8 | `snap list` | 不报损坏 |
+| 9 | `sudo nft list tables; sudo iptables -L -n` | 不报 `Table does not exist`（§4.7 netfilter 生效） |
 
-八项全过才算 PASS。日常用一天不崩，再清理旧内核。
+九项全过才算 PASS。日常用一天不崩，再清理旧内核。
 
 ---
 
@@ -422,15 +470,17 @@ cd ~/kernel/src/linux-7.2.12 && make olddefconfig
 
 ## 8. 磁盘余量（提前算账）
 
-`/boot` 只有 2.0 G，两个内核的 initrd 就吃掉 751 M。二次改动清理 `.prev` 之后：
+`/boot` 只有 2.0 G，两个内核的 initrd 就吃掉 752 M。**保留 `.prev`/`.old` 备份时**（当前状态）：
 
 | 文件 | 大小 |
 |---|---|
 | `initrd.img-7.2.12-rtx3080-20261025` | 480 M |
 | `initrd.img-7.2.12-20261111-hwreal` | 271 M |
-| 已用 / 剩余 | **811 M / 1017 M**（45%） |
+| `initrd.img-7.2.12-20261111-hwreal.prev` | 271 M |
+| 已用 / 剩余 | **1.1 G / 706 M**（62%） |
 
-> 留 `.prev` 备份时余量只剩 728 M，再加一套就装不下了——这是先算账再动手的理由。
+> 确认新内核跑稳、删掉 `.prev` 和 `.old` 后可回收到约 811 M / 1017 M（45%）；
+> 反过来，余量只剩 700 M 时**再加一套就装不下**——这是先算账再动手的理由。
 
 **下次装内核前必须先清一个旧内核**，否则 `mkinitramfs` 半路 No space 会留下一个坏 initrd
 （比装失败更危险：它能被 GRUB 选到）。
