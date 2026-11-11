@@ -16,8 +16,9 @@
 | 5. 解码 | `format` 文件给出字段偏移（含 `__data_loc` 动态串） | 靠它算 raw/`file=`，不必硬编码结构 |
 
 流程即：**写 tracefs → 内核装探针 → perf 事件 → mmap ring → 按 format 解码**。
-任何一环配置缺失，Lua 侧写得再对也是 `events=0`。本机这五环实测齐全（见下表），
-所以下面那节的 `events=0` 属于**用户态解析侧**的问题，不是内核不给数据。
+任何一环配置缺失，Lua 侧写得再对也是 `events=0`。本机这五环实测齐全（见下表）。
+历史上一度出现过 `events=0`，事后定位是**用户态解码侧**的 bug（`common_type` 按 u32 读），
+不是内核不给数据 —— 详见下面「已修的问题」。
 
 ### 为什么这台机器要专门编译内核
 
@@ -43,7 +44,7 @@ CONFIG_DYNAMIC_FTRACE=y      CONFIG_FPROBE=y           CONFIG_FRAME_POINTER=y
 
 | 路径 | 说明 |
 |---|---|
-| `src/engine.lua` | 主线引擎，552 行。探针解析、perf 属性、ring 读取、通用 format 解码 |
+| `src/engine.lua` | 主线引擎，589 行。探针解析、perf 属性、ring 读取、通用 format 解码、kallsyms 符号化 |
 | `proto/` | 演进原型，**保留作对照，不是稳定接口** |
 | `proto/v4.lua` | 最后一代原型，**实测可用**：kprobe `do_sys_openat2` + `file=+0(%si):string`，2s 收 36758 样本，跨进程读出 `file="/dev/bus/usb/006/001"` |
 | `proto/v3.lua` | v4 前身（去掉字符串提取） |
@@ -76,33 +77,38 @@ sudo luajit src/engine.lua --mode folded  --probe kprobe:do_sys_openat2 --limit 
 | `--limit` | 样本输出条数上限，默认 8 |
 | `--json` | JSON 输出 |
 
-## 当前状态（实测，2026-11-11）
+## 当前状态（实测，2026-11-11 14:20）
 
 | 模式 | 状态 | 证据 |
 |---|---|---|
-| `count` | **可用** | `syscalls:sys_enter_openat 201 次 / 2s (100/s)`，per-cpu 分布正常（cpu5 103 / cpu3 52 / cpu4 19 / cpu0 16） |
-| `samples` | **不可用** | `events=0` |
-| `latency` | **不可用** | `events=0 paired=0`（与 samples 共用 `walk()`） |
-| `folded` | 未验证 | 依赖 samples 的 ring 解析 |
+| `count` | **可用** | `syscalls:sys_enter_openat 200 次 / 2s (100/s)`，per-cpu 分布正常 |
+| `samples` | **可用** | `events=214`，字段全解出（含 `__data_loc` 串、`--str` 跨进程读串） |
+| `latency` | **可用** | `events=569 paired=268 unpaired=19`，按 comm 出 avg/p50/p99/max |
+| `folded` | **可用** | `events=291 stacks=60`，内核栈已符号化 |
+| `uprobe` | **可用** | `uprobe:/tmp/t:0x1129 34.4k 次 / 3s (11466/s)` |
 
-### 已知问题：进 ring 就读不到样本
+### 已修的问题（早期 README 的「进 ring 就读不到样本」已不成立）
 
-`count` 只做 `ioctl(PERF_EVENT_IOC_ENABLE)` + `read(fd, uint64) `取计数，完全不碰 ring，所以出数正常。
-一旦走 `mmap` ring + `walk()` 就 `events=0`。
+1. **`common_type` 读成 u32**（`events=0` 的真因）：raw 首个字段是 `common_type`(u16)，
+   读 4 字节会把 `common_flags`(0x0100) 一起读进来，值变成 `0x01000322`，`by_id` 查不到 → 全部丢弃。
+   改成读 u16 后 samples/latency/folded 三个模式同时恢复。
+2. **`latency` 未填 `pid/tid`** 就调 `key_of()` → `attempt to concatenate local 'pid'`。
+3. **`load_kallsyms` 缓存哨兵失效**：`ksym_addr` 初始化成 `{}`（真值），每次 `sym()` 直接 return；
+   修正后仍会在未命中时重解析 30 万行 `/proc/kallsyms`（表现为 CPU 100% 跑不完）。
+4. **64 位内核地址丢精度**：`tonumber(addr,16)` 是 double，`0xffffffff8d800000` 只剩 2048 字节分辨率，
+   kallsyms 表和查询值一起被压扁。改为全程 16 位小写 hex 串比较，偏移用 32 位切片算。
+5. **`reg_dynamic` 不区分 kind**：uprobe 也写 `/kprobe_events`，永远注册不上。改为按 kind 选
+   `uprobe_events` + `uprobes` 事件组，并以「事件目录是否出现」判定成败（内核 write 时只报 errno）。
+6. **探针残留不自愈**：被 SIGTERM/超时杀掉时 `cleanup()` 不执行，留下 `p:kprobes/lite_N` 占住探针
+   （后续注册全 `EBUSY`）。补了启动自清、SIGTERM/SIGINT 置标志优雅退出、`cleanup` 前先
+   `close`+`munmap` ring（否则删探针 `EIO`）。
 
-**已排除**：
-- 权限/内核支持 —— `perf_open` 返回合法 fd，`mmap` 成功
-- header 读错 —— `data_offset`(bp+1040) / `data_size`(bp+1048) / `data_head`(bp+1024) / `data_tail`(bp+1032) 位置都对
-- **raw 偏移不是原因**（早期 README 的说法是错的）：`v4` 的 `raw = d+p+20` 与 `walk()` 的
-  `p=off+8 → q=p+16 → raw=d+q+4` 算出来同为 `d+off+28`，两者一致
+### 已知限制
 
-**仍待查**：
-- `open_ring` 缓存了 header 的 `off`（真实 data_offset），但 `walk()` 用的是硬编码 `r.d = bp + PAGE`；
-  本机 header 报的正是 4096 所以看不出差别，属于隐患而非当前症状
-- `perf_open` 的 attr 是手工按字节填的（136B 结构，`sample_period=1`、`wakeup_events=1`、
-  `sample_type = TID|TIME|RAW`），字段对齐有没有错位需要拿 `sizeof(struct perf_event_attr)` 对一遍
-- 建议下一步：先用 `perf record -e syscalls:sys_enter_openat` 确认内核侧确有采样，再用 v4 的
-  读取循环原样替换 `walk()` 做二分（v4 已验证能出样本）
+- **uprobe 不支持符号名**：`uprobe:/lib/.../libc.so.6:malloc` 报 `EIO`（内核侧不认），
+  要用 `nm` 拿偏移再写 `uprobe:文件:0x偏移`；`malloc`/`getpid` 在 glibc 里是 IFUNC，本身无实体地址。
+- `walk()` 用硬编码 `r.d = bp + PAGE`，而 header 的 `data_offset` 已缓存未用；本机报的正是 4096，
+  属隐患非当前症状。
 
 ## 前提
 

@@ -245,6 +245,10 @@ $ /tmp/up >/dev/null && sudo head /sys/kernel/tracing/trace
 | `ecapture` | libbpf `link.Uprobe` → 同为 perf_event_open 路径 | **不受影响** ✅ |
 | 手写 tracefs `uprobe_events`（`trace-cmd`、脚本直写） | tracefs 内核侧符号解析 | ⚠️ 必须自己算偏移 |
 
+> 自研引擎 `trace/src/engine.lua` 走的也是 tracefs 直写这条路，实测同样只能吃偏移：
+> `uprobe:文件:0x偏移` 正常出数（`/tmp/t:0x1129` → 3s 收 34.4k 次，11466/s），
+> 写符号名则注册失败。详见 `trace/README.md`。
+
 ### 6.4 tcpdump：通
 
 ```bash
