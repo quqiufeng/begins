@@ -10,12 +10,15 @@
 | 版本串 | `7.2.12-20261111-hwreal` |
 | 内核源码 | Linux 7.2.12（`src/linux-7.2.12/`） |
 | config | `configs/config-7.2.12-20261111-hwreal`（**就是装机那一份，逐字节复制**） |
-| `=y` / `=m` | 2158 / 641（CONFIG_ 行 2935） |
-| vmlinuz | 12.1 M |
-| 模块目录 | 43 M / 649 个 `.ko` |
+| `=y` / `=m` | 2175 / 645（CONFIG_ 行 2959） |
+| vmlinuz | 12.0 M |
+| 模块目录 | 151 M / 659 个 `.ko` |
 | initrd | 271 M（含 nvidia 5 个模块） |
-| 构建耗时 | 7m53s（6 核，全新构建） |
+| 构建耗时 | 7m53s（6 核，全新构建）；二次改动增量 274 s |
 | 状态 | 已装、已设为 GRUB 默认 |
+
+> 2026-11-11 09:00 做过一次**二次改动**：补回被误裁的 `SQUASHFS`/`VFAT_FS`/`FAT_FS`/`FUSE_FS`/`IPV6`，
+> 详见 §4.5。上表是二次改动**之后**的数字。
 
 ---
 
@@ -152,6 +155,68 @@ lsinitramfs /boot/initrd.img-$V | grep -cE 'nvidia.*\.ko'   # 期望 5
 
 ---
 
+## 4.5 二次改动：补回 squashfs / vfat / fuse / ipv6
+
+轮5 把"十几个文件系统连根拔"时，连带砍掉了 `SQUASHFS`、`VFAT_FS`、`FUSE_FS` 和 `IPV6`。
+后果不是"少个功能"，而是**桌面直接残废**：
+
+| 缺失项 | 症状 |
+|---|---|
+| `SQUASHFS` | snap 全坏（`snap list` 报错、firefox/chromium 起不来），`mount \| grep squashfs` 为空 |
+| `VFAT_FS` / `FAT_FS` | `/boot/efi` 是 FAT32，挂不上；fwupd、EFI 相关一并报错 |
+| `FUSE_FS` | `fusermount`、AppImage、gvfs、xdg-desktop-portal 一类全部失效 |
+| `IPV6` | 网络栈、容器、部分浏览器行为异常 |
+
+改回 `=y` 后**增量**编译即可，不必 clean（只重编受影响的单元）：
+
+```bash
+cd ~/kernel/src/linux-7.2.12
+scripts/config --file .config -e SQUASHFS -e SQUASHFS_XZ -e VFAT_FS -e FAT_FS -e FUSE_FS -e IPV6
+make olddefconfig
+grep -E '^CONFIG_(SQUASHFS|SQUASHFS_XZ|VFAT_FS|FAT_FS|FUSE_FS|IPV6)=' .config   # 六项都要 =y
+
+make -j6                    # 274 s
+sudo make modules_install   # 2 s
+sudo make install           # 6 s，自动 update-initramfs + update-grub
+```
+
+> 前提：`.config` 里的硬件清单（§1）没动过，否则 `olddefconfig` 可能把 `=y` 静默丢掉（见 §0 第 3 条）。
+
+装完**先别重启**，用 `System.map` 验符号，比进系统再排查省事得多：
+
+```bash
+V=7.2.12-20261111-hwreal
+for s in squashfs_fill_super vfat_fill_super fuse_fill_super inet6_create; do
+  grep -qw $s /boot/System.map-$V && echo "  $s OK" || echo "  $s MISSING"
+done
+grep -E '^CONFIG_(SQUASHFS|VFAT_FS|FUSE_FS|IPV6)=y' /boot/config-$V   # 四项回显
+```
+
+### 覆盖同名版本必须先备份
+
+二次改动沿用了同一个 `LOCALVERSION`（`-20261111-hwreal`），`make install` 是**覆盖**现役内核。
+覆盖前先留一套能启动的备份，否则新内核起不来就等于没有退路：
+
+```bash
+V=7.2.12-20261111-hwreal
+sudo cp -a /boot/vmlinuz-$V{,.prev}
+sudo cp -a /boot/initrd.img-$V{,.prev}
+sudo cp -a /boot/config-$V{,.prev}
+sudo cp -a /boot/System.map-$V{,.prev}
+sudo cp -a /lib/modules/$V{,.prev}
+sudo update-grub     # .prev 自动变成菜单里独立一项，等于白送一层保险
+```
+
+跑稳后删掉（本次已删，释放 441 M：/boot 289 M + 模块目录 151 M）：
+
+```bash
+sudo rm -f /boot/{vmlinuz,initrd.img,config,System.map}-$V.prev
+sudo rm -rf /lib/modules/$V.prev
+sudo update-grub     # 菜单自动清理，`grep -c hwreal.prev /boot/grub/grub.cfg` 应为 0
+```
+
+---
+
 ## 5. DKMS（nvidia 闭源驱动）
 
 新内核串意味着 nvidia 模块需要**为新内核重编**，否则进桌面是黑屏 / 软件渲染。
@@ -211,8 +276,12 @@ sudo grep -n 'set default=' /boot/grub/grub.cfg | head -2   # 确认落到 grub.
 | 2 | 进图形界面 | 桌面正常（根盘 LVM 链路通） |
 | 3 | `nvidia-smi` | 输出 3080 信息（DKMS 模块加载成功） |
 | 4 | `ip a` | 有 IP（R8169 + 固件） |
+| 5 | `mount \| grep -c squashfs` | ≥ 1（snap 挂载恢复） |
+| 6 | `mount \| grep /boot/efi` | 有 vfat 行（§4.5 改动生效） |
+| 7 | `ip -6 addr \| grep inet6` | 有地址（IPV6 恢复） |
+| 8 | `snap list` | 不报损坏 |
 
-四项全过才算 PASS。日常用一天不崩，再清理旧内核。
+八项全过才算 PASS。日常用一天不崩，再清理旧内核。
 
 ---
 
@@ -236,13 +305,15 @@ cp ~/kernel/configs/config-round5-7m53s.ok ~/kernel/src/linux-7.2.12/.config
 
 ## 8. 磁盘余量（提前算账）
 
-`/boot` 只有 2.0 G，两个内核的 initrd 就吃掉 751 M：
+`/boot` 只有 2.0 G，两个内核的 initrd 就吃掉 751 M。二次改动清理 `.prev` 之后：
 
 | 文件 | 大小 |
 |---|---|
 | `initrd.img-7.2.12-rtx3080-20261025` | 480 M |
 | `initrd.img-7.2.12-20261111-hwreal` | 271 M |
-| 剩余 | **705 M** |
+| 已用 / 剩余 | **811 M / 1017 M**（45%） |
+
+> 留 `.prev` 备份时余量只剩 728 M，再加一套就装不下了——这是先算账再动手的理由。
 
 **下次装内核前必须先清一个旧内核**，否则 `mkinitramfs` 半路 No space 会留下一个坏 initrd
 （比装失败更危险：它能被 GRUB 选到）。

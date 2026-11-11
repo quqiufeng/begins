@@ -9,7 +9,7 @@
 |---|---|
 | 项目名 | `begin` |
 | 中文名 | 起初 |
-| 内核版本串 | `7.2.12-20261111-hwreal`（**当前在跑**，真机四项验收 PASS） |
+| 内核版本串 | `7.2.12-20261111-hwreal`（**当前在跑**，真机四项验收 PASS；已二次改动补回 squashfs/vfat/fuse/ipv6，待重启验证） |
 | 下一版命名 | `7.2.12-begin`（P1 起用） |
 | 装机 config | `configs/config-7.2.12-20261111-hwreal`（仓库内，逐字节即装机件） |
 | 旧名 | `kdb`（2026-11-10 停用） |
@@ -144,6 +144,10 @@ tools/trim/verify-boot.sh
 
 **要从零装出一模一样的内核，看 [`docs/build.md`](docs/build.md)**：9 步全流程 + 每一步的断言命令 + 回退路径，
 配套的装机 config 就是 `configs/config-7.2.12-20261111-hwreal`（入仓库，直接 `cp` 即可编译）。
+
+二次改动（§4.5）补回了轮5 误裁的 `SQUASHFS`/`VFAT_FS`/`FAT_FS`/`FUSE_FS`/`IPV6`——
+缺了它们 snap 全坏、`/boot/efi` 挂不上。增量编译 274 s，覆盖安装前先留 `.prev` 备份，
+装机 config 已同步更新（`=y 2175 / =m 645`，659 个 `.ko`）。
 
 ### 注意
 

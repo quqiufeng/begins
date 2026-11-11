@@ -168,6 +168,12 @@ find drivers -name '*.o' -printf '%h\n' | awk -F/ 'NF>=3{print $1"/"$2"/"$3} NF=
 
 轮5 的开关清单见 `logs/round5-summary.txt`，可 `scripts/config --disable ...` 原样重放。
 
+> ⚠ **轮5 的"文件系统连根拔"里有五个是错的**：`SQUASHFS`、`VFAT_FS`、`FAT_FS`、`FUSE_FS`、`IPV6`。
+> 它们不属于"没有硬件的驱动"，而是桌面运行时必需（snap 全靠 squashfs，`/boot/efi` 是 FAT32）。
+> 砍掉的表现不是少个功能，而是 snap 全坏 + ESP 挂不上。已于 2026-11-11 09:00 补回 `=y`，
+> 编译安装过程见 [`docs/build.md`](build.md) §4.5。
+> 教训：**"文件系统"不是一类东西**，要按"本机谁在用它"逐个判，不能按目录一刀切。
+
 ## 四、砍不动的边界（补充新踩的坑）
 
 原表那 6 条（`NR_CPUS` / `PREEMPT_RT` / `DEBUG_SPINLOCK` / `SMP` / `LOCKDEP` / `MEMCG`）依然成立。新增两条：
@@ -298,7 +304,18 @@ MODULES IO_URING                             # nvidia DKMS 需要 MODULES
 
 以轮5 为底，恢复 439 项（存储34 / DRM22 / USB-输入131 / 网络1 / EFI-PCI5 / 加解密7 / 其他241），
 `make olddefconfig` 后 `=y 2158 / =m 641`；`make drivers/md/` 退出码 0，`dm.o`、`dm-crypt.o` 已产出。
-备份：`/tmp/config-round5-before-fix.bak`。**尚未全量编译、尚未安装。**
+备份：`/tmp/config-round5-before-fix.bak`。
+
+后续进展（2026-11-11）：
+
+| 阶段 | 结果 |
+|---|---|
+| 全量编译 + 装机 | PASS，7m53s，已设为 GRUB 默认 |
+| 二次改动补 6 项（squashfs/xz、vfat、fat、fuse、ipv6） | PASS，增量 274 s，覆盖安装 |
+| 当前 config | `configs/config-7.2.12-20261111-hwreal`，`=y 2175 / =m 645`，659 个 `.ko` |
+| 旧 `.prev` 备份 | 已清理，释放 441 M |
+
+**唯一未完成的一项**：新内核尚未重启验证（§4.5 的八项验收跑在重启之后）。
 
 ---
 
