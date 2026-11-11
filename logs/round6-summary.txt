@@ -1,0 +1,6 @@
+round6 sandy-dbg2-20261111: 全量重建(DEBUG_INFO 变更触发全部重编) bzImage=18M vmlinux=450M System.map=9.4M
+config: +BPF_SYSCALL +BPF_JIT +CGROUP_BPF +DEBUG_INFO(DWARF5) +BTF +FUNCTION_TRACER +FUNCTION_GRAPH +DYNAMIC_FTRACE +FTRACE_SYSCALLS
+remote(192.168.1.68): boot OK -> verify-remote.sh PASS=21 FAIL=0
+  btf/vmlinux=6926098B  available_filter_functions=63363  uprobe_syms=203  bpftrace kprobe OK
+  modules=110M(带调试信息) initrd=53M
+fallback: GRUB默认仍旧内核 sandy-20261102，一次性条目+panic=10 已复位
