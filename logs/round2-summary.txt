@@ -1,0 +1,3 @@
+round2 done rc=0
+wall=12m24s bzImage=12m08s
+vmlinux=75M ko=1767 o=7633

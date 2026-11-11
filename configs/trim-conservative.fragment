@@ -1,0 +1,37 @@
+# 保守裁剪片段（方案 1）
+# 目标：单机 + QEMU 测试内核，砍掉约 700 个编译单元，不碰 virtio/ext4/9p/串口/EFI
+# 用法：scripts/kconfig/merge_config.sh -m .config <本文件> && make olddefconfig
+
+# --- netfilter 全族：241 个编译单元 ---
+# CONFIG_NETFILTER is not set
+# CONFIG_NF_TABLES is not set
+# CONFIG_NETFILTER_NETLINK is not set
+
+# --- 音频：191 个编译单元 ---
+# CONFIG_SOUND is not set
+
+# --- SMB 服务端 + CIFS 客户端：81 个编译单元 ---
+# CONFIG_SMB_SERVER is not set
+# CONFIG_CIFS is not set
+
+# --- NLS 代码页：51 个编译单元（无 FAT/CIFS 后不再需要）---
+# NLS 关不掉：drivers/acpi 与 drivers/usb 都 select NLS（保留，51 单元）
+
+# --- 老式/集群文件系统：ocfs2 54 + gfs2 24 + jfs 23 ---
+# CONFIG_OCFS2_FS is not set
+# CONFIG_GFS2_FS is not set
+# CONFIG_JFS_FS is not set
+
+# --- 无用的传输/协议族：sctp 21 + rxrpc 35 + rds 9 + atm 9 ---
+# CONFIG_IP_SCTP is not set   # 符号名是 IP_SCTP，写 SCTP 是空操作
+# CONFIG_AF_RXRPC is not set
+# CONFIG_RDS is not set
+# CONFIG_ATM is not set
+
+# --- 连带拉回项（select 依赖，必须一起关，否则 NLS / AF_RXRPC 会复活）---
+# CONFIG_FAT_FS is not set
+# CONFIG_VFAT_FS is not set
+# CONFIG_MSDOS_FS is not set
+# CONFIG_ISO9660_FS is not set
+# CONFIG_AFS_FS is not set
+# CONFIG_CEPH_FS is not set

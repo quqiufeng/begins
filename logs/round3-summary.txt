@@ -1,0 +1,3 @@
+round3 TRUE clean build: wall=10m34s bzImage=10m17s rc=0
+units=6002 ko=1008 vmlinux=61M bzImage=13M
+note: previous 5m58s was INVALID (make clean broken -> incremental)

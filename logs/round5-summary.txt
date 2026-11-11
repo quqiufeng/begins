@@ -1,0 +1,4 @@
+round5 TRUE clean build: wall=7m53s rc=0 units=4584 ko=656 vmlinux=48M bzImage=9.0M warnings=3
+round5 cuts: +PHYLIB TPM EDAC PINCTRL ACCESSIBILITY NETFILTER BRIDGE BT WIRELESS CAN NFC 9P/xfs/ntfs3/cifs/fuse/squashfs/nilfs2/hfsplus/orangefs/jfs/gfs2/ocfs2... NUMA CGROUPS HIBERNATION SUSPEND PM_SLEEP CPU_IDLE KALLSYMS_ALL
+boot verify: qemu -cpu max + initramfs + virtio-blk 32M ext4 -> TEST:EXT4-MOUNT-OK, 8250 OK
+NOTE: qemu 必须 -cpu max（内核按 -march=native 编译）

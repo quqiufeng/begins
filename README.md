@@ -9,7 +9,9 @@
 |---|---|
 | 项目名 | `begin` |
 | 中文名 | 起初 |
-| 内核版本串 | `7.2.12-begin`（下次构建生效；当前待测产物是 `-rtx3080-20261025-test`） |
+| 内核版本串 | `7.2.12-20261111-hwreal`（**当前在跑**，真机四项验收 PASS） |
+| 下一版命名 | `7.2.12-begin`（P1 起用） |
+| 装机 config | `configs/config-7.2.12-20261111-hwreal`（仓库内，逐字节即装机件） |
 | 旧名 | `kdb`（2026-11-10 停用） |
 
 ## 现在是什么（事实，不是愿景）
@@ -60,8 +62,12 @@ src/linux-7.2.12/   裁剪中的内核树（真正的工作面，本地，不入
 src-archive/        裁剪后源码快照 tar.zst（88.1 MB，入库，解包即用）
 build/              构建产物与日志
 tools/trim/         lint_includes.py（找彻底缺失的头文件）
+                    clean-build.sh（真·全新构建+计时，绕开不删 .o 的 make clean）
+                    verify-boot.sh（QEMU 真启动 + ext4 挂载断言）
 tools/abi/          check_symvers.py（零编译 CRC 对表）
-docs/               设计文档（trim.md 是当前主文档）
+docs/               设计文档
+  build.md          **裁剪→编译→安装 完整流程**（照着敲就能复现装机内核）
+  trim.md           裁剪方法与五轮账本（主文档）
 notes/              踩坑记录
 kpi/                API 面清单（愿景期产物，暂不推进）
 ```
@@ -128,6 +134,16 @@ sudo update-grub
 只动了 `.config` 和删掉整个不需要的驱动目录实体，**C 代码原样未改**。所以任何上游文档、补丁、`git bisect` 经验都照常适用。
 
 砍掉的清单在 `tools/trim/disable.list`（2265 个符号），规则在 `tools/trim/rules.txt`。想自己重走一遍裁剪见 `docs/trim.md`。
+
+**已实测跑通五轮：全新构建 20m05s → 7m53s，编译单元 9000 → 4584。** 方法与账本在 `docs/trim.md` 第 82 行起（含真清场、记账口径、QEMU 验证的三个坑）。复现两条命令：
+
+```bash
+tools/trim/clean-build.sh configs/config-round5-7m53s.ok 6
+tools/trim/verify-boot.sh
+```
+
+**要从零装出一模一样的内核，看 [`docs/build.md`](docs/build.md)**：9 步全流程 + 每一步的断言命令 + 回退路径，
+配套的装机 config 就是 `configs/config-7.2.12-20261111-hwreal`（入仓库，直接 `cp` 即可编译）。
 
 ### 注意
 

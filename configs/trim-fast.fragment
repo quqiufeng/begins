@@ -1,0 +1,24 @@
+# ============================================================
+# 第二轮裁剪：把全新构建从 13m42s 压向 ~10 分钟
+# 实测依据：-g 让单文件 0.30s vs 0.28s（+10%），但 vmlinux 547MB
+#           → 1768 次 BTF + 模块尾部 96s 全部由 DWARF 引起。
+# 记录：基线 allmod-ish 20m05s → 第一轮 13m42s → 本轮目标 <=10m
+# ============================================================
+
+# --- 调试信息：DWARF 与 BTF 一起关（BTF 依赖 DEBUG_INFO，自动失效）
+# 保留 KALLSYMS：oops 栈里仍有函数名，只是没有行号/局部变量
+CONFIG_DEBUG_INFO_NONE=y
+# CONFIG_DEBUG_INFO_BTF is not set
+# CONFIG_DEBUG_INFO_BTF_MODULES is not set
+
+# --- 按单元数排序的大件（QEMU 测试内核不需要）---
+# CONFIG_HID_SUPPORT is not set      # 293 单元；串口/PS2 足够
+# CONFIG_MTD is not set              #  93 单元；无 flash
+# CONFIG_CRYPTO_HW is not set        # 158 单元；无硬件加密卡
+# CONFIG_MD is not set               # 107 单元；不组 RAID/LVM
+# CONFIG_I2C is not set              # 102 单元；无 I2C 设备
+# CONFIG_RTC_CLASS is not set        # 131 单元；测试内核不需要墙钟
+# CONFIG_PPS is not set
+# CONFIG_PWM is not set
+# CONFIG_HWMON is not set
+# CONFIG_BACKLIGHT_CLASS_DEVICE is not set   # 59 单元
