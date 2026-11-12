@@ -44,8 +44,10 @@ CONFIG_DYNAMIC_FTRACE=y      CONFIG_FPROBE=y           CONFIG_FRAME_POINTER=y
 
 | 路径 | 说明 |
 |---|---|
-| `src/engine.lua` | 主线引擎，1521 行。探针解析、perf 属性、ring 读取、通用 format 解码、kallsyms 符号化 |
-| `tools/flame.py` `tools/heat.py` `tools/rank.py` | 火焰图 / 热力图 / 卡点排行渲染，共用 `flame.load` 归一 |
+| `src/engine.lua` | 主线引擎，1534 行。探针解析、perf 属性、ring 读取、通用 format 解码、kallsyms 符号化 |
+| `tools/render.lua` | 火焰图 / 热力图 / 卡点排行三合一渲染，**纯 LuaJIT、零 Python**；共用一套 scrub/load 归一，只出 SVG（交互 JS 内联） |
+| `tools/svgpng.lua` | SVG→PNG（cairo + librsvg FFI，自包含单文件）；引擎在进程内调用，`--flame/--heat/--rank x.png` 全走它 |
+| `proto/render-py/` | 移植前的 Python 渲染三件套（`flame/heat/rank.py`），**只作对照留档，已不参与任何流程** |
 | `proto/` | 演进原型，**保留作对照，不是稳定接口** |
 | `proto/v4.lua` | 最后一代原型，**实测可用**：kprobe `do_sys_openat2` + `file=+0(%si):string`，2s 收 36758 样本，跨进程读出 `file="/dev/bus/usb/006/001"` |
 | `proto/v3.lua` | v4 前身（去掉字符串提取） |
@@ -78,7 +80,7 @@ sudo luajit src/engine.lua --mode folded  --probe kprobe:do_sys_openat2 --limit 
 | `--ring-size` | ring data 页数，默认 8（32KB/CPU）；高频探针必须调大 |
 | `--limit` | 样本输出条数上限，默认 8 |
 | `--json` | JSON 输出 |
-| `--flame FILE` | oncpu/offcpu/folded 采完直接出火焰图：`.svg` 可交互（悬停/点击缩放），其他后缀走 PIL 出 PNG，见下 |
+| `--flame FILE` | oncpu/offcpu/folded 采完直接出火焰图：`.svg` 可交互（悬停/点击缩放），其他后缀由引擎进程内转 PNG，见下 |
 | `--heat FILE` | 同样三种模式采完直接出**函数调用热力图**（行=调用者/列=被调用者），`.svg` 可交互悬停高亮同行同列，见下 |
 | `--heat-top N` | 热力图取前 N 个热门函数，默认 24 |
 | `--rank FILE` | 同样三种模式采完直接出**卡点排行榜**（结论一句话 + 排序表），见下 |
@@ -87,11 +89,12 @@ sudo luajit src/engine.lua --mode folded  --probe kprobe:do_sys_openat2 --limit 
 
 ## 火焰图（`--flame`）
 
-`tools/flame.py` 双后端、零 Chrome、零 brendangregg 脚本：
+`tools/render.lua` 双后端、零 Chrome、零 brendangregg 脚本：
 
 - `--flame x.svg` → **可交互 SVG**（首选，只需标准库）：悬停任意框看样本数与占比，点击框放大到该子树，
   点空白退回全图；同一份文件里还内嵌了静态 rect，丢进没有 JS 的查看器（Inkscape/rsvg）照样能看。
-- `--flame x.png` → PIL 位图（需要 PIL，纯 pip --user 装即可；root 跑时会 `sudo -u $SUDO_USER` 回落渲染）。
+- `--flame x.png` → 位图：`render.lua` 仍只写 SVG，引擎在进程内用 `tools/svgpng.lua`（cairo + librsvg）转成 2 倍图 PNG，
+  **不需要 PIL、不用切身份、不用 Chrome**；转换失败会保留中间 SVG 并在 stderr 说明路径。
 
 ```bash
 # 盯住某个进程的 CPU 热点（pid 全线程），顺便出可交互图
@@ -106,13 +109,15 @@ sudo luajit src/engine.lua --mode oncpu --pid $$ --duration 3 --flame /tmp/oncpu
 
 要点：
 
+- **纯 LuaJIT**：渲染全在 `tools/render.lua`，引擎进程内 `dofile` 调它，不再起 `python3` 子进程；
+  旧 Python 版挪到 `proto/render-py/` 只作对照（并列权重的先后两家都不保证，逐字节比对时以等权重集合为准）。
 - **方向**：内核给的是「叶子在前」，出栈时已反成 `root;…;leaf`（JSON 的 `frame_dir` 标明方向），
-  `flame.py` 据此归一，根在下、热点在顶，两种模式都不会画反。
+  `render.lua` 据此归一，根在下、热点在顶，两种模式都不会画反。
 - **折叠重复帧**：unwind 在不靠谱的栈帧上会扫出几十层同一地址，连续同址压成一帧并在副标题记数量。
 - **用户态裸地址**：kprobe 只符号化内核栈，用户态一截是 `0x00007ef8…`，ASLR 下每条都不同——直接展开会炸成上万节点，
   因此统一归并成 `[user-addr]` 占位帧（纯 ASCII，mono 字体没有 CJK 字形），保留栈深度但不保留区分度。
 - **暖/冷色**：含偏移的裸地址/内核符号暖色，`libc.so.6` 这类用户态冷色。
-- **PIL 权限**：pip `--user` 装的 PIL 在 root 的 site-packages 里没有，引擎按 `$SUDO_USER` 切回调用者身份跑渲染，临时 JSON 也 chmod 644。
+- **零 Python 依赖**：`tools/render.lua` 只写 SVG（纯 LuaJIT 标准库 + 内联 JS），PNG 由引擎调 `tools/svgpng.lua` 转，所以 root/普通用户行为一致，没有 PIL 权限坑，也不再需要解释器。
 - **高度自适应**：`ROW=17`，图高 = 头 + 最深栈层数；过窄（<0.7px）的框省略并在页脚计数。
 
 ## 调用热力图（`--heat`）
@@ -137,7 +142,7 @@ sudo luajit src/engine.lua --mode offcpu --pid $$ --duration 5 --heat /tmp/block
   SVG 版悬停任意格子会把**同一行同一列**点亮、其余压暗，快速定位「谁在调它、它又调了谁」。
 - **左下 最热调用边**：Top 8 边平铺成 `A → B 权重 · 占比`，直接抄进报告。
 
-与火焰图共用同一套归一规则（复用 `tools/flame.py` 的 `load/scrub`）：重复帧折叠、用户态裸地址归并为
+与火焰图共用同一套归一规则（复用 `tools/render.lua` 的 `scrub/load`）：重复帧折叠、用户态裸地址归并为
 `[user-addr]`、CJK 字体回退都一致，所以两图里函数名可以互相对照；`--heat` 与 `--flame` 也可以一次采样同时出。
 
 ## 卡点排行（`--rank`）
@@ -166,8 +171,8 @@ sudo luajit src/engine.lua --mode oncpu --duration 3 --rank /tmp/rank.svg --rank
   裸偏移占比过半时提示加 `--sym` 或给 pid 对应 ELF，否则排行榜全是 `python3.12+0x15bd25` 这种没法看的地址。
 
 排序口径 `--rank-by`：`self`（默认，自身权重，找真热点）、`incl`（含下游，找瓶颈子系统）、`count`（命中次数）。
-`--rank-top N` 控制行数（默认 18）。`.svg` 纯标准库、`.png` 走 PIL，没有 PIL 自动退回 SVG。
-与火焰图/热力图共用 `tools/flame.py` 的 `load` 归一，三张图函数名可互相对照，也可以一次采样同时出。
+`--rank-top N` 控制行数（默认 18）。`.svg` 纯标准库直出，`.png` 由引擎用 `tools/svgpng.lua` 转；三张图同一套口径。
+与火焰图/热力图共用 `tools/render.lua` 的 `load` 归一，三张图函数名可互相对照，也可以一次采样同时出。
 
 ## 当前状态（实测，2026-11-11 14:29）
 
@@ -222,7 +227,7 @@ sudo luajit src/engine.lua --mode oncpu --duration 3 --rank /tmp/rank.svg --rank
 
 ### 四轮（2026-11-11 16:00）：卡点排行 `--rank`
 
-`tools/rank.py` 复用 `flame.load` / `heat.agg` 的归一，输入同一次采样，输出「结论一句话 + 排序表」。
+`tools/render.lua` 的 rank 后端复用 flame/heat 的同一套归一，输入同一次采样，输出「结论一句话 + 排序表」。
 排序三口径（self/incl/count）、`--rank-top N` 控行数、SVG 悬停出行明细（自身/包含/累计/出现在多少种栈里）。
 两个当初踩到的判断坑已在图上显式规避：① `--limit` 会截断 `top[]`，底部红字报「只收 A/共 B，覆盖 x%」；
 ② 最重包含权重常落在共同入口（`_start` 类），此时明说「它是全栈共同入口，不是热点」而不是当成凶手。

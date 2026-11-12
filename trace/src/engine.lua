@@ -1400,53 +1400,66 @@ if stats.lost > 0 or stats.throttled > 0 then
                    "统计偏小；用 --ring-size 调大或收窄探针范围重跑\n"):format(stats.lost, stats.throttled))
 end
 
--- --flame / --heat：采完直接出图。两者共用同一份 JSON，只是渲染脚本不同
+-- --flame / --heat / --rank：采完直接出图，全程进程内（tools/render.lua + cairo/librsvg），零 Python
 local RENDER = {
-  flame = { file = "flame.py", what = "火焰图", modes = { oncpu = 1, offcpu = 1, folded = 1 } },
-  heat  = { file = "heat.py",  what = "热力图", modes = { oncpu = 1, offcpu = 1, folded = 1 } },
-  rank  = { file = "rank.py",  what = "卡点排行", modes = { oncpu = 1, offcpu = 1, folded = 1 } },
+  flame = { what = "火焰图",   modes = { oncpu = 1, offcpu = 1, folded = 1 } },
+  heat  = { what = "热力图",   modes = { oncpu = 1, offcpu = 1, folded = 1 } },
+  rank  = { what = "卡点排行", modes = { oncpu = 1, offcpu = 1, folded = 1 } },
 }
+-- render.lua / svgpng.lua 里都有 ffi.cdef，dofile 两次会 "attempt to redefine"；缓存住只加载一次
+local MODCACHE = {}
+local function load_lua(path)
+  local m = MODCACHE[path]
+  if not m then m = dofile(path) MODCACHE[path] = m end
+  return m
+end
 local function render(kind, out)
   local cfg = RENDER[kind]
-  local mode_ok = cfg.modes[opt.mode]
-  if not mode_ok then
+  if not cfg.modes[opt.mode] then
     io.stderr:write(("[trace_engine] --%s 只支持 oncpu/offcpu/folded，当前 %s 跳过\n"):format(kind, tostring(opt.mode)))
     return
   end
   local self = arg[0] or "src/engine.lua"
   local dir = self:match("^(.*)/[^/]*$") or "."
   local fp
-  for _, c in ipairs({ dir.."/tools/"..cfg.file, dir.."/../tools/"..cfg.file, "tools/"..cfg.file }) do
+  for _, c in ipairs({ dir.."/tools/render.lua", dir.."/../tools/render.lua", "tools/render.lua" }) do
     if io.open(c) then fp = c break end
   end
-  if not fp then fail("找不到 tools/"..cfg.file) end
-  local tmp = os.tmpname()
-  local f = io.open(tmp, "w") f:write(require("cjson").encode(result)) f:close()
-  os.execute(("chmod 644 %q"):format(tmp))   -- 以调用者身份渲染，得让它读得到
+  if not fp then fail("找不到 tools/render.lua") end
+  -- svgpng.lua 跟渲染脚本同目录：不能拿 arg[0] 的 dir 拼（src/engine.lua 的 dir 是 src）
+  local pnglua = fp:gsub("[^/]*$", "") .. "svgpng.lua"
   local label = ({ oncpu = "on-CPU", offcpu = "off-CPU 阻塞时长", folded = "折叠栈" })[opt.mode] or opt.mode
   local rate = result.freq and ("@"..result.freq.."Hz") or (result.unit == "ms" and "@阻塞时长" or "")
   local t = ("%s · %s · %ds %s%s"):format(label,
     os.date("%m-%d %H:%M"), opt.duration, rate,
     opt.pid and (" · pid "..opt.pid) or "")
-  -- PIL 通常是 pip --user 装的，root 的 site-packages 里没有；渲染要回到调用者身份
-  local su = os.getenv("SUDO_USER")
-  local pre = (su and su ~= "") and ("sudo -n -u "..su.." -H ") or ""
-  local extra = ""
-  if kind == "heat" then
-    extra = " " .. tostring(opt.heat_top or 24)
-  elseif kind == "rank" then
-    extra = (" %d %s"):format(opt.rank_top or 18, opt.rank_by or "self")
+  -- 渲染脚本只出 SVG；要 PNG 就在进程内用 cairo+librsvg 转（2 倍图，汇报材料直接可用）
+  local want_png = out:lower():match("%.png$") ~= nil
+  local tmp = want_png and os.tmpname() or nil
+  local svgout = want_png and (tmp .. ".svg") or out
+  local opts = { heat_top = opt.heat_top, rank_top = opt.rank_top, rank_by = opt.rank_by }
+  local rend = load_lua(fp)
+  local ok, err = rend.render(kind, result, svgout, t, opts)
+  if not ok then
+    io.stderr:write(("[trace_engine] %s 渲染失败：%s\n"):format(cfg.what, tostring(err)))
+    return
   end
-  local cmd = ("%spython3 %q %q %q %q%s"):format(pre, fp, tmp, out, t, extra)
-  local ok = os.execute(cmd)
-  os.remove(tmp)
-  local kindtxt = out:lower():match("%.svg$") and "SVG(可交互)" or "PNG"
-  io.stderr:write(("[trace_engine] %s %s -> %s %s\n"):format(cfg.what, kindtxt, out,
-                   ok == 0 and "" or "(渲染失败)"))
+  local note, kindtxt = "", want_png and "PNG" or "SVG(可交互)"
+  if want_png then
+    local pok, perr = pcall(function()
+      local svg = io.open(svgout, "rb")
+      if not svg then error("读不到临时 SVG: " .. svgout, 0) end
+      local body = svg:read("*a") svg:close()
+      local png = load_lua(pnglua)
+      local done, why = png.render(body, out, 2)
+      if not done then error(why, 0) end
+    end)
+    if not pok then note = "(PNG 转换失败：" .. tostring(perr) .. "，SVG 留在 " .. svgout .. ")" end
+    if pok then os.remove(svgout) end        -- 只删中间产物；直接要 .svg 时不能删用户给的路径
+  end
+  io.stderr:write(("[trace_engine] %s %s -> %s %s\n"):format(cfg.what, kindtxt, out, note))
 end
-if opt.flame and opt.heat and opt.flame == opt.heat then
-  fail("--flame 和 --heat 不能写到同一个文件（会互相覆盖）；给两个不同路径")
-end
+
 if opt.flame then render("flame", opt.flame) end
 if opt.heat  then render("heat",  opt.heat)  end
 if opt.rank  then render("rank",  opt.rank)  end

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """折叠栈 -> 卡点排行榜：按自身/包含/命中排序，顶部一句话说清卡在哪
 输入：lite trace_engine --json 的 top[]/folded[]（与 flame.py / heat.py 同一套归一）
-用法：rank.py in.json out.svg|out.png "标题" [topN] [sortkey]
+用法：rank.py in.json out.svg "标题" [topN] [sortkey]
       sortkey = self(默认,自身权重) | incl(含下游) | count(命中高者优先)
-      .svg 纯标准库，悬停行出明细；.png 走 PIL（没有就退回同名 .svg）
+      .svg 纯标准库，悬停行出明细；.png 由 engine.lua 用 cairo+librsvg 转
 坑：top[] 受 --limit 控制，默认只留 40 条，结论会如实标出覆盖率
 """
 import os, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from flame import load, CJK          # 归一化规则必须和火焰图一致
+from flame import load               # 归一化规则必须和火焰图一致
 from heat import agg, fmt, clip, esc
 
 PAD = 16
@@ -118,8 +118,10 @@ def rows_of(self_w, incl_w, stk, sortkey, topn):
     return sorted(self_w.keys(), key=key)[:topn]
 
 
-def geom(n):
-    return TOPH + 26 + max(1, n) * ROW + 54
+def geom(n, nnotes):
+    # 底部要留够：每条红色提示一行 15px + 页脚一行 16px + 边距，
+    # 否则两条提示会压到页脚上（之前只按一行提示算，2 条时重叠）
+    return TOPH + 26 + max(1, n) * ROW + 34 + max(1, nnotes) * 15
 
 
 def subtitle(sortkey, n, tot, unit_ms):
@@ -144,8 +146,9 @@ def notes(j, folded, cov, got, unit_ms):
 def svg(j, folded, topn, sortkey, title, out):
     unit_ms, self_w, incl_w, edges, tot, stk = stats(j, folded)
     rows = rows_of(self_w, incl_w, stk, sortkey, topn)
-    H = geom(len(rows))
     head, share, (path, _), topf, got, cov = verdict(j, unit_ms, self_w, incl_w, tot, folded)
+    nts = notes(j, folded, cov, got, unit_ms)   # 依赖 verdict 给出的 cov/got，必须排在它后面
+    H = geom(len(rows), len(nts))
     mx = max([incl_w.get(r, 0) for r in rows] or [1]) or 1
     s = ['<?xml version="1.0" encoding="UTF-8"?>',
          '<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" viewBox="0 0 %d %d" '
@@ -207,81 +210,13 @@ def svg(j, folded, topn, sortkey, title, out):
                  % (X_CUM, yy + 8, cum))
         s.append('</g>')
 
-    for k, t in enumerate(notes(j, folded, cov, got, unit_ms)):
+    for k, t in enumerate(nts):
         s.append('<text x="%d" y="%d" font-size="10.5" fill="#b2182b">%s</text>'
-                 % (PAD, H - 40 + k * 15 - (0 if len(notes(j, folded, cov, got, unit_ms)) > 1 else 14),
-                    esc(fit(t, W - 2 * PAD, 10.5))))
+                 % (PAD, H - 28 - (len(nts) - 1 - k) * 15, esc(fit(t, W - 2 * PAD, 10.5))))
     s.append('<text x="%d" y="%d" font-size="11" fill="#8a8f98">trace_engine · 自身=采样点落在此函数，'
              '包含=含下游 · 采样模式命中=样本数或毫秒，folded 模式=真实调用次数</text>' % (PAD, H - 16))
     s.append('</svg>')
     open(out, "w", encoding="utf-8").write("\n".join(s))
-    return out
-
-
-def png(j, folded, topn, sortkey, title, out):
-    from PIL import Image, ImageDraw, ImageFont
-    unit_ms, self_w, incl_w, edges, tot, stk = stats(j, folded)
-    rows = rows_of(self_w, incl_w, stk, sortkey, topn)
-    H = geom(len(rows))
-    head, share, (path, _), topf, got, cov = verdict(j, unit_ms, self_w, incl_w, tot, folded)
-    mx = max([incl_w.get(r, 0) for r in rows] or [1]) or 1
-    img = Image.new("RGB", (W, H), (255, 255, 255))
-    d = ImageDraw.Draw(img)
-    try:
-        f_t = ImageFont.truetype(CJK, 21, index=1)
-        f_s = ImageFont.truetype(CJK, 12.5, index=1)
-        f_n = ImageFont.truetype(CJK, 11.5, index=1)
-        f_b = ImageFont.truetype(CJK, 12.5, index=1)
-    except Exception:
-        f_t = f_s = f_n = f_b = ImageFont.load_default()
-
-    def rt(x, y, t, font, fill, anchor_right=False):
-        d.text((x - d.textlength(t, font=font) if anchor_right else x, y), t, font=font, fill=fill)
-
-    rt(PAD, 18, title, f_t, (22, 22, 22))
-    rt(PAD, 50, subtitle(sortkey, len(incl_w), tot, unit_ms), f_s, (92, 92, 92))
-
-    d.rounded_rectangle([PAD, 76, W - PAD, 138], 4, fill=(244, 247, 251), outline=(219, 228, 238))
-    d.rectangle([PAD, 76, PAD + 5, 138], fill=(178, 24, 43))
-    rt(PAD + 16, 92, head, f_b, (31, 61, 92))
-    chain = "  ->  ".join(path[-6:]) if path else "-"
-    rt(PAD + 16, 113, fit("卡点链：" + chain, W - 2 * PAD - 40, 12.5), f_s, (74, 74, 74))
-
-    hy = TOPH + 8
-    for x, t, right in ((X_TAG, "结论", False), (X_NAME, "函数", False), (X_BAR, "相对权重", False),
-                        (X_SELF, "自身%", True), (X_INCL, "包含%", True),
-                        (X_HIT, "命中", True), (X_CUM, "累计%", True)):
-        rt(x, hy, t, f_n, (107, 114, 128), right)
-    d.line([PAD, hy + 20, W - PAD, hy + 20], fill=(226, 230, 236))
-
-    y0, cum = TOPH + 26, 0.0
-    for i, f in enumerate(rows):
-        yy = y0 + i * ROW
-        sw, iw = self_w.get(f, 0), incl_w.get(f, 0)
-        pct_s, pct_i = 100.0 * sw / tot, 100.0 * iw / tot
-        cum += pct_s
-        tw, swd = max(2.0, BAR_W * iw / mx), max(2.0, BAR_W * sw / mx)
-        tg, tc = tag_of(f, self_w, incl_w)
-        if i % 2 == 1:
-            d.rectangle([PAD - 4, yy - 4, W - PAD + 4, yy + ROW - 8], fill=(250, 251, 252))
-        rt(PAD, yy, str(i + 1), f_n, (154, 163, 174))
-        rt(X_TAG, yy, tg, f_n, tc)
-        rt(X_NAME, yy, fit(f, NAME_W - 10, 11.5), f_n, (34, 38, 43))
-        d.rectangle([X_BAR, yy + 1, X_BAR + tw, yy + 14], fill=INCL_C)
-        d.rectangle([X_BAR, yy + 1, X_BAR + swd, yy + 14], fill=SELF_C)
-        rt(X_SELF, yy, "%.1f%%" % pct_s, f_b, (31, 41, 55), True)
-        same = abs(pct_i - pct_s) < 0.05
-        rt(X_INCL, yy, "·" if same else "%.1f%%" % pct_i, f_n,
-           (200, 206, 214) if same else (107, 114, 128), True)
-        rt(X_HIT, yy, num(sw, unit_ms), f_n, (75, 85, 99), True)
-        rt(X_CUM, yy, "%.1f%%" % cum, f_n, (154, 163, 174), True)
-
-    ns = notes(j, folded, cov, got, unit_ms)
-    for k, t in enumerate(ns):
-        rt(PAD, H - 40 - (len(ns) - 1 - k) * 15, fit(t, W - 2 * PAD, 11.5), f_n, (178, 24, 43))
-    rt(PAD, H - 18, "trace_engine · 自身=采样点落在此函数，包含=含下游 · 采样模式命中=样本数或毫秒，"
-       "folded 模式=真实调用次数 · 包含列的 · 表示该函数全是叶子帧", f_n, (138, 143, 152))
-    img.save(out)
     return out
 
 
@@ -300,15 +235,10 @@ def main():
     if not folded:
         print("没有栈数据")
         return 1
-    if out.lower().endswith(".svg"):
-        svg(j, folded, topn, sortkey, title, out)
-    else:
-        try:
-            png(j, folded, topn, sortkey, title, out)
-        except ImportError:
-            out = out.rsplit(".", 1)[0] + ".svg"
-            svg(j, folded, topn, sortkey, title, out)
-            print("[rank] 没有 PIL，改出 SVG")
+    if not out.lower().endswith(".svg"):
+        print("[rank] 本脚本只出 .svg；.png 由 engine.lua 转（cairo+librsvg）")
+        return 2
+    svg(j, folded, topn, sortkey, title, out)
     print("[rank] %s" % out)
     return 0
 

@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """折叠栈 -> 函数调用热力图（行=调用者，列=被调用者，颜色=调用边的时间/样本权重）
 输入：lite trace_engine --json 的 top[]/folded[]，与 flame.py 同一套归一（复用 load/scrub）
-用法：heat.py in.json out.svg|out.png "标题" [topN]
-      .svg 纯标准库，悬停看数值并高亮同行同列；.png 走 PIL（没有就退回同名 .svg）
+用法：heat.py in.json out.svg "标题" [topN]
+      .svg 纯标准库，悬停看数值并高亮同行同列；.png 由 engine.lua 用 cairo+librsvg 转
 """
 import json, os, sys, math
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from flame import load, CJK   # 归一化规则必须和火焰图一致
+from flame import load          # 归一化规则必须和火焰图一致
 
 CELL = 26
 RANK_W = 400
@@ -104,7 +104,7 @@ def svg(unit_ms, self_w, incl_w, edges, topn, title, out):
     y = HEAD + 6
     s.append('<text x="%d" y="%d" font-size="13" fill="#333">热门函数（按包含权重排名，深色为自身）</text>'
              % (PAD, y - 12))
-    bw = RANK_W - 130
+    bw = RANK_W - 175          # 留出右侧「自身/包含」数字列，别压到矩阵标题
     topi = rank[0][1] if rank else 1
     for i, f in enumerate(funcs):
         yy = y + i * (CELL - 4)
@@ -187,70 +187,6 @@ def svg(unit_ms, self_w, incl_w, edges, topn, title, out):
     open(out, "w", encoding="utf-8").write("\n".join(s))
     return out
 
-def png(unit_ms, self_w, incl_w, edges, topn, title, out):
-    from PIL import Image, ImageDraw, ImageFont
-    rank = sorted(incl_w.items(), key=lambda kv: -kv[1])
-    funcs, N, mx, MW, W, H = geom(rank, edges, topn)
-    tot = sum(incl_w.values()) or 1
-    img = Image.new("RGB", (W, H), (255, 255, 255))
-    d = ImageDraw.Draw(img)
-    try:
-        f_t = ImageFont.truetype(CJK, 20, index=1)
-        f_s = ImageFont.truetype(CJK, 12, index=1)
-        f_n = ImageFont.truetype(CJK, 11, index=1)
-    except Exception:
-        f_t = f_s = f_n = ImageFont.load_default()
-    d.text((PAD, 14), title, font=f_t, fill=(26, 26, 26))
-    d.text((PAD, 44), "行=调用者 列=被调用者 颜色=调用边权重 · %d 函数 · 总权重 %s"
-           % (N, fmt(tot, unit_ms)), font=f_s, fill=(90, 90, 90))
-    y, bw = HEAD + 6, RANK_W - 130
-    topi = rank[0][1] if rank else 1
-    for i, f in enumerate(funcs):
-        yy = y + i * (CELL - 4)
-        sw, iw = self_w.get(f, 0), incl_w.get(f, 0)
-        wx, ww = PAD + 130, max(1.0, bw * iw / topi)
-        d.rectangle([wx, yy, wx + ww, yy + CELL - 7], fill=(223, 230, 238))
-        if sw > 0:
-            d.rectangle([wx, yy, wx + max(1.0, bw * sw / topi), yy + CELL - 7], fill=(63, 124, 181))
-        t = clip(f, 122, 11)
-        d.text((PAD + 124 - d.textlength(t, font=f_n), yy), t, font=f_n, fill=(42, 42, 42))
-        d.text((wx + ww + 5, yy), "%s / %s" % (short(sw), short(iw)), font=f_n, fill=(102, 102, 102))
-    x0, y0 = PAD + RANK_W + 26 + NAME_W, HEAD + 40
-    for iy, a in enumerate(funcs):
-        t = clip(a, NAME_W - 10, 10.5)
-        d.text((x0 - 6 - d.textlength(t, font=f_n), y0 + iy * CELL + 7), t, font=f_n, fill=(42, 42, 42))
-    for iy, a in enumerate(funcs):
-        for jx, b in enumerate(funcs):
-            v = edges.get((a, b), 0)
-            fill = (247, 248, 250) if v <= 0 else rgb(heat(math.log1p(v) / math.log1p(mx)))
-            d.rectangle([x0 + jx * CELL, y0 + iy * CELL,
-                         x0 + jx * CELL + CELL - 1, y0 + iy * CELL + CELL - 1], fill=fill)
-            if v > 0 and math.log1p(v) / math.log1p(mx) > 0.62:
-                t = short(v)
-                d.text((x0 + jx * CELL + CELL / 2.0 - d.textlength(t, font=f_n) / 2.0, y0 + iy * CELL + 7),
-                       t, font=f_n, fill=(255, 255, 255))
-    ly = y0 + MW + 34
-    idx = set(funcs)
-    hot = sorted(((a, b, v) for (a, b), v in edges.items() if a in idx and b in idx),
-                 key=lambda t: -t[2])[:TOPEDGE]
-    for i, (a, b, v) in enumerate(hot):
-        yy = ly + i * 15
-        d.rectangle([PAD, yy - 5, PAD + 6, yy + 5], fill=rgb(heat(math.log1p(v) / math.log1p(mx))))
-        d.text((PAD + 12, yy - 7), "%s → %s   %s · %.2f%%"
-               % (clip(a, 150, 11), clip(b, 150, 11), fmt(v, unit_ms), 100.0 * v / tot),
-               font=f_n, fill=(51, 51, 51))
-    # 图例
-    gx, gy, gw = W - 300, H - 46, 200
-    for k in range(100):
-        d.rectangle([gx + gw * k / 100.0, gy, gx + gw * (k + 1) / 100.0, gy + 12],
-                    fill=rgb(heat(k / 99.0)))
-    d.text((gx, gy + 18), "低", font=f_n, fill=(102, 102, 102))
-    t = "高 %s" % fmt(mx, unit_ms)
-    d.text((gx + gw - d.textlength(t, font=f_n), gy + 18), t, font=f_n, fill=(102, 102, 102))
-    d.text((PAD, H - 24), "trace_engine · 色阶按 log(1+w) 归一 · 悬停请看 SVG 版", font=f_n, fill=(136, 136, 136))
-    img.save(out)
-    return out
-
 def main():
     a = sys.argv[1:]
     if len(a) < 2:
@@ -264,15 +200,10 @@ def main():
     if not incl_w:
         print("没有栈数据")
         return 1
-    if out.lower().endswith(".svg"):
-        svg(unit_ms, self_w, incl_w, edges, topn, title, out)
-    else:
-        try:
-            png(unit_ms, self_w, incl_w, edges, topn, title, out)
-        except ImportError:
-            out = out.rsplit(".", 1)[0] + ".svg"
-            svg(unit_ms, self_w, incl_w, edges, topn, title, out)
-            print("[heat] 没有 PIL，改出 SVG")
+    if not out.lower().endswith(".svg"):
+        print("[heat] 本脚本只出 .svg；.png 由 engine.lua 转（cairo+librsvg）")
+        return 2
+    svg(unit_ms, self_w, incl_w, edges, topn, title, out)
     print("[heat] %s" % out)
     return 0
 
