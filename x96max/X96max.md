@@ -252,10 +252,18 @@ rootfs    /dev/mmcblk1p2（eMMC）56.9G ext4
 | 项 | 值 |
 |---|---|
 | 构建机 | x86_64 Ubuntu 24.04，6 核 / 23GiB（实测够用） |
+| 运行身份 | **普通用户**，脚本内部自己 `sudo`。用 `sudo ./build-image.sh` 起会把 `$HOME` 变成 `/root`，直接报 `missing root SSH public key: /root/.ssh/id_ed25519.pub` |
 | 内核源码 | `/opt/linux/src/linux-7.2.12`（`VERSION=7 PATCHLEVEL=2 SUBLEVEL=12`） |
 | 内核配置 | 仓库内 `x96max/kernel/config-7.2.12-x96`（**最终 `.config`，直接复制即可复现**） |
 | 基础镜像 | `.../build/output/images/Armbian_26.11.0-trunk_trixie_arm64_6.18.60.img` |
 | 输出 | `/data/x96-build/recovery/x96src-autoinstall.img.gz` |
+
+构建前**先清场**，别让不属于本次的挂载混进来（原因见 §7.3 第 19 条）：
+
+```bash
+mount | grep -vE ' / |/data'     # 有没有该消失却还在的挂载点（U 盘、上次 loop）
+sudo losetup -D                  # 清掉上次失败 rebuild 留下的 loop 设备
+```
 
 一次性装依赖：
 
@@ -495,6 +503,7 @@ cd /data/x96-build/armbian-build
 
 - 实测耗时约 **6:52**（x86 上 mmdebstrap + qemu 构建 arm64 rootfs）。
 - 产物：`cache/rootfs/rootfs-arm64-trixie-minimal_*.tar.zst`（约 108M，253 包）。
+- 收尾阶段 armbian 会对**所有挂载点**跑 `df`；任何一个挂载点返回 I/O error，整步就报 `ERROR` —— 见 §7.3 第 19 条。
 
 ### 5.6 注入基础镜像并 rebuild
 
@@ -746,7 +755,9 @@ cd /home/quqiufeng/kernel
 | `X96_ROOT_PASSWORD` | 空 | 默认锁定 root 密码、仅 SSH key；要控制台密码登录才显式设置 |
 | `X96_ROOT_SSH_KEY` | `~/.ssh/id_ed25519.pub` | 写进镜像的 root 公钥 |
 
-脚本会先检查：sudo、基础镜像、四个内核包、auto-install 文件、rootfs 产物。输出：
+**用普通用户跑**（不要 `sudo ./build-image.sh`，`$HOME` 会变成 `/root` 而丢掉 `~/.ssh/id_ed25519.pub`；
+确实要从 root shell 起，就显式给 `X96_ROOT_SSH_KEY`）。脚本会先检查：sudo、基础镜像、四个内核包、
+auto-install 文件、rootfs 产物。它**不检查**遗留挂载，构建前自己按 §5.1 清场。输出：
 
 ```text
 /data/x96-build/recovery/x96src-autoinstall.img.gz
@@ -800,11 +811,17 @@ systemctl status x96-autoinstall
 16. **源码 rootfs 的 `/boot` 是空的**：注入前先备份基础镜像的 `/boot`、注入后还原，再由 `rebuild` 替换内核。
 17. **时间戳超前**导致 `tar` 刷 `time stamp ... is in the future`，无害。
 18. **`rm: ... Device or resource busy`** 是上一次失败 `rebuild` 的残留 loop 挂载：清 `build/tmp_dir` 的挂载即可，不影响产物。
+19. **`df: /mnt/xxx: Input/output error` 会让 rootfs 步骤假失败**：armbian 收尾会对全挂载点跑 `df`，
+    一个坏挂载点（拔掉的 U 盘、上次的 loop、`errors=remount-ro` 的 vfat）返回非 0 → 子 shell 判失败 →
+    日志里整个 rootfs 步骤 `ERROR`，但**包其实已经装完**，日志指向 `rootfs-create.sh` 完全没提 `df`。
+    判据：`df -h >/dev/null; echo $?` 不是 0 就先找挂载点，`sudo umount -l <点>` 后直接重跑（rootfs 缓存会命中，约 7 分钟）。
+20. **必须普通用户跑脚本**：`sudo ./build-image.sh` 让 `$HOME=/root`，默认 key 路径变 `/root/.ssh/id_ed25519.pub`
+    → `missing root SSH public key`。要 root shell 就传 `X96_ROOT_SSH_KEY=/home/<user>/.ssh/id_ed25519.pub`。
 
 ### 7.4 通用
 
-19. **备份先行**：写主线 U-Boot 前，原厂启动区 117MiB + p1 + p2 必须在 NAS 上有备份（§8）。
-20. **凭据只放 `~/.env`**，不写进仓库、不拼进命令行。
+21. **备份先行**：写主线 U-Boot 前，原厂启动区 117MiB + p1 + p2 必须在 NAS 上有备份（§8）。
+22. **凭据只放 `~/.env`**，不写进仓库、不拼进命令行。
 
 ---
 
@@ -943,9 +960,10 @@ NAS 备份      dav://192.168.1.53:5005/sata11-18072858035/x96-backup/
               http://192.168.1.53:5005/sata11-18072858035/x96-backup/
 本地备份      ~/x96-backup/
 构建全程      §5（5.1 准备 → 5.10 验证）
+构建假失败    rootfs 步骤 ERROR 但包已装完 → 查遗留挂载，`sudo umount -l` 后重跑（§7.3 第 19 条）
 出错先看      §7；黑屏看 §7.1，备份回滚看 §8
 ```
 
 ---
 
-*文档版本: 2.0 · 重写: 2026-11-14 · 上一版: 1.4（`git show HEAD:x96max/X96max.md`） · 设备: X96 Max / S905X2*
+*文档版本: 2.1 · 重写: 2026-11-14 · 2.1 补构建前清场与 `df` EIO 假失败（§5.1/§7.3-19、20） · 上一版: 1.4（`git show HEAD:x96max/X96max.md`） · 设备: X96 Max / S905X2*
