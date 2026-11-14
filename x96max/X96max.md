@@ -3,6 +3,8 @@
 > **一句话**：把一台 X96 Max 4GB 电视盒子，从商家 ophub 镜像换成「自编译 Linux 7.2.12 + 官方 Armbian build framework 源码构建的 rootfs + 主线 U-Boot」，跑在 eMMC 上，只留有线和显示/音频，155 个包。
 > **当前状态** `[verified]`：已从 eMMC 启动，`uname -r` = `7.2.12-x96`，hostname `x96src`，rootfs ~568M。
 > **这是记录不是教程**：所有命令都是本机实际跑过的；路径、包数、分区起点是当场读出来的事实，不是「一般应该这样」。
+> **2026-11-14 复检**：首启自动安装曾因镜像缺 `hexdump` 静默退出、且脚本一度退回 `-m no`；两处已修并加了
+> 构建期断言，见 §7.3-23/24。**镜像内容一律靠 `build-image.sh` 重建，不热修卡上分区。**
 
 ---
 
@@ -675,6 +677,18 @@ sync
 > 或 `./x96max/build-image.sh --skip-rootfs --write /dev/sdX`（会再确认一次设备名）。
 > `dd` 覆盖整个介质，务必确认 `/dev/sdX` 是 U 盘而不是系统盘。
 
+**不要热修卡上的 `p2`**（`mount` 进去补个二进制）当交付：那是补救不是重建，卡上 `p1` 的 `boot.scr`、
+`u-boot.emmc`、`/etc/model_database.conf` 与 `p2` 的 rootfs 必须来自**同一次** `rebuild`，
+热修过的卡没有任何构建期断言保护（4c 断言根本不跑）。要改内容就改仓库 → 重跑 `build-image.sh` → 整盘 `dd`。
+
+写盘前自检（30 秒，省一次来回）：
+
+```bash
+gzip -dc <img.gz> | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
+sudo mount /dev/sdXp2 /mnt && sudo test -x /mnt/usr/bin/hexdump && \
+  sudo grep -c 'armbian-install -m yes -a no' /mnt/usr/local/sbin/x96-autoinstall.sh
+```
+
 启动：
 
 - X96 Max 的 U-Boot 通常 **USB 启动优先于 eMMC**：插盘上电即可。
@@ -732,7 +746,7 @@ dmesg | grep -iE "meson8b-dwmac|RTL8211F|panfrost|meson-drm|snd|mmc"
 
 | 文件 | 作用 |
 |---|---|
-| `build-image.sh` | 跑完 §5.5–§5.7：源码 rootfs → 注入 → rebuild → 裁剪 → gzip（可选直接写盘） |
+| `build-image.sh` | 跑完 §5.5–§5.7：源码 rootfs → 注入 → 补 `hexdump`（4b）→ 工具断言（4c）→ rebuild → 裁剪 → gzip（可选直接写盘） |
 | `config-x96-source.conf` | 被脚本安装进构建环境的内核/rootfs 配置 |
 | `mkbase.sh` | 可选：自造基础镜像容器（源码 rootfs → ext4 → `base-own.img`），只在不想下载 26.11.0 官方镜像时走这条路，见 §5.6 注 |
 | `x96-autoinstall.sh` + `.service` | 镜像内首启自动执行 `armbian-install -m yes -a no`，含依赖自检与 done 标记防误判 |
@@ -778,6 +792,8 @@ systemctl status x96-autoinstall
 - **依赖必须自检，不能交给 apt**：`armbian-install` 的 `check_depends` 会 `which` 9 个命令，缺一个就
   `apt-get update/install`；apt 会读走 stdin，后面的 `read boxid` 拿到 EOF → `Input error, exit!` 或
   `DTB file not found`。所以脚本先自检，缺就报错退出（该 service 在 local-fs.target 之后跑，那时也没网）。
+  自检清单里 `hexdump` 是最容易漏的一个：`rootfs-minimal` 根本不带它（见 §7.3-23），漏了就是「能进系统、
+  什么都不发生」，比报错更难查。
 - **`done` 标记只能在安装真正成功后写**：旧版无条件 `touch done`，装失败也标「已完成」然后关机，
   下次开机直接 skip —— 静默装死。
 
@@ -804,7 +820,7 @@ systemctl status x96-autoinstall
 12. **x86 上不能直接 `update-initramfs`**：`uInitrd` 必须 arm64，走 §5.3 的 qemu chroot。
 13. **`rebuild` 要四个包齐全**：`boot-*`、`dtb-amlogic-*`、`modules-*`、`header-*`，缺一个报 `The 4 kernel missing.`。
 
-### 7.3 源码 rootfs
+### 7.3 源码 rootfs 与首启脚本
 
 14. **`ARTIFACT_IGNORE_CACHE=yes` 必须加**，否则拿到的是 ghcr.io 的 OCI 预编译 rootfs。
 15. **`rebuild` 要求 rootfs 里有 `/usr/lib/modules` 和 `/usr/src`**；源码 rootfs 没有，要手动 `mkdir -p`，否则报 `tar: .../usr/lib/modules: No such file`。
@@ -817,6 +833,30 @@ systemctl status x96-autoinstall
     判据：`df -h >/dev/null; echo $?` 不是 0 就先找挂载点，`sudo umount -l <点>` 后直接重跑（rootfs 缓存会命中，约 7 分钟）。
 20. **必须普通用户跑脚本**：`sudo ./build-image.sh` 让 `$HOME=/root`，默认 key 路径变 `/root/.ssh/id_ed25519.pub`
     → `missing root SSH public key`。要 root shell 就传 `X96_ROOT_SSH_KEY=/home/<user>/.ssh/id_ed25519.pub`。
+23. **`rootfs-minimal` 不带 `hexdump`，首启安装会被它整条静默掐死** `[verified] 2026-11-14`：盒子确实起进了
+    Armbian（屏幕上是正常 login，没有报错），但 `x96-autoinstall.service` 的依赖自检缺 `hexdump` → `exit 1`，
+    只留 `/var/log/x96-autoinstall.log` 一行 + tty0 一行。同时 `armbian-install` 自己也 `which hexdump`
+    （`check_depends`，脚本第 84 行）、第 200/352 行用 `hexdump -x/-e` 读 zImage 与 u-boot 魔数，
+    缺了它还会尝试 `apt-get install bsdextrautils`（首启没网 → 必失败，且 apt 读走 stdin 让 `read boxid` 拿 EOF）。
+    修法两件一起做，别只做一半：
+    - 构建期补文件：`build-image.sh` 步骤 **4b** 从 `bsdextrautils_2.41.5-1_arm64.deb` 解出 `/usr/bin/hexdump`
+      塞进 rootfs（只依赖 `libtinfo.so.6` + `libc.so.6`，qemu-aarch64 验过 `-x`/`-e` 两种用法）。
+    - 构建期断言：缺一个就让**构建**失败——这类缺口必须在 x86 上暴露，不能留给盒子。断言分两处，
+      因为工具来源不同（见 25）：
+      - **4c**（rootfs 侧，rebuild 前）：`hexdump parted mkfs.vfat mkfs.ext4 mkfs.btrfs losetup fdisk lsblk
+        tar dbus-uuidgen` —— 必须来自源码 rootfs。
+      - **6b**（交付镜像侧，rebuild + 裁剪后）：上面 10 个 + `ampart` `armbian-install`，另外还断言
+        `x96-autoinstall.sh` 里确实是 `armbian-install -m yes -a no`、且 `/etc/x96-autoinstall.done` 不存在。
+24. **`-m no` 是错的，`armbian-install` 必须 `-m yes -a no`** `[verified] 2026-11-14`：见 §7.1-3。曾有版本以
+    「301 的 `MAINLINE_UBOOT` 在镜像里根本没有」为理由退回 `-m no`，这个前提是**错的**：镜像里
+    `/usr/lib/u-boot/x96max-u-boot.bin.sd.bin` 与 `/boot/u-boot-x96max.bin` 都在（`model_database.conf`
+    301 行第 5/6 字段）。`-m no` 只还原原厂 bootloader，再叠 `/boot/u-boot.emmc` 就是 §7.1-4 的黑屏组合。
+    **改这一行之前先 `awk -F: '$1==301' <img>:/etc/model_database.conf` 写真机条目，别凭记忆。**
+25. **`ampart` / `armbian-install` 不在源码 rootfs 里，是 `rebuild` 才注入的** `[verified] 2026-11-14`：
+    源码 rootfs（mmdebstrap minimal）没有这两个，断言写在 rebuild 之前就会 `rootfs missing tools: ampart` 假失败。
+    真正的来源是 ophub 的 `build-armbian/armbian-files/platform-files/amlogic/rootfs/`
+    （`usr/bin/ampart`、`usr/sbin/armbian-install`、`usr/sbin/armbian-openvfd`、`usr/share/openvfd/`），
+    `rebuild` 阶段才拷进 rootfs。**判据：断言放在你要交付的那份 rootfs 上（第 6 步挂上来的 `p2`），不是在中间产物上。**
 
 ### 7.4 通用
 
@@ -874,6 +914,9 @@ dav://192.168.1.53:5005/sata11-18072858035/x96-backup/emmc-original-backup/
 | eMMC 安装（主线 U-Boot，`-m yes -a no`） | 完成 |
 | eMMC 启动验证（`/dev/mmcblk1p2`，7.2.12-x96） | 完成 `[verified]` |
 | 裁剪到 155 包 | 完成 `[verified]` |
+| 首启静默失败复查（rootfs 缺 `hexdump`；`-m no` 前提有误） | 完成 `[verified] 2026-11-14`，见 §7.3-23/24 |
+| 按修正后脚本整盘重建镜像（4b/4c/6b 生效，rootfs 重建 5:56 + rebuild） | 完成 `[verified] 2026-11-14` |
+| SD 卡整盘 `dd`（14.6G 卡，3.2GB 镜像）并挂载验收 | 完成 `[verified] 2026-11-14`：`hexdump`/`ampart`/`armbian-install` 在位、脚本 `-m yes -a no`、service 已使能、无 done 标记 |
 
 ---
 

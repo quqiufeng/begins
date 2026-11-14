@@ -55,11 +55,13 @@ log "deps ok, eMMC boot0 present"
 # 答案从文件喂，不用管道：即使有什么东西读了 stdin 也不会污染这两行
 printf '%s\n%s\n' "$BOXID" "$FILETYPE" > /run/x96-answers
 sleep 3
-log "running: armbian-install -m no -a yes < /run/x96-answers"
-# -m no  : 不写 mainline u-boot（x96max 的 MAINLINE_UBOOT 在镜像里根本没有，
-#          /usr/lib/u-boot 下只有 x96maxplus-u-boot.bin.sd.bin）
-# -a yes : 用 ampart 分区（Amlogic 的 117MiB 前置空洞靠它）
-/usr/sbin/armbian-install -m no -a yes < /run/x96-answers
+log "running: armbian-install -m yes -a no < /run/x96-answers"
+# -m yes : 写主线 u-boot。2026-11-14 复查：301 号在 /etc/model_database.conf 里的
+#          MAINLINE_UBOOT=x96max-u-boot.bin.sd.bin 在 /usr/lib/u-boot 下确实存在，
+#          UBOOT_OVERLOAD=u-boot-x96max.bin 也在 /boot 下。用 -m no 就只还原原厂
+#          bootloader，再叠 u-boot.emmc 正是 §7.1-4 记的黑屏组合。
+# -a no  : 禁用 ampart（§7.1-3 真机结论；ampart 那条路在这台机上没成功过）
+/usr/sbin/armbian-install -m yes -a no < /run/x96-answers
 rc=$?
 log "armbian-install rc=$rc"
 

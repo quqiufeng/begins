@@ -137,6 +137,44 @@ sudo install -m 755 "$AUTO" /mnt/base-root/usr/local/sbin/x96-autoinstall.sh
 sudo install -m 644 "$UNIT" /mnt/base-root/etc/systemd/system/x96-autoinstall.service
 sudo ln -sf /etc/systemd/system/x96-autoinstall.service /mnt/base-root/etc/systemd/system/multi-user.target.wants/x96-autoinstall.service
 
+# 4b) rootfs-minimal 不自带 hexdump（bsdextrautils）。2026-11-14 首启安装就是被它整条静默掐死的：
+#     x96-autoinstall.sh 的依赖自检 exit 1（只留一行日志 + tty0），而 armbian-install 的
+#     check_depends 也 which hexdump（第 84 行）、200/352 行真的用它读 zImage/u-boot 魔数。
+#     从 deb 直接解文件喂进去，不走 chroot apt：不依赖网络策略、也不碰首启的 stdin。
+if [[ ! -x /mnt/base-root/usr/bin/hexdump ]]; then
+  HXDEB=$(mktemp -d)
+  HXURL="http://mirrors.tuna.tsinghua.edu.cn/debian/pool/main/u/util-linux"
+  HXFN=$(curl -sf "$HXURL/" | grep -oE 'bsdextrautils_[^"]*_arm64\.deb' | sort -V | tail -1)
+  [[ -n "$HXFN" ]] || { echo "cannot locate bsdextrautils arm64 deb"; exit 1; }
+  curl -sfL -o "$HXDEB/x.deb" "$HXURL/$HXFN" || { echo "download failed: $HXFN"; exit 1; }
+  dpkg-deb -x "$HXDEB/x.deb" "$HXDEB/root"
+  sudo install -m 755 -o root -g root "$HXDEB/root/usr/bin/hexdump" /mnt/base-root/usr/bin/hexdump
+  rm -rf "$HXDEB"
+  echo "installed hexdump ($HXFN)"
+fi
+
+# 4c) 构建期断言（rootfs 侧）：这些工具必须来自源码 rootfs —— rebuild 之后没人会补它们。
+#     ampart / armbian-install 不在这里：它们是 ophub 的 platform-files/amlogic/rootfs 在
+#     rebuild 阶段注入的，源码 rootfs 里本来就没有（查它们要等第 6 步，见 6b）。
+assert_tools() {
+  local root=$1 label=$2 c d found missing=""
+  shift 2
+  for c in "$@"; do
+    found=""
+    for d in usr/bin usr/sbin bin sbin; do
+      [[ -x "$root/$d/$c" ]] && { found=1; break; }
+    done
+    [[ -n "$found" ]] || missing="$missing $c"
+  done
+  if [[ -n "$missing" ]]; then
+    echo "$label missing tools:$missing (first-boot autoinstall would die silently)"
+    exit 1
+  fi
+  echo "$label tools ok: $*"
+}
+ROOTFS_TOOLS=(hexdump parted mkfs.vfat mkfs.ext4 mkfs.btrfs losetup fdisk lsblk tar dbus-uuidgen)
+assert_tools /mnt/base-root rootfs "${ROOTFS_TOOLS[@]}"
+
 sudo umount /mnt/base-root
 sudo losetup -d "$LOOP"
 
@@ -174,6 +212,16 @@ sudo mv /mnt/final-root/etc/apt/sources.list.d/armbian-config.sources \
 sudo rm -f /mnt/final-root/etc/x96-autoinstall.done
 sudo mkdir -p /mnt/final-root/etc/systemd/system/multi-user.target.wants
 sudo ln -sf /etc/systemd/system/x96-autoinstall.service /mnt/final-root/etc/systemd/system/multi-user.target.wants/x96-autoinstall.service
+# 6b) 交付镜像断言：这里是唯一「盒子上会真的跑的那份 rootfs」。ampart / armbian-install 到这一步
+#     才存在（ophub rebuild 注入 platform-files），所以断言放这儿；顺带钉死 -m yes 与「没有 done 标记」，
+#     这两条一破就是首启静默装死或黑屏。
+assert_tools /mnt/final-root "final image" "${ROOTFS_TOOLS[@]}" ampart armbian-install
+sudo grep -q -- 'armbian-install -m yes -a no' /mnt/final-root/usr/local/sbin/x96-autoinstall.sh \
+  || { echo "final image: x96-autoinstall.sh is not 'armbian-install -m yes -a no'"; exit 1; }
+if sudo test -e /mnt/final-root/etc/x96-autoinstall.done; then
+  echo "final image: /etc/x96-autoinstall.done must not exist"; exit 1
+fi
+echo "final image assertions ok"
 sudo umount /mnt/final-root
 sudo losetup -d "$LOOP"
 
