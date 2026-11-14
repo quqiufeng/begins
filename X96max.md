@@ -6,7 +6,7 @@
 > 本文目标：记录硬件、现有系统打包方式，以及**从 Linux 7.2.12 源码编译内核 → 源码构建 rootfs → ophub 打包 → SD/U 盘验证 → eMMC 安装 → 体积裁剪** 的完整过程。
 > 状态：**已成功从 eMMC 启动裁剪后的源码系统**（155 包，rootfs ~568M；主线 U-Boot）。
 > 无线策略（2026-11 更新）：**保留 Wi-Fi/蓝牙驱动与固件**（RTL8822BS → `rtw88_8822bs` + `btrtl`），内核里不再 `-d` 关闭；有线 RTL8211F 仍是主用网络。
-> 仓库脚本：`scripts/x96/`（一键镜像脚本、rootfs 配置、首启自动安装、最终内核配置）。
+> 仓库脚本：**本仓库 `x96max/`**（`build-image.sh` 一键镜像、`config-x96-source.conf` rootfs 配置、`x96-autoinstall.*` 首启自动安装、`kernel/config-7.2.12-x96` 最终内核配置、`mkbase.sh` 自造 rebuild 基础镜像）。
 
 ---
 
@@ -174,17 +174,20 @@ CONFIG_RFKILL=m
 | 项目 | 值 |
 |---|---|
 | 构建机 | x86_64 Ubuntu 24.04（noble），6 核，23GiB 内存 |
-| 工作目录 | `/data/x96-build` |
-| ophub 仓库 | `/data/x96-build/amlogic-s9xxx-armbian` |
+| 工作目录 | `/x96-build` |
+| ophub 仓库 | `/x96-build/amlogic-s9xxx-armbian` |
 | 内核源码 | `/opt/linux/src/linux-7.2.12` |
-| 内核构建目录 | `/data/x96-build/kbuild-7.2.12` |
+| 内核构建目录 | `/x96-build/kbuild-7.2.12` |
 | 交叉工具链 | `aarch64-linux-gnu-gcc` 13.3.0 |
 | 模拟器 | `qemu-aarch64-static` + binfmt（用于 arm64 chroot） |
+
+> 2026-11-14：`/data` 盘空间紧张，工作目录由 `/data/x96-build` 迁到 `/x96-build`（同机、只换挂载点，内容与属主不变）。
+> 三个脚本的 `X96_BUILD_ROOT` 默认值已同步；老路径可用 `sudo ln -s /x96-build /data/x96-build` 兼容。
 
 安装依赖：
 
 ```bash
-cd /data/x96-build/amlogic-s9xxx-armbian
+cd /x96-build/amlogic-s9xxx-armbian
 sudo apt-get update
 sudo apt-get install -y $(cat compile-kernel/tools/script/ubuntu2404-build-armbian-depends)
 ```
@@ -195,7 +198,7 @@ sudo apt-get install -y $(cat compile-kernel/tools/script/ubuntu2404-build-armbi
 
 ### 5.1 源码与配置
 
-> 本次最终 `.config` 已保存到 `scripts/x96/kernel/config-7.2.12-x96`；直接复制即可复现。下面是从 6.18 基线重建/理解配置的步骤。
+> 本次最终 `.config` 已保存到 `x96max/kernel/config-7.2.12-x96`；直接复制即可复现。下面是从 6.18 基线重建/理解配置的步骤。
 
 源码：`/opt/linux/src/linux-7.2.12`（Makefile：`VERSION=7 PATCHLEVEL=2 SUBLEVEL=12`）。
 
@@ -209,7 +212,7 @@ make ARCH=arm64 mrproper
 以内核 6.18 的 ophub stable 配置为基线，适配 7.2.12：
 
 ```bash
-OUT=/data/x96-build/kbuild-7.2.12
+OUT=/x96-build/kbuild-7.2.12
 mkdir -p "$OUT"
 cp /tmp/ophub-cfg/config-6.18 "$OUT/.config"
 ```
@@ -302,7 +305,7 @@ $OUT/modules/lib/modules/7.2.12-x96/
 
 ```bash
 # 1) 用基础镜像或最终镜像的 rootfs 分区
-IMG=/data/x96-build/amlogic-s9xxx-armbian/build/output/images/Armbian_26.11.0-trunk_trixie_arm64_6.18.60.img
+IMG=/x96-build/amlogic-s9xxx-armbian/build/output/images/Armbian_26.11.0-trunk_trixie_arm64_6.18.60.img
 LOOP=$(sudo losetup -Pf --show "$IMG")
 sudo mkdir -p /mnt/x96root
 sudo mount ${LOOP}p2 /mnt/x96root
@@ -322,9 +325,9 @@ sudo chroot /mnt/x96root /usr/bin/qemu-aarch64-static /bin/bash -c \
   "depmod -a 7.2.12-x96 && update-initramfs -c -k 7.2.12-x96"
 
 # 4) 取出 initrd 并做 uInitrd
-sudo cp /mnt/x96root/boot/initrd.img-7.2.12-x96 /data/x96-build/
+sudo cp /mnt/x96root/boot/initrd.img-7.2.12-x96 /x96-build/
 mkimage -A arm64 -O linux -T ramdisk -C gzip -n uInitrd \
-  -d /data/x96-build/initrd.img-7.2.12-x96 /data/x96-build/uInitrd-7.2.12-x96
+  -d /x96-build/initrd.img-7.2.12-x96 /x96-build/uInitrd-7.2.12-x96
 ```
 
 ---
@@ -334,7 +337,7 @@ mkimage -A arm64 -O linux -T ramdisk -C gzip -n uInitrd \
 `rebuild` 需要 4 个压缩包，目录：
 
 ```text
-/data/x96-build/amlogic-s9xxx-armbian/build-armbian/kernel/stable/7.2.12/
+/x96-build/amlogic-s9xxx-armbian/build-armbian/kernel/stable/7.2.12/
 ├── boot-7.2.12-x96.tar.gz
 ├── dtb-amlogic-7.2.12-x96.tar.gz
 ├── modules-7.2.12-x96.tar.gz
@@ -359,15 +362,15 @@ modules-6.18.59-ophub.tar.gz
 对应 7.2.12：
 
 ```bash
-K=/data/x96-build/amlogic-s9xxx-armbian/build-armbian/kernel/stable/7.2.12
+K=/x96-build/amlogic-s9xxx-armbian/build-armbian/kernel/stable/7.2.12
 mkdir -p "$K/boot" "$K/dtb" "$K/modules" "$K/header"
 
 # boot
 cp "$OUT/.config"                      "$K/boot/config-7.2.12-x96"
 cp "$OUT/System.map"                   "$K/boot/System.map-7.2.12-x96"
 cp "$OUT/arch/arm64/boot/Image"        "$K/boot/vmlinuz-7.2.12-x96"
-cp /data/x96-build/initrd.img-7.2.12-x96 "$K/boot/initrd.img-7.2.12-x96"
-cp /data/x96-build/uInitrd-7.2.12-x96    "$K/boot/uInitrd-7.2.12-x96"
+cp /x96-build/initrd.img-7.2.12-x96 "$K/boot/initrd.img-7.2.12-x96"
+cp /x96-build/uInitrd-7.2.12-x96    "$K/boot/uInitrd-7.2.12-x96"
 tar -czf "$K/boot-7.2.12-x96.tar.gz" -C "$K/boot" .
 
 # dtb（只放需要的）
@@ -392,13 +395,13 @@ tar -czf "$K/modules-7.2.12-x96.tar.gz" -C "$OUT/modules/lib/modules" 7.2.12-x96
 基础镜像放在：
 
 ```text
-/data/x96-build/amlogic-s9xxx-armbian/build/output/images/*-trunk_*.img
+/x96-build/amlogic-s9xxx-armbian/build/output/images/*-trunk_*.img
 ```
 
 执行：
 
 ```bash
-cd /data/x96-build/amlogic-s9xxx-armbian
+cd /x96-build/amlogic-s9xxx-armbian
 sudo ./rebuild -b s905x2 -k 7.2.12 -s 512/2560 -n x96custom
 ```
 
@@ -455,7 +458,7 @@ htop iotop iozone3 iperf3 fping expect dialog whiptail figlet bc
 ### 9.3 chroot 裁剪
 
 ```bash
-IMG=/data/x96-build/amlogic-s9xxx-armbian/build/output/images/<final>.img
+IMG=/x96-build/amlogic-s9xxx-armbian/build/output/images/<final>.img
 LOOP=$(sudo losetup -Pf --show "$IMG")
 sudo mount ${LOOP}p2 /mnt/x96root
 sudo mount --bind /dev  /mnt/x96root/dev
@@ -659,16 +662,16 @@ ROOTFS_TYPE='ext4'
 ## 14. 关键路径速查
 
 ```text
-构建仓库      /data/x96-build/amlogic-s9xxx-armbian
-Armbian build /data/x96-build/armbian-build
-源码 rootfs   /data/x96-build/armbian-build/cache/rootfs/rootfs-arm64-trixie-minimal_*.tar.zst
+构建仓库      /x96-build/amlogic-s9xxx-armbian
+Armbian build /x96-build/armbian-build
+源码 rootfs   /x96-build/armbian-build/cache/rootfs/rootfs-arm64-trixie-minimal_*.tar.zst
 内核源码      /opt/linux/src/linux-7.2.12
-内核构建      /data/x96-build/kbuild-7.2.12
-基础镜像      /data/x96-build/amlogic-s9xxx-armbian/build/output/images/
-内核包目录    /data/x96-build/amlogic-s9xxx-armbian/build-armbian/kernel/stable/7.2.12/
-最终镜像      /data/x96-build/amlogic-s9xxx-armbian/build/output/images/
-仓库脚本      /opt/my-agent/scripts/x96/
-输出镜像      /data/x96-build/recovery/x96src-autoinstall.img.gz
+内核构建      /x96-build/kbuild-7.2.12
+基础镜像      /x96-build/amlogic-s9xxx-armbian/build/output/images/
+内核包目录    /x96-build/amlogic-s9xxx-armbian/build-armbian/kernel/stable/7.2.12/
+最终镜像      /x96-build/amlogic-s9xxx-armbian/build/output/images/
+仓库脚本      /home/quqiufeng/kernel/x96max/
+输出镜像      /x96-build/recovery/x96src-autoinstall.img.gz
 源码镜像      Armbian_26.11.0_amlogic_s905x2_trixie_7.2.12_server_2026.11.02.img.gz
 eMMC 备份     dav://192.168.1.53:5005/sata11-18072858035/x96-backup/emmc-original-backup/
 NAS 备份目录  dav://192.168.1.53:5005/sata11-18072858035/x96-backup/
@@ -699,11 +702,11 @@ NAS 备份目录  dav://192.168.1.53:5005/sata11-18072858035/x96-backup/
 
 ### 16.1 构建 rootfs
 
-> 仓库内已提供 `scripts/x96/build-image.sh`，会自动安装 `scripts/x96/config-x96-source.conf` 并执行以下步骤；也可按本节手工执行。
+> 仓库内已提供 `x96max/build-image.sh`，会自动安装 `x96max/config-x96-source.conf` 并执行以下步骤；也可按本节手工执行。
 
 ```bash
-git clone https://github.com/armbian/build /data/x96-build/armbian-build
-cd /data/x96-build/armbian-build
+git clone https://github.com/armbian/build /x96-build/armbian-build
+cd /x96-build/armbian-build
 
 ./compile.sh rootfs \
   BOARD=odroidn2 BRANCH=current RELEASE=trixie \
@@ -726,10 +729,10 @@ cd /data/x96-build/armbian-build
 BASE=.../Armbian_26.11.0-trunk_trixie_arm64_6.18.60.img
 R=.../cache/rootfs/rootfs-arm64-trixie-minimal_*.tar.zst
 LOOP=$(sudo losetup -Pf --show "$BASE"); sudo mount ${LOOP}p1 /mnt/base-root
-sudo rsync -a /mnt/base-root/boot/ /data/x96-build/base-boot-backup/
+sudo rsync -a /mnt/base-root/boot/ /x96-build/base-boot-backup/
 sudo find /mnt/base-root -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 zstd -dc "$R" | sudo tar -xpf - --numeric-owner --xattrs --xattrs-include='*' -C /mnt/base-root
-sudo rsync -a /data/x96-build/base-boot-backup/ /mnt/base-root/boot/
+sudo rsync -a /x96-build/base-boot-backup/ /mnt/base-root/boot/
 # 源码 rootfs 是空目录结构，rebuild 需要这两个目录
 sudo mkdir -p /mnt/base-root/usr/lib/modules /mnt/base-root/usr/src
 # SSH/网络
@@ -742,7 +745,7 @@ sudo umount /mnt/base-root; sudo losetup -d "$LOOP"
 ### 16.3 打包 7.2.12 镜像
 
 ```bash
-cd /data/x96-build/amlogic-s9xxx-armbian
+cd /x96-build/amlogic-s9xxx-armbian
 sudo ./rebuild -b s905x2 -k 7.2.12 -s 512/2560 -n x96src
 ```
 
@@ -806,6 +809,12 @@ Wi-Fi/蓝牙驱动与固件保留（`rtw88_8822bs` + `btrtl`，固件 `rtw88/`�
 6. 保留无线时**两处必须同时改**：内核 `-e` 启用 + rootfs 别删 `rtw88`/`rtl_bt` 固件与 `iw`/`wpasupplicant`。
    只改一处的话症状是：`wlan0` 根本不出现（内核无模块），或出现了但 `dmesg` 报
    `Direct firmware load for rtw88/rtw8822b_fw.bin failed`（固件被裁）。
+7. **`rootfs-minimal` 不自带 `hexdump`**（属 `bsdextrautils`）：`armbian-install` 的 `check_depends` 会
+   `which hexdump`，200/352 行真的用它读 `zImage`/`u-boot` 魔数；`x96-autoinstall.sh` 依赖自检
+   `exit 1` 且只往 tty0 写一行日志 → **首启静默装死，看起来像没开机**。
+   `build-image.sh` 已自愈：4b 从镜像源解 deb 塞 `/usr/bin/hexdump`；4c 断言
+   `hexdump parted mkfs.vfat mkfs.ext4 mkfs.btrfs losetup fdisk lsblk tar dbus-uuidgen` 全在，
+   缺一个直接构建失败（不要在 rebuild 之后再补，那时没人补）。
 
 ---
 
@@ -884,22 +893,22 @@ apt-get install -y sudo u-boot-tools parted btrfs-progs   # 以后要 armbian-in
 
 ## 19. 从源码到 eMMC：端到端操作流程
 
-> 本节是按顺序执行的清单；原理、参数解释和踩坑见第 4–18 节。仓库脚本在 `scripts/x96/`。
+> 本节是按顺序执行的清单；原理、参数解释和踩坑见第 4–18 节。仓库脚本在本仓库 `x96max/`。
 
 ### 19.1 产物与前置
 
 | 项 | 值 |
 |---|---|
 | 构建机 | x86_64 Ubuntu 24.04，6 核 / 23GiB（实测） |
-| 工作目录 | `/data/x96-build` |
+| 工作目录 | `/x96-build` |
 | 内核源码 | `/opt/linux/src/linux-7.2.12` |
-| 内核构建 | `/data/x96-build/kbuild-7.2.12` |
-| ophub 仓库 | `/data/x96-build/amlogic-s9xxx-armbian` |
-| Armbian build | `/data/x96-build/armbian-build` |
+| 内核构建 | `/x96-build/kbuild-7.2.12` |
+| ophub 仓库 | `/x96-build/amlogic-s9xxx-armbian` |
+| Armbian build | `/x96-build/armbian-build` |
 | 基础镜像 | `.../build/output/images/Armbian_26.11.0-trunk_trixie_arm64_6.18.60.img` |
-| 仓库脚本 | `scripts/x96/build-image.sh`、`config-x96-source.conf`、`x96-autoinstall.*` |
-| 最终内核配置 | `scripts/x96/kernel/config-7.2.12-x96` |
-| 输出镜像 | `/data/x96-build/recovery/x96src-autoinstall.img.gz` |
+| 仓库脚本 | `x96max/build-image.sh`、`config-x96-source.conf`、`x96-autoinstall.*`、`mkbase.sh` |
+| 最终内核配置 | `x96max/kernel/config-7.2.12-x96` |
+| 输出镜像 | `/x96-build/recovery/x96src-autoinstall.img.gz` |
 
 > 基础镜像约 2.5G、内核 4 个 tar 包、rootfs 缓存和 recovery 镜像都**不入库**；仓库只保留脚本和配置。
 
@@ -914,30 +923,33 @@ sudo apt-get install -y \
 
 # ophub（rebuild + kernel packaging）
 git clone --depth 1 https://github.com/ophub/amlogic-s9xxx-armbian \
-  /data/x96-build/amlogic-s9xxx-armbian
-cd /data/x96-build/amlogic-s9xxx-armbian
+  /x96-build/amlogic-s9xxx-armbian
+cd /x96-build/amlogic-s9xxx-armbian
 sudo apt-get install -y \
   $(cat compile-kernel/tools/script/ubuntu2404-build-armbian-depends)
 
 # Armbian build framework（源码 rootfs）
-git clone https://github.com/armbian/build /data/x96-build/armbian-build
+git clone https://github.com/armbian/build /x96-build/armbian-build
 
 # 内核源码：本次使用 /opt/linux/src/linux-7.2.12
 # 基础镜像：放到上面的默认路径，或通过 X96_BASE_IMAGE 指定
+# （不想下 2.5G 官方镜像可以自造：sudo x96max/mkbase.sh → $ROOT/base-own.img，
+#   再 X96_BASE_IMAGE=$ROOT/base-own.img；ophub 的 extract_armbian() 只从基础镜像里
+#   取一个可挂载的 ext4 rootfs + /etc/os-release，make_image() 会用 parted 重造整个分区表）
 ```
 
 ### 19.3 编译内核 7.2.12-x96
 
 ```bash
-REPO=/opt/my-agent
+REPO=/home/quqiufeng/kernel
 KSRC=/opt/linux/src/linux-7.2.12
-OUT=/data/x96-build/kbuild-7.2.12
+OUT=/x96-build/kbuild-7.2.12
 
 # 仅首次或源码树有树内产物时执行；会删除 .config
 # (cd "$KSRC" && make ARCH=arm64 mrproper)
 
 mkdir -p "$OUT"
-cp "$REPO/scripts/x96/kernel/config-7.2.12-x96" "$OUT/.config"
+cp "$REPO/x96max/kernel/config-7.2.12-x96" "$OUT/.config"
 
 cd "$KSRC"
 make O="$OUT" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
@@ -967,7 +979,7 @@ grep '^CONFIG_LOCALVERSION=' "$OUT/.config"   # "-x96"
 用基础镜像的 rootfs + `qemu-aarch64-static` chroot：
 
 ```bash
-ROOT=/data/x96-build
+ROOT=/x96-build
 OUT=$ROOT/kbuild-7.2.12
 BASE=$ROOT/amlogic-s9xxx-armbian/build/output/images/Armbian_26.11.0-trunk_trixie_arm64_6.18.60.img
 
@@ -999,7 +1011,7 @@ mkimage -A arm64 -O linux -T ramdisk -C gzip -n uInitrd \
 ### 19.5 打包 4 个内核包
 
 ```bash
-ROOT=/data/x96-build
+ROOT=/x96-build
 OUT=$ROOT/kbuild-7.2.12
 KSRC=/opt/linux/src/linux-7.2.12
 K=$ROOT/amlogic-s9xxx-armbian/build-armbian/kernel/stable/7.2.12
@@ -1065,23 +1077,23 @@ ls -lh "$K"
 > 前提：19.3–19.5 已产出 `boot/dtb-amlogic/modules/header` 四个内核包。
 
 ```bash
-cd /opt/my-agent
+cd /home/quqiufeng/kernel
 
 # 完整构建：源码 rootfs + 注入 + rebuild + 裁剪 + gzip
-./scripts/x96/build-image.sh
+./x96max/build-image.sh
 
 # 复用已有 rootfs，只重打包
-./scripts/x96/build-image.sh --skip-rootfs
+./x96max/build-image.sh --skip-rootfs
 
 # 直接写 U 盘/SD（危险，确认设备名）
-./scripts/x96/build-image.sh --skip-rootfs --write /dev/sdX
+./x96max/build-image.sh --skip-rootfs --write /dev/sdX
 ```
 
 可用环境变量：
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `X96_BUILD_ROOT` | `/data/x96-build` | 工作目录 |
+| `X96_BUILD_ROOT` | `/x96-build` | 工作目录 |
 | `X96_BASE_IMAGE` | 上面的 6.18.60 通用镜像 | 基础镜像 |
 | `X96_ROOT_PASSWORD` | 空 | 默认锁定 root 密码，仅 SSH key；需要控制台密码登录时显式设置 |
 | `X96_ROOT_SSH_KEY` | `~/.ssh/id_ed25519.pub` | 写入镜像的 root 公钥 |
@@ -1089,17 +1101,17 @@ cd /opt/my-agent
 脚本会检查 sudo、基础镜像、4 个内核包、auto-install 文件和 rootfs 产物。输出：
 
 ```text
-/data/x96-build/recovery/x96src-autoinstall.img.gz
+/x96-build/recovery/x96src-autoinstall.img.gz
 ```
 
 ### 19.7 写盘、首启与 eMMC 安装
 
 ```bash
 # 写 U 盘/SD（二选一）
-gzip -dc /data/x96-build/recovery/x96src-autoinstall.img.gz | \
+gzip -dc /x96-build/recovery/x96src-autoinstall.img.gz | \
   sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
 # 或
-./scripts/x96/build-image.sh --skip-rootfs --write /dev/sdX
+./x96max/build-image.sh --skip-rootfs --write /dev/sdX
 ```
 
 盒子从 U 盘/SD 启动后确认：

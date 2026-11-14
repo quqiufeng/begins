@@ -6,7 +6,7 @@
 # 只要一个装了源码 rootfs 的 ext4 分区即可。
 set -euo pipefail
 
-ROOT=/data/x96-build
+ROOT=/x96-build
 SIZE_MB=${SIZE_MB:-2560}
 OUTIMG=${OUTIMG:-$ROOT/base-own.img}
 BOOTBAK=$ROOT/base-boot-backup

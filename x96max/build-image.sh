@@ -7,7 +7,7 @@
 #   x96max/build-image.sh --skip-rootfs --write /dev/sdX
 #
 # Environment:
-#   X96_BUILD_ROOT       build workspace (default: /data/x96-build)
+#   X96_BUILD_ROOT       build workspace (default: /x96-build)
 #   X96_BASE_IMAGE       generic arm64 Armbian trixie image (default below)
 #   X96_ROOT_PASSWORD    root password (default: empty = lock password;
 #                        set only when console password login is needed)
@@ -21,7 +21,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-ROOT=${X96_BUILD_ROOT:-/data/x96-build}
+ROOT=${X96_BUILD_ROOT:-/x96-build}
 ARMBIAN=$ROOT/armbian-build
 OPHUB=$ROOT/amlogic-s9xxx-armbian
 KERNEL=7.2.12
