@@ -1,0 +1,14 @@
+[Unit]
+Description=X96 first-boot auto install to eMMC
+After=local-fs.target
+ConditionPathExists=!/etc/x96-autoinstall.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/x96-autoinstall.sh
+TimeoutStartSec=0
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target
