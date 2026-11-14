@@ -297,6 +297,51 @@ $OUT/modules/lib/modules/7.2.12-x96/
 > 后台编译务必用 `setsid`/`nohup` 脱离当前 shell；否则终端超时会终止整个进程组。
 > 不要用 `pkill -f kbuild-7.2.12`，会匹配到当前 shell 自身；用进程组 `kill -- -PGID`。
 
+### 5.3 源码树裁剪（2026-11-15：全新构建 8 分 46 秒）
+
+口径和 `docs/trim.md`（主机 `begin` 内核）不同：**不动 config，只删代码**——把源码树从
+1.8G / 94777 文件削到 **821M / 69673 文件（45%）**，用同一份 `.config` 换更短的全量编译。
+
+| 项 | 值 |
+|---|---|
+| 裁剪树 | `/x96-build/src-linux`（原版 `/opt/linux/src/linux-7.2.12`，未动） |
+| 用的 config | `/x96-build/config-x96-trimmed`（含 `CONFIG_DEBUG_INFO_NONE=y`，关 debug info 是最大的那一刀） |
+| 干净全量 `-j6` | **rc=0，526 s = 8m46s**（目标 ≤10 分钟已达成） |
+| 产物 | `Image` 35.9 MB / `vmlinux` 44.9 MB（aarch64 PIE） |
+| 日志与计时 | `/x96-build/logs/timed-0058.log`、计时脚本 `/x96-build/run-timed.sh` |
+
+```bash
+cd /x96-build/src-linux
+ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make O=/x96-build/kbuild-7.2.12 clean
+ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j6 O=/x96-build/kbuild-7.2.12
+```
+
+**四条踩出来的规矩**（这一轮都真炸过）：
+
+1. **删目录必须同步改父 Makefile。** `obj-y += 已删目录/` 会让 kbuild 直接失败。
+   用 `x96max/trim-tools/fix_makefiles2.py`：按**逻辑行**（`\` 续行）削尾部 token，删完只剩 `obj-$(X) +=` 就丢整句。
+2. **不能按目录名删 `=y` 子系统。** 判据是「该目录 Makefile 的 `obj-$(CONFIG_*)` ∩ 当前 config 的 `=y/=m`」，
+   有命中就不能删。这次误删了 `net/ethtool`(ETHTOOL_NETLINK)、`net/sched`、`net/devlink`(NET_DEVLINK)、
+   `drivers/media/dvb-core`(DVB_CORE)、`kernel/cgroup`、`kernel/events`(PERF_EVENTS)，
+   症状是链接期 **238 条 `undefined reference`**（编译期全绿，只有链接才炸）。
+   > **不能拿「符号 → 定义它的 Kconfig 所在目录」判归属**：`NET_DEVLINK`/`ETHTOOL_NETLINK` 定义在 `net/Kconfig`，
+   > `DVB_CORE` 在 `drivers/media/Kconfig`，`CGROUPS`/`PERF_EVENTS` 在 `init/Kconfig`，按归属算这些目录**永远 0 个
+   > 活符号**。`prune_src.py` 现在是三层判据，任一命中即保留：① 目录 Makefile 的 `CONFIG_*` ∩ `=y/=m`；
+   > ② 父 Makefile 的 `obj-$(CONFIG_X) += <dir>/`（`net/devlink/Makefile` 整份 `obj-y :=` 就靠这层）；
+   > ③ `rules.txt` 的 `PROTECT <dir>`。三层都不命中才删——对已裁剪的树 dry-run 必须得「可删 0 个」。
+3. **被无条件 `#include` 头文件的目录只删代码、留头文件**，并补一个空 Makefile（`make clean`/`syncconfig`
+   会因为目录缺 Makefile/Kconfig 提前中断）：
+   - `fs/squashfs` ← `init/do_mounts_rd.c`
+   - `net/bridge` ← `net/ipv6/netfilter.c`、`net/netfilter/nfnetlink_{log,queue}.c`、`br_netfilter.h`、`trace/events/bridge.h`
+4. **验证顺序固定**：`make clean`（先暴露缺 Makefile）→ `syncconfig` → 全量编译 → 最后查 `undefined reference`。
+
+> 本轮只验证了「能编」。**Image 还没在盒子上启动过**，QEMU/真机启动断言未跑。
+
+裁剪工具（`plan.py` / `prune_src.py` / `fix_sources.py` / `fix_makefiles2.py` / `sym2kc.py` / `rules.txt`）
+在 `x96max/trim-tools/`，用法见那里的 `README.md`；`/x96-build/trim-tools` 是它的软链，老命令照跑。
+`sym2kc.py` 生成 `plan`/`prune_src` 要的 Kconfig 符号表（`/tmp/sym2kc.tsv` 被清会自动重建）；
+config 位置按 `$KCONFIG` → `<tree>/.config` → `/x96-build/config-x96-trimmed` 回退（out-of-tree 构建没有 `src-linux/.config`）。
+
 ---
 
 ## 6. 生成 arm64 initrd / uInitrd
