@@ -75,12 +75,18 @@ grep -E '^CONFIG_(ATA|SATA_AHCI|SCSI|BLK_DEV_SD|MD|BLK_DEV_DM|DM_CRYPT|EXT4_FS|D
 |---|---|---|
 | `config-baseline-2026-11-11` | **基线**：发行版原版，184 K | 裁剪起点，也是回退终点 |
 | `trim-conservative.fragment` / `trim-fast.fragment` | **fragment**：只写要改的开关 | 配合 `scripts/config` 应用，可审计 |
-| `config-7.2.12-20261111-hwreal` | **当前装机版**（round6 + `LOCALVERSION` + `SOUND/SND` 全开），与 `.config` md5 一致 | 编译此文件即得在跑的内核 |
+| `config-7.2.12-sandy-dbg3-20261114` | **当前装机版**（192.168.1.68 在跑的 dbg3），与 tree 的 `.config` md5 一致 | 编译此文件即得在跑的内核 |
+| `sandy-dbg3-20261114.fragment` | **该版本的 savedefconfig 反向导出**（312 行，基线 `x86_64_defconfig`） | 升内核源码版本时的可解释起点；回灌已验证 0 行差异 |
 
 > **改 config 的正确姿势**：不要把 `.config` 当源码手改。写 fragment →
 > `scripts/config --file .config -e XXX -d YYY` → `make olddefconfig` →
 > 立刻 `cp .config configs/config-<version>`（覆盖同名，不建 `current` 之类的别名）。
 > `.config` 是产物，`configs/` 里的快照才是资产；一个内核版本只留一份。
+>
+> **fragment 也只留一份**：新版本定稿后重跑 `make savedefconfig` 导出 `sandy-<ver>.fragment`，
+> 删掉上一版的（git 里可取回）。留着旧版 fragment 等于留了一条会退回旧 `LOCALVERSION`
+> 和旧开关的错误重放路径。手写的意图链（`sandy-from-zero` / `netfilter` / `sandy-dbg` /
+> `trace-capture`）不在此列——它们记的是「为什么偏离 defconfig」，快照里读不出来。
 
 ---
 

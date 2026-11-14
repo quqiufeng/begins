@@ -49,7 +49,7 @@ make -j6                     # 两份包的 .config 都已就位
 |---|---|
 | 上游 | `linux-7.2.12.tar.xz`（同一份，SHA256 见上表） |
 | 起点 | `x86_64_defconfig` → `configs/sandy-from-zero-20261111.fragment` |
-| 叠加 | `configs/netfilter.fragment` → `configs/sandy-dbg-20261111.fragment` → `configs/sandy-dbg2-20261111.fragment` |
+| 叠加 | `configs/netfilter.fragment` → `configs/sandy-dbg-20261111.fragment` → `configs/sandy-dbg2-20261111.fragment`（**该 fragment 已于 2026-11-14 删除**，dbg3 的重导出片段见 `configs/sandy-dbg3-20261114.fragment`；本包内容不受影响，`.config` 快照仍在 git 03c3419） |
 | 应用方式 | `tools/kernel/apply-fragment.sh <tree> <fragment>`（每步 `olddefconfig` 验收） |
 | 完整配置 | `configs/config-7.2.12-sandy-dbg2-20261111`（133 KB，与本包内 `.config` 逐字节一致，也与目标机 `/boot/config-7.2.12-sandy-dbg2-20261111` 一致） |
 | 配置规模 | `=y` 1616、`=m` 110 |

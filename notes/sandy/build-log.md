@@ -140,3 +140,91 @@ grub.cfg 只剩 1 个启动项 + recovery + UEFI 固件设置，`grub-script-che
 **已修**（00:30）：`verify-remote.sh` 的 `panic=10` 提示原写死"会自动重启回老内核"，
 现改为按实际可引导内核数动态输出——只有一份时明确报"无退路，panic 后重启回同一份"，
 多份时报可回落，并额外提示远程切换风险。验证：`bash -n` 通过，实跑输出符合预期。
+
+## 第 11 轮：补 TUN/TAP（`CONFIG_TUN=m`，2026-11-12 22:02）
+
+**要求**：这台小机箱要能跑 wireguard/tailscale 一类的东西，需要 `/dev/net/tun`。
+
+**坑的经过（值得记住）**：`scripts/config -e TUN` 之后我图省事，**用
+`make drivers/net/tun.ko` 单独编一个模块、scp 到远端 `/lib/modules/` 替换**，
+连挂两次不同的错：
+
+| 尝试 | 报错 |
+|---|---|
+| 单独编、带 BTF | `BPF: [155041] ENUM (anon) ... Invalid name` / `failed to validate module [tun] BTF: -22` |
+| 单独编、关 `DEBUG_INFO_BTF_MODULES` | `module: x86/modules: Invalid relocation target, existing value is nonzero for sec 28, idx 1` |
+
+**根因不是 tun**：`CONFIG_DEBUG_INFO_BTF_MODULES=y` 下模块 BTF 是**相对 vmlinux BTF 的
+split BTF**（类型 id 从基准表尾部续号，例中 155041）。模块集必须和**正在跑的那个 vmlinux**
+同源；只换模块不换 vmlinux，或脱离完整构建单编一个 `.ko`（section 号、modpost 产物都对不上），
+两种都必然报上面两类错。判据：`modprobe -r nf_tables && modprobe nf_tables` 也报同样 `-22`。
+
+**按文档的正确做法**：
+
+```bash
+# 1) config 只走 fragment/snapshot，一个版本一份（§2）
+scripts/config --file .config -e TUN && make olddefconfig
+cp .config ~/kernel/configs/config-7.2.12-sandy-dbg2-20261111     # 与 .config md5 一致
+
+# 2) 完整构建，让 vmlinuz 与整套模块同源
+cd ~/kernel/build/sandy-20261111/tree && make -j6
+
+# 3) 用现成通道落盘，不手搬单 .ko
+~/kernel/tools/kernel/remote-install.sh 7.2.12-sandy-dbg2-20261111 \
+    /home/quqiufeng/kernel/build/sandy-20261111/tree 192.168.1.68 --no-grub-reboot
+```
+
+**换内核的安全套路**（机器只有一份内核，`无法远程回退`）：
+
+```bash
+sudo grub-reboot "Advanced options for Ubuntu>Ubuntu, with Linux $V"   # 一次性：新内核
+# 持久默认若设为 "$V.prev" 即可在 panic 后回落；本次默认仍是同名新内核（版本串没变）
+reboot
+```
+
+**结果**：22:01:40 冷启动，`boot_id c737a02f… → f57056ae…`；`modprobe tun` rc=0，
+`ip tuntap add/del dev tun-test0 mode tun` 进出都成功；`verify-remote.sh` **PASS=27 FAIL=0**。
+/boot 171M（含 4 个 `.prev` 备份），`/lib/modules/$V` 146M / 106 个模块。
+
+> **`.prev` 已清（22:06）**：按 §4.5 流程 `rm -f /boot/{vmlinuz,initrd.img,config,System.map}-$V.prev`
+> + `rm -rf /lib/modules/$V.prev`（本次无此目录，`.old` 那套没跑过 modules_install）→ `update-grub`。
+> 菜单只剩 `Ubuntu` / `7.2.12-sandy-dbg2-20261111` / recovery / UEFI 四项，`grep -c '\.prev' grub.cfg` = 0，
+> `saved_entry` 仍指向在跑的内核；`/boot` 从 165M 降到 **87M（5%）**。
+> **代价要记住**：清静之后机器上就只剩这一份内核，`vmlinuz.old` 也指向同一个文件，再覆盖安装前必须先备份。
+
+## 第 12 轮：dbg3 定稿快照 + fragment 重导出（2026-11-14 17:50）
+
+**背景**：dbg3 已转正为远端默认内核（第 11 轮），但 `configs/` 里躺的还是 dbg2 的快照和 dbg2 的
+savedefconfig fragment——两条都会把人带回 dbg2 的错误路径。
+
+**做了什么**：
+
+| 动作 | 对象 |
+|---|---|
+| 新增快照 | `configs/config-7.2.12-sandy-dbg3-20261114`（130 K，4987 行），与 `build/sandy-20261111/tree/.config` **字节一致**，md5 `1d507b74ff60dd1fbb493c46b3fcfd6e` |
+| 删除快照 | `configs/config-7.2.12-sandy-dbg2-20261111`（git 03c3419 可取回） |
+| 新增 fragment | `configs/sandy-dbg3-20261114.fragment`，`make savedefconfig` 反向导出 312 行（310 条配置） |
+| 删除 fragment | `configs/sandy-dbg2-20261111.fragment` |
+| 改文档 | `docs/build.md` §2 分工表（当前装机版换成 dbg3 + 新增「fragment 也只留一份」规则）；`src-archive/README.md` 叠加链标注 dbg2 fragment 已删 |
+
+**回灌验证**（同 §8 的方法，不是嘴上说）：
+
+```bash
+cp .config /tmp/real-dbg3.config
+make x86_64_defconfig
+tools/kernel/apply-fragment.sh . configs/sandy-dbg3-20261114.fragment
+diff <(grep -E '^(CONFIG_|# CONFIG_)' .config | sort) \
+     <(grep -E '^(CONFIG_|# CONFIG_)' /tmp/real-dbg3.config | sort)
+# → 0 行差异，4015 项 vs 4015 项
+cp /tmp/real-dbg3.config .config && make olddefconfig   # "No change to .config"，md5 仍是 1d507b74…
+```
+
+> **做完回灌一定要把 `.config` 恢复回去再跑一次 `olddefconfig`**，否则 `.config` 对了但
+> `include/config/auto.conf` 还是回灌态，下一次增量编译会按错的 autoconf 走。
+
+**dbg2 → dbg3 的真实差异只有 3 项**：`LOCALVERSION`、`USER_NS`（n→y）、`TUN`（n→m）。
+其余 4012 项一字未动，所以这两个快照的 diff 本身就是一份准确的变更记录。
+
+**留着的 fragment（手写意图链，不要删）**：`sandy-from-zero`（defconfig 起步）、`netfilter`
+（nft/iptables 整块）、`sandy-dbg`（第一版追踪开关）、`trace-capture`（BPF 抓栈流程，`trace/README.md` 还在用）、
+`trim-conservative` / `trim-fast`（裁剪模板）。判据：快照里读不出「为什么偏离 defconfig」，这就是它们的价值。

@@ -1,12 +1,17 @@
-# configs/sandy-dbg2-20261111.fragment
+# configs/sandy-dbg3-20261114.fragment
 # 从 build/sandy-20261111/tree/.config 用 `make savedefconfig` 反向导出的**真实**配置
-# （310 项，不是手写的装饰文件）。基线 = arch/x86/configs/x86_64_defconfig。
-# 重放：tools/kernel/apply-fragment.sh <tree> configs/sandy-dbg2-20261111.fragment
-# 本次新增 netfilter（dbg2 第一版把 CONFIG_NETFILTER 整块裁掉了，nft/iptables 不可用）：
-#   NETFILTER=y, NF_TABLES=m(含 inet/netdev/arp), IP_NF_IPTABLES=y, NF_NAT=y(内置), XTABLES_LEGACY=y
+# （312 行含注释，不是手写的装饰文件）。基线 = arch/x86/configs/ 下的 x86_64_defconfig。
+# 重放：tools/kernel/apply-fragment.sh <tree> configs/sandy-dbg3-20261114.fragment
+#
+# 与 dbg2 只差 3 项（dbg2 的 fragment 已删除，其快照 config-7.2.12-sandy-dbg2-20261111
+# 仍可从 git 03c3419 取回）：
+#   LOCALVERSION  -sandy-dbg2-20261111 → -sandy-dbg3-20261114
+#   USER_NS       not set → y
+#   TUN           not set → m（必须与 vmlinux 同源整机构建，单编 .ko 会 BTF 失配）
+# netfilter 那一整块（NETFILTER/NF_TABLES/IP_NF_IPTABLES/NF_NAT/XTABLES_LEGACY）沿用 dbg2。
 
 CONFIG_WERROR=y
-CONFIG_LOCALVERSION="-sandy-dbg2-20261111"
+CONFIG_LOCALVERSION="-sandy-dbg3-20261114"
 CONFIG_SYSVIPC=y
 CONFIG_POSIX_MQUEUE=y
 CONFIG_AUDIT=y
@@ -34,6 +39,7 @@ CONFIG_CGROUP_PERF=y
 CONFIG_CGROUP_BPF=y
 CONFIG_CGROUP_MISC=y
 CONFIG_CGROUP_DEBUG=y
+CONFIG_USER_NS=y
 CONFIG_BLK_DEV_INITRD=y
 CONFIG_KALLSYMS_ALL=y
 CONFIG_PROFILING=y
@@ -188,6 +194,7 @@ CONFIG_DM_ZERO=y
 CONFIG_DM_MULTIPATH=m
 CONFIG_NETDEVICES=y
 CONFIG_NETCONSOLE=y
+CONFIG_TUN=m
 CONFIG_VIRTIO_NET=y
 CONFIG_8139TOO=y
 CONFIG_R8169=y
