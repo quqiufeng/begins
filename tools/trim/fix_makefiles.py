@@ -5,7 +5,7 @@
 """
 import os, re, sys
 
-tree = os.path.expanduser('~/kernel/src/linux-7.2.12')
+tree = os.environ.get('KTREE', os.path.expanduser('~/kernel/src/linux-7.2.12'))
 APPLY = '--apply' in sys.argv
 drop_log, nfiles = [], 0
 

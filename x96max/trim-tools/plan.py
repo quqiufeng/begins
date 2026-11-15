@@ -1,57 +1,41 @@
 #!/usr/bin/env python3
-"""按 rules.txt 生成需禁用的 CONFIG 符号清单（不落盘，只打印/写文件）。"""
-import re, sys, os, collections
+"""按 rules.txt 生成需禁用的 CONFIG 符号清单（不落盘，只打印/写 disable.list）。"""
+import os, sys, collections
+import _trimpath                      # noqa: F401  (sys.path)
+import trimlib as T
 
+HERE = os.path.dirname(os.path.realpath(__file__))
 tree = os.environ.get('KTREE', '/x96-build/src-linux')
-rules = os.environ.get('RULES', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rules.txt'))
+rules = os.environ.get('RULES', os.path.join(HERE, 'rules.txt'))
+cfg = T.config_path(tree, '/x96-build/config-x96-20261115')
 
 kill, keep = [], set()
-for ln in open(rules):
+for ln in open(rules, encoding='utf-8'):
     ln = ln.split('#')[0].strip()
     if not ln: continue
     k, _, v = ln.partition(' ')
-    v = v.strip()
-    if k == 'KILL': kill.append(v.rstrip('/'))
-    elif k == 'KEEP': keep.add(v.replace('CONFIG_', '', 1))
+    v = v.strip().rstrip('/')
+    if k == 'KILL' and v: kill.append(v)
+    elif k == 'KEEP' and v: keep.add(v.replace('CONFIG_', '', 1))
 
-# symbol -> 定义它的 Kconfig 路径
-# 前置输入由 sym2kc.py 生成；/tmp 被清掉时自动重建
-_s2k = os.environ.get('SYM2KC', '/tmp/sym2kc.tsv')
-if not os.path.exists(_s2k):
-    import subprocess
-    subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sym2kc.py')], check=True)
-sym2kc = {}
-for ln in open(_s2k):
-    s, f = ln.rstrip('\n').split('\t')
-    sym2kc.setdefault(s, f.lstrip('./'))
-
-en = {}
-# config 位置：$KCONFIG > <tree>/.config > /x96-build/config-x96-trimmed（本机是 out-of-tree 构建）
-_cfg = os.environ.get('KCONFIG') or next((p for p in (os.path.join(tree, '.config'),
-        '/x96-build/config-x96-trimmed') if os.path.exists(p)),
-        os.path.join(tree, '.config'))
-for ln in open(_cfg):
-    m = re.match(r'CONFIG_(\w+)=([ym])$', ln.strip())
-    if m: en[m.group(1)] = m.group(2)
+s2k = T.sym2kc(tree)
+en = T.enabled(cfg)
 
 hit = collections.defaultdict(list)
-for s, v in en.items():
+for s in en:
     if s in keep: continue
-    f = sym2kc.get(s)
+    f = s2k.get(s)
     if not f: continue
     for k in kill:
         if f.startswith(k + '/') or f.startswith(k):
-            # 命中更长的目录优先，但一条就够（同一符号只定义一次）
             hit[k].append(s); break
 
 out = sorted({s for v in hit.values() for s in v})
-with open(os.path.join(os.path.dirname(rules), 'disable.list'), 'w') as fh:
+with open(os.path.join(HERE, 'disable.list'), 'w') as fh:
     fh.write('\n'.join(out) + '\n')
 
 if '-q' not in sys.argv:
-    tot = 0
+    print(f"config: {cfg}")
     for k in sorted(hit, key=lambda x: -len(hit[x])):
-        if not hit[k]: continue
-        tot += len(hit[k])
         print(f"{len(hit[k]):5d}  {k}")
     print(f"\n合计禁用 {len(out)} 个符号（当前 =y {sum(1 for v in en.values() if v=='y')} / =m {sum(1 for v in en.values() if v=='m')}）")

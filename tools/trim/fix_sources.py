@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """清掉指向「已删除目录」的 source 行。含 $ 变量的行一律跳过。"""
 import os, re, sys
-tree = os.path.expanduser('~/kernel/src/linux-7.2.12')
+tree = os.environ.get('KTREE', os.path.expanduser('~/kernel/src/linux-7.2.12'))
 rules = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rules.txt')
 gone = set()
 for ln in open(rules):
