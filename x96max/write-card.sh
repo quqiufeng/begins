@@ -11,8 +11,8 @@
 #      所以**裸盘 cmp 不是判据**，判据在文件系统层（本脚本第 5 步）。
 #
 # 用法:
-   sudo ./write-card.sh <img|img.gz> /dev/sdX [--yes] [--verify-only] [--img-cache DIR] [--bs 4M]
-   sudo ./write-card.sh <img|img.gz> /dev/sdX --verify-only   # 只校验已写好的卡，不动数据
+#  sudo ./write-card.sh <img|img.gz> /dev/sdX [--yes] [--verify-only] [--img-cache DIR] [--bs 4M]
+#  sudo ./write-card.sh <img|img.gz> /dev/sdX --verify-only   # 只校验已写好的卡，不动数据
 #
 # 做的事:
 #   0 安全检查（拒绝系统盘/已挂载）→ 1 关自动挂载、停 udisks2（退出时自动恢复）

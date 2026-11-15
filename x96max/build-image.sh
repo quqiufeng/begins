@@ -31,7 +31,7 @@ BASE=${X96_BASE_IMAGE:-$OPHUB/build/output/images/Armbian_26.11.0-trunk_trixie_a
 BOOTBAK=$ROOT/base-boot-backup
 AUTO=$SCRIPT_DIR/x96-autoinstall.sh
 UNIT=$SCRIPT_DIR/x96-autoinstall.service
-ROOT_PASSWORD=${X96_ROOT_PASSWORD-}
+ROOT_PASSWORD=${X96_ROOT_PASSWORD-x96max}
 ROOT_SSH_KEY=${X96_ROOT_SSH_KEY:-$HOME/.ssh/id_ed25519.pub}
 OUT=$ROOT/recovery
 
@@ -98,6 +98,35 @@ sudo cp "$ROOT_SSH_KEY" /mnt/base-root/root/.ssh/authorized_keys
 sudo chmod 700 /mnt/base-root/root/.ssh
 sudo chmod 600 /mnt/base-root/root/.ssh/authorized_keys
 sudo sed -i "s|^root:[^:]*:|root:${HASH}:|" /mnt/base-root/etc/shadow
+
+# 2b) 控制台免密码自动登录 —— 必须烘进镜像。
+#     2026-11-15 真因：这一版 build-image.sh 里根本没有这段话，ROOT_PASSWORD 默认空
+#     → root 密码字段写成 '!'（锁定）→ HDMI/串口 `login:` 无论敲什么都进不去，
+#     看着像"刷完进不去/dead system"，其实就是没开登录口子。
+#     enable-autologin.sh 只能事后改卡，镜像本身必须自带。
+sudo mkdir -p /mnt/base-root/etc/systemd/system/getty@tty1.service.d \
+              /mnt/base-root/etc/systemd/system/serial-getty@ttyAML0.service.d
+sudo tee /mnt/base-root/etc/systemd/system/getty@tty1.service.d/autologin.conf >/dev/null <<'EOF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
+EOF
+sudo tee /mnt/base-root/etc/systemd/system/serial-getty@ttyAML0.service.d/autologin.conf >/dev/null <<'EOF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty -o '-p -- \\u' --autologin root --keep-baud 115200,38400,9600 %I $TERM
+EOF
+sudo mkdir -p /mnt/base-root/etc/systemd/system/getty.target.wants
+sudo ln -sf /usr/lib/systemd/system/getty@.service \
+  /mnt/base-root/etc/systemd/system/getty.target.wants/getty@tty1.service
+# 首启向导会拦住自动登录后的 shell，必须先掐掉
+for _f in armbian-check-first-login.sh armbian-firstlogin.sh; do
+  if sudo test -f "/mnt/base-root/etc/profile.d/$_f"; then
+    sudo mv "/mnt/base-root/etc/profile.d/$_f" "/mnt/base-root/etc/profile.d/$_f.disabled"
+  fi
+done
+echo "autologin baked: root on tty1 + ttyAML0, password=${ROOT_PASSWORD:-<empty>}"
+
 sudo mkdir -p /mnt/base-root/etc/ssh/sshd_config.d
 printf 'PermitRootLogin yes\nPasswordAuthentication %s\n' "$PASSWORD_AUTH" | sudo tee /mnt/base-root/etc/ssh/sshd_config.d/10-x96.conf >/dev/null
 sudo mkdir -p /mnt/base-root/etc/systemd/network

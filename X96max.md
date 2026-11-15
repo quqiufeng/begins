@@ -31,10 +31,20 @@
 1. ✅ 补回被裁掉的 FAT 支持：源码 `fs/fat/` 已回，钩子 `fs/Kconfig:136`、`fs/Makefile:55` 已接，配置加 `FAT_FS/MSDOS_FS/VFAT_FS=y` + `FAT_DEFAULT_UTF8/codepage=437/iocharset=utf8`。原因：p1 是 FAT32，缺 FAT 则 `/boot` 挂不上。
    - 合并后的配置已落到**两个权威路径**（与 `kbuild-7.2.12/.config` 逐字节相同，即编出当前 Image 的那份）：`x96max/kernel/config-7.2.12-x96`（`build-kernel.sh` / `rebuild-from-zero.sh` 的默认 CFG）和 `configs/config-7.2.12-x96-20261115`。`/x96-build/config-x96-20261115-fat` 只是同一份的临时副本，不再作为入口。
 2. ✅ 内核已编出：`/x96-build/kbuild-7.2.12/arch/arm64/boot/Image`，14:23，35.9MB；`.config` 三项 `=y`，`strings Image | grep -x vfat` 命中。
-3. ⬜ **重打包四件套**：`./x96max/pack-kernel.sh` —— 现有 `/x96-build/pkgs/*` 是 09:20 的旧内核（无 FAT），必须覆盖。
-4. ⬜ **重出镜像**：`./x96max/rebuild-from-zero.sh --from image` —— 现有 `Armbian_26.11.0_amlogic_s905x2_trixie_7.2.12_server_2026.11.15.img.gz`（09:27）也是旧内核。
-5. ⬜ 写卡验证：`sudo ./x96max/write-card.sh <新img.gz> /dev/sdX`。
+3. ✅ **重打包四件套**：`./x96max/pack-kernel.sh` 已在 14:59 跑完，`/x96-build/pkgs/` 全是新时间戳（boot 36.9M / dtb 10.7K / header 13.4M / modules 239K + `sha256sums`）。
+4. ✅ **重出镜像**：`./x96max/rebuild-from-zero.sh --from image` 已在 15:07 出图 `/x96-build/recovery/x96src-autoinstall.img.gz`（284662631 B），时间晚于 14:58 的 `Image`，即含 FAT 的新内核。
+   - 注意：`.config` 与归档配置的 md5 不同（`0719a0d0…` vs `3a3b318a…`）—— 后者是 merged/归档版，前者是 olddefconfig 后的实编版，二者**不等价属正常**，判据看 §0 第 1 条的结论而不是 md5 相等。
+5. ✅ **已装上 eMMC 并启动成功**（2026-11-15 15:32 屏幕取证）：`x96src login:` 出现，日志里有
+   `FAT-fs (mmcblk1p1): utf8 is not a recommended IO charset…` —— p1 是 FAT32 且**挂上了**，同时出现 `utf8` 提示说明 `FAT_DEFAULT_UTF8=y` 生效，即**跑的就是 15:07 那份含 FAT 的新内核**（旧内核无 FAT 会直接卡在挂 /boot）。
+   `mmcblk1: p1 p2` 反复被打出来是首次启动 growpart/resize 的重扫，正常。
+   开机耗时 `~30s` 到 login，曲线与旧系统一致，无 `I/O error` / `reset`，USB 掉盘问题不再出现（走的是 eMMC，本就不涉及）。
 6. ⬜ **无线缺口**：当前树/配置里没有 `net/wireless`、`net/mac80211`、`drivers/net/wireless`，`CONFIG_RTW88*`、`CONFIG_BT*` 全未开 → 内核无 Wi-Fi/蓝牙驱动（有线正常）。补法与证据见 §0.3；这一项不动也不影响 FAT 这条主线。
+7. ⬜ **U 盘在盒子上读一半掉线**（`sda` sector 1427360 / 697MiB，`cmd_age=30s` + xhci `reset`）：卡本身没问题（PC 上 `verify-card.sh` 全绿），是盒子 USB3 口只以 `high-speed`(480M) 枚举 USB3 盘所致。eMMC 未被写入。排查顺序与 `patch-bootargs.sh --usb-fix` 见 §10.2.2。
+8. 🔧 **initramfs 抢跑：U 盘根盘枚举晚 1.3 秒，先被判「UUID 不存在」**（`t=39.64s` 放弃 / `t=40.94s` 才出 `[sda]`）。
+   **与第 1~3 条无关**：`CONFIG_USB_STORAGE` 早已 `=y`、`[sda]` 也确实出现了——同一句 `Gave up waiting` 的第二种成因，§5.4 的三条断言全过仍会撞上。
+   - 应急：`(initramfs)` 里敲 `exit`，会重跑一轮 `mountroot` 并挂上，不用重启。
+   - 固修：`patch-bootargs.sh --usb-fix 346d:5678 rootdelay=15`，已写入 U 盘 p1，**待真机复验**（预期黑屏 15s 属正常）。
+   - 判据表 + 可复现步骤见 **§5.5**；装进 eMMC 后要 `-r rootdelay=15` 删掉，否则每次白等 15s。
 
 ### 0.1 源码缺失时的补齐来源（唯一权威包）
 
@@ -79,6 +89,12 @@ K=$ROOT/amlogic-s9xxx-armbian/build-armbian/kernel/stable/7.2.12
 KNAME=7.2.12-x96
 ```
 
+**开工第一步：跑自检**（只读，不改任何东西；19 项全绿才有资格往下走）
+
+```bash
+./x96max/preflight.sh || exit 1     # 源码树钩子三连 + 配置 =y + 工具链 + 四个脚本
+```
+
 | # | 段 | 命令 | 必须过的断言 |
 |---|---|---|---|
 | 0 | 配置同源 | `diff -q $CFG1 $CFG2` | 两份配置一致；`grep -cE '^CONFIG_(FAT_FS\|MSDOS_FS\|VFAT_FS)=y' $CFG1` = 3 |
@@ -87,12 +103,14 @@ KNAME=7.2.12-x96
 | 3 | 四包 | `./x96max/pack-kernel.sh` | 四个 tar 的 mtime 晚于 Image；`tar -xzOf $K/boot-$KNAME.tar.gz ./vmlinuz-$KNAME \| strings \| grep -qx vfat` 命中 |
 | 4 | 镜像 | `./x96max/rebuild-from-zero.sh --from image` | `done.log` 里 sha256 与 `x96-build/pkgs/*` 的新内核时间同一天；`--from image` 的日志里有本次 boot 包大小 |
 | 5 | 写卡 | `sudo ./x96max/write-card.sh <img.gz> /dev/sdX` | 逐文件 sha256 全 OK；盒子起来后 `dmesg \| grep -i vfat`、`mount \| grep /boot` |
+| 6 | 写卡后**必加引导参数** | `sudo ./x96max/patch-bootargs.sh --usb-fix 346d:5678` | `-l` 三行齐：`rootdelay=15` / `usb-storage.quirks=346d:5678:u` / `usbcore.autosuspend=-1`（缺了必回退 §5.5 竞态，停 initramfs） |
 
-**两个已踩过的坑（写进纪律，别再犯）**：
+**三个已踩过的坑（写进纪律，别再犯）**：
 
 1. **配置入口只有一个**：`rebuild-from-zero.sh` / `build-kernel.sh` 的 `CFG=$SELF_DIR/kernel/config-$KNAME`。改配置要改**这里**（并同步 `configs/`），只改 `/x96-build/*` 下的副本等于没改——本轮就因此差点用无 FAT 的配置重编。
 2. **`--from pkgs` / `--from image` 不重做内核**：它们只吃 `$OUT/Image` 和 `$K/*.tar.gz`。所以"改了配置/源码 → 必须至少 `--from kernel`（或先手工重编 + `pack-kernel.sh`）"，顺序反了就是拿旧内核再出一遍镜像。
    - 反过来：`--from pkgs` 不会重做 initrd。当前配置下所有驱动 `=y`，`modules-*` 只有 `test_bpf.ko`，所以**只改配置重编 Image 时 initrd 可复用**；哪天开了 `=m`（尤其 usb/storage、ext4、meson 相关），必须 `--from initrd` 重做，否则首启找不到根盘。
+3. **写卡 ≠ 可以启动**：`write-card.sh` 只拷镜像，**不写 `uEnv.txt` 的 APPEND**。每次写完卡必须紧跟第 6 步 `patch-bootargs.sh --usb-fix 346d:5678`，否则缺 `rootdelay=15` 必回退 §5.5 的枚举竞态，卡在 initramfs。脚本幂等，重复跑无副作用。
 
 ### 0.3 已知缺口：Wi-Fi 驱动没进内核（下一轮要补）
 
@@ -139,6 +157,96 @@ grep -E 'CONFIG_(WLAN|CFG80211|MAC80211|RTW88|BT|RFKILL)' /x96-build/kbuild-7.2.
 - 补完记得把新配置同步回 `x96max/kernel/config-7.2.12-x96` 和 `configs/config-7.2.12-x96-20261115`，否则下一轮又回到无 Wi-Fi。
 
 ---
+
+### 0.4 新内核首启：唯一真错误是有线网卡 `cannot attach to PHY (-ENODEV)`（2026-11-15 15:34）
+
+屏幕取证（第二张图，启动到 login 之后仍在刷）：
+
+```
+meson8b-dwmac ff3f0000.ethernet eth0: Register MEM_TYPE_PAGE_POOL RxQ-0
+meson8b-dwmac ff3f0000.ethernet eth0: cannot attach to PHY (error: -ENODEV)
+```
+
+**判读**：启动本身成功（DRM/HDMI 起了、fb0 出来了、走到 login），错只在 eth0 拿不到 PHY。
+同屏其余几行都是良性噪声，别误判：
+- `IRQ eth_wake_irq not found` / `IRQ sfty not found` —— 可选的 WOL/安全中断，没有不影响。
+- `DSI transceiver device is disabled` —— X96 Max 没有 DSI 屏。
+- `[drm] forcing HDMI-A-1 connector on` —— 强制点亮 HDMI，正常。
+- `Active PHY interface: GMII/MII (0)` —— 这是 MAC 的 HW capability 寄存器 `dma_cap.actphyif`，**不是** DT 的 phy-mode，跟 -ENODEV 无关，别当线索。
+
+**离线已排掉的原因（都不用再查）**：
+| 检查 | 结果 |
+|---|---|
+| `drivers/net/phy/realtek/realtek_main.c` | 在（7.x 已把 realtek.c 拆成 realtek/ 子目录，`Makefile` 是 `obj-$(CONFIG_REALTEK_PHY) += realtek/`） |
+| Image 里 RTL8211F 驱动 | 在（`RTL8211F Gigabit Ethernet`、`rtl8211f_config_rgmii_delay`） |
+| `CONFIG_PHYLIB` / `REALTEK_PHY` / `MDIO_BUS_MUX_MESON_G12A` / `PINCTRL_MESON_G12A` | 全 `=y` |
+| `mdio-mux-meson-g12a.c`、`dwmac-meson{,-meson8b}.c` | 在，`amlogic,g12a-mdio-mux` 字符串在 Image |
+| 本次 dtb `meson-g12a-x96-max.dtb` 反编译 | `phy-mode = "rgmii"`、`phy-handle`→phy@0、`mdio-multiplexer@4c000` 链到 `mdio-parent-bus` 都正确 |
+
+**7.x 目录搬迁的坑（别把它当"文件被裁"）**：`of_mdio.c`、`phylib` 相关已从 `drivers/net/phy/`
+搬到 `drivers/net/mdio/`（`drivers/net/mdio/of_mdio.c` 存在，13KB）。`drivers/net/phy/` 下没有
+`of_mdio.c`/`phylib.c` **是正常的**，`CONFIG_OF_MDIO=y` 也没有对应 `obj-` 行在 phy/Makefile 里。
+最硬的验收是看 vmlinux 符号，本次实测全部为 `T`（全局，已编入）：
+```
+of_mdio_find_device  of_phy_find_device  fwnode_phy_find_device
+phylink_fwnode_phy_connect  phy_attach_direct  phy_probe
+__initcall__kmod_mdio_mux_meson_g12a__686_357_g12a_mdio_mux_driver_init6
+```
+→ **不需要补文件、不需要重编内核**。
+
+所以**不是配置缺项、也不是 DTB 错**，是运行时 MDIO 上没扫到 PHY。`-ENODEV` 出自
+`stmmac_main.c:1356`，上游走的是 `phylink_fwnode_phy_connect()` → `of_phy_find_device()` 返回 NULL，
+即 **phy-handle 指向的节点没能注册成 mdio 设备** → 最常见两个原因：
+1. G12A 的 MDIO 是多路复用（`amlogic,g12a-mdio-mux`），mux 没探针成功 / 没切到外置 PHY 那一路，
+   则外部 PHY 根本不在任何 mdio 总线上；
+2. PHY 被 `reset-gpios = <&gpio 15 GPIO_ACTIVE_LOW>` 一直按在复位里，MDIO 读回 0xffffffff。
+
+**若定位结果指向不同修法，编译代价差别很大**：
+| 结论 | 改什么 | 代价 |
+|---|---|---|
+| reset-gpios 时序 / mux 使能 | 只改 `meson-g12a-x96-max.dts` 的 PHY 节点 | **只重编 dtb**：`make ARCH=arm64 dtbs`，秒级；不碰 Image |
+| 需换 `phy-mode`（rgmii→rgmii-id 等） | 同上 | 同上 |
+| mdio-mux 驱动逻辑 bug | 改 `drivers/net/mdio/mdio-mux-meson-g12a.c` | 增量 `make ARCH=arm64 Image`，约 1–2 分钟 |
+| 确认某驱动真被裁掉 | 解回 + 补 Kconfig/Makefile 钩子 | 全量 `build-kernel.sh`，8 分 15 秒 |
+
+即"补文件重编译"是**最坏情况**，且当前所有证据都不支持它。
+
+**上机三条命令定位（登录后跑，网不通就用串口/键盘）**：
+```bash
+ls /sys/bus/mdio_bus/devices/            # 空 = PHY 没注册（对应原因1）
+dmesg | grep -iE 'mdio|g12a-mdio-mux|dwmac|phy'   # 看 mux 有没有 probe 失败/时钟错误
+cat /sys/kernel/debug/gpio | grep -i eth  # 或 gpioinfo，看 reset gpio 是否被拉高
+```
+- `/sys/bus/mdio_bus/devices/` 空且 dmesg 无 mux 相关行 → 查 mdio-mux 是否被裁剪成模块但没装进 uInitrd；
+- 有 `mdio_bus_mux` 报 `-EPROBE_DEFER`/clk 错 → 是 mux 的 `pclk/clkin` 时钟依赖顺序；
+- mux 正常但没有 phy 设备 → reset GPIO 时序，试 `reset-assert-us/deassert-us` 放宽或临时去掉 `reset-gpios` 验证。
+
+对比基线：旧 6.12 ophub 内核在同一块板、同一 dtb 上 eth0 是通的，所以这是**7.2.12 新内核引入的差异**，
+不是硬件坏。优先级排在 Wi-Fi 缺口（§0.3）之前——有线本来是最稳的网。
+
+### 0.5 进不了系统的真因：root 密码是**锁定**的，不是键盘坏（2026-11-15 15:39）
+
+`x96src login:` 打 root + 回车进不去 —— 根因在 `build-image.sh:12`：
+`X96_ROOT_PASSWORD` 默认空，走的是**锁定密码**分支（只留 SSH key），
+**空密码 ≠ 可登录**，锁定账户在 getty 上必然被拒。屏幕上那堆 DRM/eth0 日志只是把
+`Login incorrect` 顶掉了，看起来像卡死。
+
+**修法（离线，卡插到 PC 上跑，幂等）**：
+```bash
+sudo ./x96max/enable-autologin.sh              # 按 LABEL=ROOTFS 自动找卡
+sudo ./x96max/enable-autologin.sh /dev/sdb2    # 或显式指定
+```
+它做四件事：
+1. `shadow` 的 root 密码字段清空（空密码，**非** `!` 锁定），备份 `shadow.bak.x96`
+2. `getty@tty1.service.d/autologin.conf` → HDMI 控制台 `--autologin root`
+3. `serial-getty@ttyAML0.service.d/autologin.conf` → 串口同样自动登录
+4. 屏蔽 `armbian-firstlogin/firstrun`，停用 `profile.d/armbian-check-first-login.sh`
+   （否则自动登录后会立刻被首启向导拦住改密码）
+
+**注意**：`systemctl --root=$MNT` 离线 enable 用不了时脚本会退化成直接建
+`etc/systemd/system/getty.target.wants/getty@tty1.service` 软链，两条路都试过。
+
+想顺手压掉刷屏日志：`sudo ./x96max/patch-bootargs.sh quiet loglevel=3`。
 
 ## 1. 硬件配置
 
@@ -344,7 +452,7 @@ CONFIG_RFKILL=m
 | 构建机 | x86_64 Ubuntu 24.04（noble），6 核，23GiB 内存 |
 | 工作目录 | `/x96-build` |
 | ophub 仓库 | `/x96-build/amlogic-s9xxx-armbian` |
-| 内核源码（原版，只做参照） | `/opt/linux/src/linux-7.2.12`（1.8G / 94777 文件，未动） |
+| 内核源码（原版，只做参照） | `/opt/linux/src/linux-7.2.12.tar.xz`（完整树 2026-11-15 已删；要用先解到 `/tmp/linux-7.2.12`，见 §0.1） |
 | **内核源码（实际编译的裁剪树）** | `/x96-build/src-linux`（545M / 37911 文件，裁剪过程见 §5.3） |
 | 内核构建目录（out-of-tree） | `/x96-build/kbuild-7.2.12`（`make O=`，源码树不落产物） |
 | 内核 4 包 | 产出 `/x96-build/pkgs/`；`rebuild` 实际读取 `.../build-armbian/kernel/stable/7.2.12/` |
@@ -373,7 +481,8 @@ sudo apt-get install -y $(cat compile-kernel/tools/script/ubuntu2404-build-armbi
 
 > 本次最终 `.config` 已保存到 `x96max/kernel/config-7.2.12-x96`；直接复制即可复现。下面是从 6.18 基线重建/理解配置的步骤。
 
-源码：`/opt/linux/src/linux-7.2.12`（Makefile：`VERSION=7 PATCHLEVEL=2 SUBLEVEL=12`）。
+源码：`/opt/linux/src/linux-7.2.12.tar.xz`（Makefile：`VERSION=7 PATCHLEVEL=2 SUBLEVEL=12`）。
+**原版完整树已删**，只剩这个包；实际编译用裁剪树 `/x96-build/src-linux`，缺文件一律按 §0.1 从包里解。
 
 先清理源码树（树内构建产物会导致 out-of-tree 构建报错）：
 
@@ -480,7 +589,7 @@ $OUT/modules/lib/modules/7.2.12-x96/
 
 | 项 | 值 |
 |---|---|
-| 裁剪树 | `/x96-build/src-linux`（原版 `/opt/linux/src/linux-7.2.12`，未动） |
+| 裁剪树 | `/x96-build/src-linux`（原版完整树 2026-11-15 已删，仅存 `/opt/linux/src/linux-7.2.12.tar.xz`） |
 | 用的 config | `/x96-build/config-x96-20261115` 生成，`make olddefconfig` 后落 `kbuild-7.2.12/.config`
 （含 `CONFIG_DEBUG_INFO_NONE=y`，关 debug info 是最大的那一刀）；
 **归档副本 `configs/config-7.2.12-x96-20261115`**（与 `kbuild/.config` 字节一致，6672 行；
@@ -497,9 +606,10 @@ ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j6 O=/x96-build/kbuild-7.2.12
 ```
 
 > 这两条就是**实测用的编译命令**；`-j6` 即 `nproc`（构建机 6 核），`O=` 指到独立的构建目录。
-> 走一键脚本时对应 `X96_KSRC=/x96-build/src-linux ./x96max/rebuild-from-zero.sh`：
-> 脚本默认 `X96_KSRC=/opt/linux/src/linux-7.2.12`（**未裁剪的原版**，全量约 20 分钟），
-> 想复现 8 分钟那一档必须显式把 `X96_KSRC` 指向裁剪树。
+> 走一键脚本时对应 `./x96max/rebuild-from-zero.sh`：
+> 脚本默认 `X96_KSRC=${X96_BUILD_ROOT:-/x96-build}/src-linux`（**裁剪树**，即 8 分钟那一档）；
+> 想用未裁剪原版才显式 `X96_KSRC=/opt/linux/src/linux-7.2.12`——**但该目录 2026-11-15 已删，只剩
+> `linux-7.2.12.tar.xz`**，要那档须先 `cd /opt/linux/src && tar -xf linux-7.2.12.tar.xz`。
 
 **五条踩出来的规矩**（这一轮都真炸过）：
 
@@ -592,11 +702,16 @@ ALERT!  UUID=d764b7d9-…  does not exist.  Dropping to a shell!
 
 ```bash
 cd /x96-build/src-linux
-# 1) 从同版本完整树拷回整个存储驱动目录
-cp -a /opt/linux/src/linux-7.2.12/drivers/usb/storage drivers/usb/
+# 1) 拷回整个存储驱动目录（完整树已不在 /opt，只剩 tar.xz，必须先解到 /tmp，见 §0.1）
+SRC=/opt/linux/src/linux-7.2.12.tar.xz
+[[ -d /tmp/linux-7.2.12 ]] || (cd /tmp && tar -xf $SRC linux-7.2.12/drivers/usb/storage)
+cp -a /tmp/linux-7.2.12/drivers/usb/storage drivers/usb/
 # 2) 恢复被连带删掉的 Kconfig 钩子（当前在 114 行，插在 endmenu 之前）
 grep -q 'storage/Kconfig' drivers/usb/Kconfig || \
   sed -i '/^endmenu/i source "drivers/usb/storage/Kconfig"' drivers/usb/Kconfig
+# 2b) 恢复 Makefile 钩子（缺这行目录白拷，kbuild 不会进去）
+grep -q 'CONFIG_USB_STORAGE.*storage/' drivers/usb/Makefile || \
+  sed -i 's|^obj-\$(CONFIG_USB) \+=  *$|obj-$(CONFIG_USB_STORAGE)\t+= storage/\n&|' drivers/usb/Makefile
 # 3) 打开开关
 ./scripts/config --file /x96-build/kbuild-7.2.12/.config -e USB_STORAGE -e USB_UAS
 # 4) 用 syncconfig 而不是 olddefconfig —— 新符号是 NEW 状态，olddefconfig 会取默认值把它再关一次
@@ -641,8 +756,106 @@ sync && udisksctl unmount -b /dev/sdb1 && udisksctl unmount -b /dev/sdb2
 | 旧 U 盘内核备份 | `/x96-build/U-backup-{zImage,vmlinuz,config}-20261115-124215` |
 | config 归档 | `configs/config-7.2.12-x96-20261115`（已刷新，与 `kbuild/.config` 字节一致） |
 
-**待办**：新 `Image` 已烧进 U 盘，**真机启动断言还没跑**。启动后要确认三件事：
-`lsblk` 里出现 U 盘自己的 `sda`、`/proc/filesystems` 含 `ext4`、`dmesg` 里 xhci/dwc3 有设备枚举。
+**真机启动断言结果（2026-11-15 16:00，三条全过）**：
+
+| 断言 | 结果 |
+|---|---|
+| `lsblk` 出现 U 盘自己的 `sda` | ✅ `sd 0:0:0:0: [sda]`，`sda1`/`sda2` 都出来 |
+| `/proc/filesystems` 含 `ext4` | ✅ |
+| `dmesg` 里 xhci/dwc3 有设备枚举 | ✅ |
+
+**但启动仍然失败**，报的还是 `Gave up waiting for root file system device`——
+只是这次不是缺驱动，而是**枚举比 initramfs 超时晚 1.3 秒**。同一个报错、两种成因，见 **§5.5**。
+
+> 教训：这一节的「三条断言」只能证明**驱动进了内核**，**不能证明挂根盘成功**。
+> 驱动到位之后再去判断能不能启动，必须看 §5.5 的时间戳判据表，否则会误以为修复没生效、白重编一遍内核。
+
+### 5.5 同一句 `Gave up waiting` 的第二种成因：晚 1.3 秒的枚举竞态（2026-11-15 16:00）
+
+**这是 §5.4 的陷阱版**：屏幕/串口输出**一字不差**，但根因完全不同，按 §5.4 去重编内核是白干。
+
+```text
+Gave up waiting for root file system device.
+Common problems:
+ - Boot args (cat /proc/cmdline)
+ - Check rootdelay= (did the system wait long enough?)   ← 这次就死在这行
+ - Missing modules (cat /proc/modules; ls /dev)
+ALERT!  UUID=8e0a1be3-…  does not exist.  Dropping to a shell!
+```
+
+**唯一可靠的区分手段：比对两个时间戳的先后**（在 initramfs 里看不到 dmesg 就靠这条，因为提示里三行 who-done-it 全是猜的）。
+
+本例实测：
+
+| 事件 | 时间 | 结果 |
+|---|---|---|
+| initramfs-tools 超时放弃 | **39.64 s** | 此时 `/dev/sda` 还不存在 → 报 UUID 不存在 |
+| `sd 0:0:0:0: [sda]` 枚举完成 | **40.94 s** | 只晚 **1.3 秒** |
+
+⇒ 驱动**在**（§5.4 的修复已生效），`ext4` 也在，纯粹是 `initramfs-tools` 的 `ROOTDELAY` 默认值（约 30 次 × 1s 轮询）在 U 盘枚举前就到期了。
+U 盘走的是 `usb-storage` 异步探测 + 30s 级 `scan`，比 eMMC/SSD 慢一大截，1.3 秒的窗口就是这么来的。
+
+**判据表（照这个走，别猜）**
+
+| 观察 | 结论 | 做法 |
+|---|---|---|
+| 超时时刻 < `[sda]` 枚举时刻（差几秒内） | 竞态 | 加 `rootdelay=15`，见本节下方「永久修复」 |
+| `[sda]` 从没出现 | 真缺驱动（§5.4） | 查 `nm vmlinux \| grep usb_stor_probe`、`CONFIG_USB_STORAGE=y` |
+| `[sda]` 出现了但 `EXT4-fs` 没挂上 | 不是驱动也不是时序 | 查 `root=UUID=` 是否与实际 UUID 一致、`rootfstype=ext4` |
+| `I/O error` + `cmd_age=30s` + `reset` | 链路掉盘 | §10.2.2 |
+
+**现场应急（不用重启、不用改盘）**：在 `(initramfs)` 提示符直接敲
+
+```text
+exit
+```
+
+`initramfs-tools` 的 `local` 脚本在 shell 退出后会**重新走一遍 `mountroot` 轮询**。此时 `sda` 早已枚举完，一次就挂上，系统继续正常启动。
+（这招只对「竞态」有效；真缺驱动时 `exit` 会立刻再报一次同样的错。）
+
+**永久修复（写进 p1 的 `uEnv.txt`，别手抠）**：
+
+```bash
+sudo ./x96max/patch-bootargs.sh --usb-fix 346d:5678 rootdelay=15
+```
+
+一次带全三个参数（`rootdelay=15` + `usb-storage.quirks=346d:5678:u` + `usbcore.autosuspend=-1`）。
+`patch-bootargs.sh` 幂等，重复跑只会更新、不会叠加重复项；备份落在 `/x96-build/uEnv.txt.bak.<epoch>`。
+
+> `rootdelay=15` 的代价是**每次开机多等 15 秒**（`prepare-root` 里 hard sleep，不是轮询，有就用不上「提前发现」）。
+> 只在这根 U 盘根盘上需要；装进 eMMC 后 root 是 `mmcblk1p2`，**要把它删掉**：
+> `sudo ./x96max/patch-bootargs.sh -r rootdelay=15`
+
+**验证参数真的进了内核**（改完盘、开机后第一步）：
+
+```bash
+cat /proc/cmdline | tr ' ' '\n' | grep -E 'rootdelay|quirks|autosuspend'
+# 期望三行都在：rootdelay=15 / usb-storage.quirks=346d:5678:u / usbcore.autosuspend=-1
+```
+
+**写盘后的权威快照（2026-11-15 16:05，`cat /media/$USER/BOOT/uEnv.txt` 实录）**
+
+```text
+LINUX=/zImage
+INITRD=/uInitrd
+FDT=/dtb/amlogic/meson-g12a-x96-max.dtb
+APPEND=root=UUID=8e0a1be3-3e27-4733-9b1f-b5936d744996 rootflags=data=writeback rw rootwait \
+  rootfstype=ext4 console=ttyAML0,115200n8 console=tty0 no_console_suspend consoleblank=0 \
+  fsck.fix=yes fsck.repair=yes net.ifnames=0 max_loop=128 cgroup_enable=cpuset \
+  cgroup_memory=1 cgroup_enable=memory swapaccount=1 video=HDMI-A-1:1920x1080@60e \
+  plymouth.enable=0 rootdelay=15 usb-storage.quirks=346d:5678:u usbcore.autosuspend=-1
+```
+
+下次要核对「盘上到底带没带参数」时，直接跟这段对拍，别只 `grep rootdelay`——
+**`rootwait` 和 `rootdelay` 是两个不同的参数**，`grep root` 会把两行混在一起误判。
+
+**本条的可复现步骤（下一个人照做）**
+
+1. `sudo ./x96max/patch-bootargs.sh -l` 记下当前 APPEND 并确认**没有** `rootdelay`
+2. 插盘启动，在 `(initramfs)` 里敲 `exit` → 应能进系统（证明是竞态而不是缺驱动）
+3. `dmesg | grep -E 'Gave up|\[sda\]'` 换算成同一时间轴，确认「放弃时刻 < 枚举时刻」
+4. `patch-bootargs.sh --usb-fix <vid:pid> rootdelay=15` 写盘，`sync && umount`
+5. 再启动一次，黑屏 15 秒属正常，之后应直接到 `login:`
 
 ---
 
@@ -1039,6 +1252,97 @@ USB 读卡器大块读会返回错字节：`bs=1M` 几乎必错，`bs=256K` 仍�
 Amlogic 官方救砖流程，绕开 eMMC 上一切 U-Boot 配置，不依赖 `boot.scr` 的 devnum 扫描。
 注意：被改坏的引导文件仍在 eMMC 上，起来后立刻 `mv /boot/uEnv.txt.disabled /boot/uEnv.txt` 复原。
 
+### 10.2.2 U 盘在盒子上读一半掉线（`cmd_age=30s` + `reset`）
+
+**症状**（2026-11-15，Teclast CoolFlash `346d:5678`，32G，写卡校验全绿）：
+
+```text
+42.435373 usb 3-1: reset high-speed USB device number 2 using xhci-hcd
+42.569531 sd 0:0:0:0: [sda] tag#0 UNKNOWN(0x2003) Result: hostbyte=0x03 driverbyte=DRIVER_OK cmd_age=30s
+42.573627 CDB: opcode=0x28 28 00 00 15 c7 a0 00 00 08 00
+42.581156 I/O error, dev sda, sector 1427360 op 0x0:(READ) flags 0x80700 phys_seg 1 prio class 2
+```
+
+读三行的含义：
+
+| 字段 | 说明 |
+|---|---|
+| `tag#0 UNKNOWN(0x2003)` + `hostbyte=0x03` | 命令没拿到结果就被链路断开，不是数据错/校验错 |
+| `cmd_age=30s` | SCSI 层等到超时上限才报错（默认 `eh_timeout` 30s） |
+| `reset ... device number 2` | xHCI 在超时后复位设备；日志里只有 USB 2.0 的 `high-speed` |
+
+**位置**：sector 1427360 × 512 = 697MiB。p1 只占 0–511MiB，所以断的是 **rootfs 内约 185MiB 处**——系统读根盘时就断，卡在挂 root，后面全无输出。
+
+**关键判据：这不是卡坏了。** 同一根盘在同一台 PC 上 `verify-card.sh` 全量 sha256 通过（分区表 / 前 4MiB / 194 条 vs 9868 条清单），换到盒子读就掉。差异只在盒子的 USB 主控与供电。
+
+**决定性对比——枚举速度**：
+
+| 位置 | `speed` | 协议 |
+|---|---|---|
+| PC（热插后 `/sys/bus/usb/devices/*/speed`） | **5000** | USB 3.2 SuperSpeed |
+| 盒子（dmesg 日志） | **480**（`high-speed`） | 掉回 USB 2.0 |
+
+一块 USB3 盘插 USB3 口却只以 USB2 枚举 ⇒ **SuperSpeed 那对差分线没起来**（口是 USB2 / 延长线 / 供电压不住信号）。链路本就不稳，大块读必超时复位。
+
+**按成本从低到高**：
+
+1. **换到盒子蓝色 USB3 口，直插，不用延长线**（最可能直接解决）
+2. 接**有源 HUB**（这类盒子 USB 口带不动峰值电流，廉价 U 盘尤其明显）
+3. 内核参数兜底：禁 UAS + 禁运行期挂起（见下）
+4. 走 **microSD 槽**，稳定性远好于 U 盘；同一个 `img.gz` 直接 `write-card.sh`
+5. 换 USB-SATA SSD
+
+**第 3 条的改法**（改 p1 的 `uEnv.txt`，不要手抠，用脚本）：
+
+```bash
+sudo ./x96max/patch-bootargs.sh -l                              # 先看当前 APPEND
+sudo ./x96max/patch-bootargs.sh --usb-fix 346d:5678 rootdelay=15  # 追加下面三行
+```
+
+等价于在 `APPEND=` 末尾加：
+
+```text
+usb-storage.quirks=346d:5678:u usbcore.autosuspend=-1 rootdelay=15
+```
+
+> `rootdelay=15` 严格说**不属于掉盘**（掉盘是链路层超时复位），它是治 §5.5 那个「枚举晚 1.3 秒被 initramfs 放弃」的竞态。
+> 但两种故障出现在同一根盘、同一台盒子上，实测**一起加最省事**——单独排查哪一个都是一轮插拔 + 一次重启。
+
+`:u` = 对该盘禁用 UAS、强制走老的 BOT 协议（G12A 的 xHCI 上 UAS 翻车率高，症状与本例一致）。
+**但要老实说**：本例在 `high-speed` 下枚举，UAS 大概率本就没参与，真正起作用的是「换口」，这两行属于保险。
+
+> 副作用提醒：因为断在 rootfs 之前，`x96-autoinstall` 一次都没跑过，**eMMC 完全未被写入**。
+> 看到这类日志不要急着怀疑安装脚本，先确认 root 是否挂上：串口里没有 `EXT4-fs ... mounted filesystem` 就是没到那一步。
+
+**2026-11-15 15:31 补充：这根盘在 PC 上也掉了一次，判据要改。**
+
+写卡那台 PC（15 点后）的 dmesg：
+
+```text
+27557.182388 usb 2-3: new SuperSpeed USB device number 14 using xhci_hcd   ← 5000M，正常
+27558.450197 EXT4-fs (sdb2): mounted filesystem 74d71f81-… r/w              ← sdb2 读写正常
+27863.540836 EXT4-fs (sdb2): unmounting filesystem 74d71f81-…
+27863.659632 sdb: detected capacity change from 61440000 to 0               ← 掉盘
+27868.868765 usb 1-3: new high-speed USB device number 16 using xhci_hcd    ← 重插后只剩 480M
+27870.289731 usb 1-3: device not accepting address 16, error -71           ← 直接枚举失败
+```
+
+三条新信息：
+
+1. **PC 上原本是 `SuperSpeed`(5000M)，读写 `sdb2` 正常** —— 说明线/口/卡当时都好，数据没坏。
+2. **同一根盘随后在 PC 上也掉了**（`capacity change … to 0`），重插后只能 `high-speed` 且 `error -71` 枚举失败。
+   ⇒ 掉盘不专属于盒子的 USB 口，「卡/线已开始接触不良或供电衰减」也是候选因，不能只怪盒子。
+3. 因此 §10.2.2 的排查第 0 步改成：**先在 PC 上把这张卡重新插一次，看 `speed` 是不是 5000**。
+   - 仍是 5000 且 `verify-card.sh` 全绿 → 卡没问题，锅在盒子，按上面 1→5 走；
+   - 只有 480 或干脆 -71 → **先换线/换卡/换口**，再谈盒子，否则会白折腾内核参数。
+
+```bash
+# PC 侧重插后判定（不用 dmesg 也能看）
+for d in /sys/bus/usb/devices/*/; do
+  [ -r "$d/speed" ] && echo "$(basename $d) $(cat $d/speed) $(cat $d/product 2>/dev/null)"
+done | grep -i -e 5000 -e teclast
+```
+
 ### 10.3 验证
 
 ```bash
@@ -1185,7 +1489,8 @@ NAS 备份目录  dav://192.168.1.53:5005/sata11-18072858035/x96-backup/
 6. **Amlogic Maskrom 的 `update` 工具在本机控制传输不稳定**：T95 的 Allwinner FEL 经验不能直接套用；能 SD 启动就不要再纠结 Maskrom。
 7. **备份先行**：原厂启动区 117MiB、p1、p2 都在 `dav://192.168.1.53:5005/sata11-18072858035/x96-backup/emmc-original-backup/`；写主线 U-Boot 前必须保留。
 8. **写卡前关桌面自动挂载**：udisks2 会在 dd 结束后把卡以 **rw** 挂上 → ext4 日志回放 → 经不稳的读路径读到错字节再写回，垃圾被固化成真损坏（症状：文件字符错位、**长度不变**、`e2fsck -fn` 干净，只有逐文件 sha256 抓得到）。一条命令避开：`sudo x96max/write-card.sh <img.gz> /dev/sdX`，详见 §10.1.3。
-9. **别用整盘 `cmp` 判写卡成败**：USB 读卡器大块读会返回错字节，且同一位置重读给出**相同的错字节**，裸盘比对必然出现几百字节假差异，会把好卡判成坏卡、逼你反复重写（每次重写又在放大第 8 条的风险）。判据是逐文件 sha256 + `e2fsck -fn`，见 §10.1.4。
+9. **U 盘掉盘先看 `speed`，别急着换卡**：`reset ... high-speed` + `cmd_age=30s` + `hostbyte=0x03` 是链路层超时，不是数据损坏；同一根盘在 PC 上 sha256 全绿就说明卡没问题。USB3 盘在盒子上只以 480M 枚举基本等于掉到了 USB2 链路，先换口/上有源 HUB。详见 §10.2.2。
+10. **别用整盘 `cmp` 判写卡成败**：USB 读卡器大块读会返回错字节，且同一位置重读给出**相同的错字节**，裸盘比对必然出现几百字节假差异，会把好卡判成坏卡、逼你反复重写（每次重写又在放大第 8 条的风险）。判据是逐文件 sha256 + `e2fsck -fn`，见 §10.1.4。
 10. **删源码目录前先看它的 `Kconfig` 有没有被 `source`。** `disable.list` 划掉一个 `CONFIG_*` 只是「不编它」，
     但 `prune_src.py` 若因此删掉整个目录（含 `Makefile` + `Kconfig`），`drivers/*/Kconfig` 里的 `source` 行
     就悬空了，`olddefconfig` 会把这个开关**静默丢成 `n`**：`Image` 照编照引导，直到挂根盘才报
@@ -1703,7 +2008,16 @@ sudo ./x96max/write-card.sh /x96-build/recovery/x96src-autoinstall.img.gz /dev/s
 
 # 只把镜像塞进卡上已分好区的 p1（卡上分区方案不变、不想重写整盘时用）
 sudo ./x96max/flash-p1.sh /x96-build/recovery/x96src-autoinstall.img.gz /dev/sdX1
+
+# 改卡上 p1 的启动参数（uEnv.txt 的 APPEND），不重写任何分区
+sudo ./x96max/patch-bootargs.sh -l                     # 只列出当前 APPEND
+sudo ./x96max/patch-bootargs.sh --usb-fix 346d:5678 rootdelay=15   # USB 保险套餐（三参数，§5.5）
+sudo ./x96max/patch-bootargs.sh quiet loglevel=7       # 追加任意参数（幂等）
+sudo ./x96max/patch-bootargs.sh -r rootdelay=15        # 删掉指定参数（装进 eMMC 后必做）
 ```
+
+`patch-bootargs.sh` 定位分区的方式和 `flash-p1.sh` 一样（`X96_ROOT_LABEL=ROOTFS` → 反查父盘 → 找 p1 的 FAT32），
+每步都重读回验，写前先把原文件备份到 `$X96_BUILD_ROOT/uEnv.txt.bak.<时间戳>`。盒子读一半掉盘时的用法见 **§10.2.2**。
 
 > 不要再手工 `dd`：见 §10.1.3（自动挂载把日志回放出的垃圾固化进卡）与 §10.1.4（裸盘 `cmp` 不是判据）。
 > 完整流程、手工等价命令、失败判定表在 **§10.1**。
@@ -1762,4 +2076,4 @@ v4l2-ctl --list-devices
 
 ---
 
-*文档版本: 1.5 · 更新: 2026-11-15 · 设备: X96 Max / S905X2*
+*文档版本: 1.7 · 更新: 2026-11-15 · 设备: X96 Max / S905X2*
