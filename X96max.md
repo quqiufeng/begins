@@ -43,7 +43,7 @@
 8. 🔧 **initramfs 抢跑：U 盘根盘枚举晚 1.3 秒，先被判「UUID 不存在」**（`t=39.64s` 放弃 / `t=40.94s` 才出 `[sda]`）。
    **与第 1~3 条无关**：`CONFIG_USB_STORAGE` 早已 `=y`、`[sda]` 也确实出现了——同一句 `Gave up waiting` 的第二种成因，§5.4 的三条断言全过仍会撞上。
    - 应急：`(initramfs)` 里敲 `exit`，会重跑一轮 `mountroot` 并挂上，不用重启。
-   - 固修：`patch-bootargs.sh --usb-fix 346d:5678 rootdelay=15`，已写入 U 盘 p1，**待真机复验**（预期黑屏 15s 属正常）。
+   - 固修：`patch-bootargs.sh --usb-fix 346d:5678 rootdelay=15`，已写入卡 p1（2026-11-15 16:14 复核：`APPEND` 22 参数、三参数逐个 `grep -xF` 命中、`diff` 对备份只多这 3 行），**待真机复验**（预期黑屏 15s 属正常）。
    - 判据表 + 可复现步骤见 **§5.5**；装进 eMMC 后要 `-r rootdelay=15` 删掉，否则每次白等 15s。
 
 ### 0.1 源码缺失时的补齐来源（唯一权威包）
@@ -821,6 +821,11 @@ sudo ./x96max/patch-bootargs.sh --usb-fix 346d:5678 rootdelay=15
 
 一次带全三个参数（`rootdelay=15` + `usb-storage.quirks=346d:5678:u` + `usbcore.autosuspend=-1`）。
 `patch-bootargs.sh` 幂等，重复跑只会更新、不会叠加重复项；备份落在 `/x96-build/uEnv.txt.bak.<epoch>`。
+
+> **坑（2026-11-15 实测）**：`write-card.sh` 收尾会把卡上分区**全部卸载**，紧接着跑
+> `patch-bootargs.sh` 时 p1 未挂载 → 旧版 `findmnt` 返回 1 + `set -euo pipefail` 让赋值失败，
+> 脚本**零输出、直接退出 1**，极易被当成"跑过了"。已修（`|| true`，commit `8c40d19`）。
+> 现在正常输出应为 `+ 追加: rootdelay=15` 等三行，否则**当它没生效**，重跑并跟 `-l` 对拍。
 
 > `rootdelay=15` 的代价是**每次开机多等 15 秒**（`prepare-root` 里 hard sleep，不是轮询，有就用不上「提前发现」）。
 > 只在这根 U 盘根盘上需要；装进 eMMC 后 root 是 `mmcblk1p2`，**要把它删掉**：
