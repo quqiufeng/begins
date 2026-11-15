@@ -116,6 +116,9 @@ if run_stage initrd; then
     sudo umount /mnt/x96root
     sudo losetup -d "$LOOP"
     trap - EXIT
+    # 等待窗口 30s → 90s：USB 读卡器启动时 sda 在 ~37.5s 才枚举，
+    # 而 init 的 30s 预算扣掉 rootdelay 后必然先放弃（rootdelay 只会挖预算，不会加预算）。
+    sudo "$SELF_DIR/patch-initrd-wait.sh" "$ROOT/initrd.img-$KNAME" --inplace
     mkimage -A arm64 -O linux -T ramdisk -C gzip -n uInitrd \
       -d "$ROOT/initrd.img-$KNAME" "$ROOT/uInitrd-$KNAME"
     ls -l "$ROOT/initrd.img-$KNAME" "$ROOT/uInitrd-$KNAME"

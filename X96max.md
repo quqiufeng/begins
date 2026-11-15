@@ -43,8 +43,9 @@
 8. 🔧 **initramfs 抢跑：U 盘根盘枚举晚 1.3 秒，先被判「UUID 不存在」**（`t=39.64s` 放弃 / `t=40.94s` 才出 `[sda]`）。
    **与第 1~3 条无关**：`CONFIG_USB_STORAGE` 早已 `=y`、`[sda]` 也确实出现了——同一句 `Gave up waiting` 的第二种成因，§5.4 的三条断言全过仍会撞上。
    - 应急：`(initramfs)` 里敲 `exit`，会重跑一轮 `mountroot` 并挂上，不用重启。
-   - 固修：`patch-bootargs.sh --usb-fix 346d:5678 rootdelay=15`，已写入卡 p1（2026-11-15 16:14 复核：`APPEND` 22 参数、三参数逐个 `grep -xF` 命中、`diff` 对备份只多这 3 行），**待真机复验**（预期黑屏 15s 属正常）。
-   - 判据表 + 可复现步骤见 **§5.5**；装进 eMMC 后要 `-r rootdelay=15` 删掉，否则每次白等 15s。
+   - **`rootdelay=15` 是无效解，已弃用**（2026-11-15 读 `init`/`scripts/local` 源码证伪，见 §5.5「为什么 rootdelay 没用」）：`init` 先记 `starttime` 再 `sleep rootdelay`，而 `slumber=max(30, rootdelay)` → 15 秒只是从 30 秒预算里挖掉 15 秒，放弃时刻只提前、不推迟。
+   - 固修（已写入卡 p1，**待真机复验**）：`x96max/patch-initrd-wait.sh` 把 initramfs 里 `scripts/local` 的 `slumber` 由 `30` 改成 `90`，重打包成 `uInitrd`；`uEnv.txt` 的 `rootdelay=15` 已用 `-r` 删除（`APPEND` 21 参数，`usb-storage.quirks=346d:5678:u` / `usbcore.autosuspend=-1` 保留）。
+   - 判据表 + 可复现步骤见 **§5.5**；`rebuild-from-zero.sh --from initrd` 已内置该补丁，重打镜像不会回退。
 
 ### 0.1 源码缺失时的补齐来源（唯一权威包）
 
@@ -103,14 +104,14 @@ KNAME=7.2.12-x96
 | 3 | 四包 | `./x96max/pack-kernel.sh` | 四个 tar 的 mtime 晚于 Image；`tar -xzOf $K/boot-$KNAME.tar.gz ./vmlinuz-$KNAME \| strings \| grep -qx vfat` 命中 |
 | 4 | 镜像 | `./x96max/rebuild-from-zero.sh --from image` | `done.log` 里 sha256 与 `x96-build/pkgs/*` 的新内核时间同一天；`--from image` 的日志里有本次 boot 包大小 |
 | 5 | 写卡 | `sudo ./x96max/write-card.sh <img.gz> /dev/sdX` | 逐文件 sha256 全 OK；盒子起来后 `dmesg \| grep -i vfat`、`mount \| grep /boot` |
-| 6 | 写卡后**必加引导参数** | `sudo ./x96max/patch-bootargs.sh --usb-fix 346d:5678` | `-l` 三行齐：`rootdelay=15` / `usb-storage.quirks=346d:5678:u` / `usbcore.autosuspend=-1`（缺了必回退 §5.5 竞态，停 initramfs） |
+| 6 | 写卡后**必补 initramfs 等待窗口** | `sudo ./x96max/patch-initrd-wait.sh <卡>/uInitrd --inplace` + `patch-bootargs.sh --usb-fix 346d:5678` | `slumber` 回读为 `90`；`APPEND` 含 `usb-storage.quirks=346d:5678:u` / `usbcore.autosuspend=-1`（缺了必回退 §5.5 竞态，停 initramfs）。**不要加 `rootdelay`** |
 
 **三个已踩过的坑（写进纪律，别再犯）**：
 
 1. **配置入口只有一个**：`rebuild-from-zero.sh` / `build-kernel.sh` 的 `CFG=$SELF_DIR/kernel/config-$KNAME`。改配置要改**这里**（并同步 `configs/`），只改 `/x96-build/*` 下的副本等于没改——本轮就因此差点用无 FAT 的配置重编。
 2. **`--from pkgs` / `--from image` 不重做内核**：它们只吃 `$OUT/Image` 和 `$K/*.tar.gz`。所以"改了配置/源码 → 必须至少 `--from kernel`（或先手工重编 + `pack-kernel.sh`）"，顺序反了就是拿旧内核再出一遍镜像。
    - 反过来：`--from pkgs` 不会重做 initrd。当前配置下所有驱动 `=y`，`modules-*` 只有 `test_bpf.ko`，所以**只改配置重编 Image 时 initrd 可复用**；哪天开了 `=m`（尤其 usb/storage、ext4、meson 相关），必须 `--from initrd` 重做，否则首启找不到根盘。
-3. **写卡 ≠ 可以启动**：`write-card.sh` 只拷镜像，**不写 `uEnv.txt` 的 APPEND**。每次写完卡必须紧跟第 6 步 `patch-bootargs.sh --usb-fix 346d:5678`，否则缺 `rootdelay=15` 必回退 §5.5 的枚举竞态，卡在 initramfs。脚本幂等，重复跑无副作用。
+3. **写卡 ≠ 可以启动**：`write-card.sh` 只拷镜像，**既不写 `uEnv.txt` 的 APPEND、也不改 `uInitrd`**。每次写完卡必须紧跟第 6 步（`patch-initrd-wait.sh` + `patch-bootargs.sh --usb-fix 346d:5678`），否则 `slumber=30` 撞上 USB 读卡器 `~38s` 枚举，必回退 §5.5 的竞态、卡在 initramfs。两个脚本都幂等，重复跑无副作用。
 
 ### 0.3 已知缺口：Wi-Fi 驱动没进内核（下一轮要补）
 
@@ -770,7 +771,7 @@ sync && udisksctl unmount -b /dev/sdb1 && udisksctl unmount -b /dev/sdb2
 > 教训：这一节的「三条断言」只能证明**驱动进了内核**，**不能证明挂根盘成功**。
 > 驱动到位之后再去判断能不能启动，必须看 §5.5 的时间戳判据表，否则会误以为修复没生效、白重编一遍内核。
 
-### 5.5 同一句 `Gave up waiting` 的第二种成因：晚 1.3 秒的枚举竞态（2026-11-15 16:00）
+### 5.5 同一句 `Gave up waiting` 的第二种成因：晚 1.3 秒的枚举竞态（2026-11-15 16:28 修正：`rootdelay` 无效，改抬 `slumber`）
 
 **这是 §5.4 的陷阱版**：屏幕/串口输出**一字不差**，但根因完全不同，按 §5.4 去重编内核是白干。
 
@@ -799,7 +800,7 @@ U 盘走的是 `usb-storage` 异步探测 + 30s 级 `scan`，比 eMMC/SSD 慢一
 
 | 观察 | 结论 | 做法 |
 |---|---|---|
-| 超时时刻 < `[sda]` 枚举时刻（差几秒内） | 竞态 | 加 `rootdelay=15`，见本节下方「永久修复」 |
+| 超时时刻 < `[sda]` 枚举时刻（差几秒内） | 竞态 | 抬 initramfs 等待窗口（`patch-initrd-wait.sh`），**别用 `rootdelay`**，见下方「永久修复」 |
 | `[sda]` 从没出现 | 真缺驱动（§5.4） | 查 `nm vmlinux \| grep usb_stor_probe`、`CONFIG_USB_STORAGE=y` |
 | `[sda]` 出现了但 `EXT4-fs` 没挂上 | 不是驱动也不是时序 | 查 `root=UUID=` 是否与实际 UUID 一致、`rootfstype=ext4` |
 | `I/O error` + `cmd_age=30s` + `reset` | 链路掉盘 | §10.2.2 |
@@ -813,14 +814,42 @@ exit
 `initramfs-tools` 的 `local` 脚本在 shell 退出后会**重新走一遍 `mountroot` 轮询**。此时 `sda` 早已枚举完，一次就挂上，系统继续正常启动。
 （这招只对「竞态」有效；真缺驱动时 `exit` 会立刻再报一次同样的错。）
 
-**永久修复（写进 p1 的 `uEnv.txt`，别手抠）**：
+**为什么 `rootdelay` 没用（2026-11-15 源码证伪，别再试了）**
 
-```bash
-sudo ./x96max/patch-bootargs.sh --usb-fix 346d:5678 rootdelay=15
+`uInitrd` 解包后两处关键代码：
+
+```sh
+# init:229-236
+starttime="$(_uptime)"; starttime=$((starttime + 1))   # ① 先记等待起点
+if [ "$ROOTDELAY" ]; then sleep "$ROOTDELAY"; fi        # ② 再睡 rootdelay 秒
+
+# scripts/local:82-86
+slumber=30                                              # ③ 预算固定 30 秒
+if [ "${ROOTDELAY:-0}" -gt $slumber ]; then slumber=$ROOTDELAY; fi
 ```
 
-一次带全三个参数（`rootdelay=15` + `usb-storage.quirks=346d:5678:u` + `usbcore.autosuspend=-1`）。
-`patch-bootargs.sh` 幂等，重复跑只会更新、不会叠加重复项；备份落在 `/x96-build/uEnv.txt.bak.<epoch>`。
+①→② 说明 sleep 发生在**计时窗口之内**，③ 说明窗口是 `max(30, rootdelay)`。
+`rootdelay=15 < 30` ⇒ 窗口仍是 30s，且白扣 15s → 放弃时刻从 `30s` 变成 `30s`（并列），
+`sda` 在 `t=37.54s` 才枚举，实测原地死于 `t=37.39s`，**差 150ms**。
+（只有当 `rootdelay > 30` 才会真的延长窗口，但那是拿"每次开机硬睡 N 秒"换来的，且 `sleep` 是 hard sleep，不是轮询，早枚举也用不上。）
+
+**永久修复：抬 `slumber`（不动启动参数）**
+
+```bash
+# 卡插在电脑上时（uInitrd 在 p1 根目录）
+sudo ./x96max/patch-initrd-wait.sh /media/$USER/BOOT/uInitrd --inplace
+
+# 离线改内核包里的 initrd（rebuild-from-zero.sh --from initrd 已自动调用）
+sudo ./x96max/patch-initrd-wait.sh /x96-build/initrd.img-7.2.12-x96 -o /tmp/i.img
+```
+
+脚本做三件事：剥 uImage 头 → 改 `scripts/local` 的 `slumber=30` 为 `90` → `mkimage` 重打包，
+**落盘前回读自检**（解包确认 `slumber=90` 真在里面），失败不写任何东西。
+窗口 90s 对 USB 读卡器 `~38s` 枚举绰绰有余；eMMC/TF 槽启动 1 秒内就枚举完，不受影响。
+
+> 曾被写成 `patch-bootargs.sh --usb-fix 346d:5678 rootdelay=15` 的旧方案已废弃，
+> 卡 p1 上的 `rootdelay=15` 也已 `-r` 删除（只剩 `usb-storage.quirks=346d:5678:u` 和
+> `usbcore.autosuspend=-1`，这两个仍建议留着：前者关 UAS 避开 §10.2.2 掉盘，后者禁 USB 自动挂起）。
 
 > **坑（2026-11-15 实测）**：`write-card.sh` 收尾会把卡上分区**全部卸载**，紧接着跑
 > `patch-bootargs.sh` 时 p1 未挂载 → 旧版 `findmnt` 返回 1 + `set -euo pipefail` 让赋值失败，
