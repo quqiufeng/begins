@@ -85,23 +85,59 @@ X96 Max 可启动镜像
 
 ### 2.3 当前分区与启动
 
-**原厂（商家）布局**：
+**原厂（商家）布局**（实测自 `recovery/bootarea-117MiB.img`，即 eMMC 前 117MiB 原样备份）：
 
 ```text
 /dev/mmcblk2      58.2G
-├─ mmcblk2p1      511M  FAT32  /boot      start=239616 sectors（约 117MiB）
-└─ mmcblk2p2      57.6G ext4   /          start=1288192 sectors
+├─ [0 -- 117MiB]  117M  启动链保留区（MBR 未登记）   sectors 0 -- 239615
+├─ mmcblk2p1      511M  FAT32  /boot                start=239616 sectors（117MiB）
+└─ mmcblk2p2      57.6G ext4   /                    start=1288192 sectors（629MiB）
 ```
+
+逐段内容（同一份实测数据）：
+
+```text
+偏移        大小        内容
+0           68 MiB      Amlogic 原厂启动链：U-Boot 2015.01（Jun 21，年份字段被裁断）
+                        + BL2/BL30/BL31（FIP 建于 2019-04-14，tag g12a gb1cc8f0，
+                          luan.yuan@droid15-sz）
+68 MiB      ~49 MiB     FAT32，label=EMMC_BOOT，**MBR 未登记**
+                        内含 flippy 5.4.125-flippy-60+o 的 zImage/uInitrd/uEnv.txt
+                        + u-boot.sd/u-boot.usb（历史残留，原系统启动链不用它）
+117 MiB     511 MiB     p1  FAT32  type=0x0c  start=239616    ← 原系统 /boot
+628 MiB     1 MiB       空隙（2048 扇区，对齐）
+629 MiB     57.6 GiB    p2  ext4   type=0x83  start=1288192   ← 原系统 /
+
+总计 122142720 扇区 = 58.19 GiB（64GB eMMC）；MBR 标签 id=0x10964940
+```
+
+- MBR 引导代码段（`0x000–0x1BD`）**全零**：原厂启动不靠 MBR 代码，Amlogic ROM 按固定偏移
+  从 0 区加载 BL2 → BL30/BL31 → U-Boot 2015.01，所以这一段既是「保留区」也是真正的启动区。
+- 68MiB 处的 `EMMC_BOOT` 是 MBR 之外的「孤儿分区」：它的 BPB 自称 160MiB / hidden=131072
+  （64MiB），与实际位置不符，且被 117MiB 处的 p1 截断——说明这份分区表被重写过，
+  这个 FAT 是上一代系统的 boot 分区残留。
+- 安装主线 U-Boot 后 p1 挪到 68MiB（见下），正好落在这个孤儿 FAT 的位置上，把残留覆盖掉。
 
 **安装主线 U-Boot 后的当前布局**（`armbian-install -m yes -a no`）：
 
 ```text
 /dev/mmcblk1      58.2G
-├─ mmcblk1p1      511M  FAT32 BOOT_EMMC   /boot   start=139264 sectors（68MiB）
-└─ mmcblk1p2      56.9G ext4  ROOTFS_EMMC /       start=2764800 sectors（1350MiB）
+├─ [0 -- 68MiB]   68M   主线 U-Boot 启动链（0 区，MBR 未登记）  sectors 0 -- 139263
+├─ mmcblk1p1      511M  FAT32  BOOT_EMMC   /boot      start=139264 sectors（68MiB）
+├─ [579 -- 1350MiB] 771M 未使用空隙                              sectors 1185792 -- 2764799
+└─ mmcblk1p2      56.9G ext4   ROOTFS_EMMC  /          start=2764800 sectors（1350MiB）
 ```
 
-- 原厂布局前约 117MiB 是 Amlogic U-Boot/启动链保留区。
+- **设备编号随启动介质变**：同一块 eMMC，从 SD/U 盘启动时枚举为 `mmcblk2`（§1 硬件表、
+  上文「原厂布局」），从 eMMC 自身启动时枚举为 `mmcblk1`（§16 验证 `findmnt / /dev/mmcblk1p2`）。
+  两个编号指的是同一块盘，别当成两块。
+- **算术自洽**：p1 占 139264–1185791（68–579MiB）；p1 末尾到 p2 起点空 1579008 扇区 = 771MiB；
+  p2 到盘尾 119377920 扇区 = 56.90GiB。比原厂的 57.63GiB 少 0.73GiB，正好等于 p2 起点后移的
+  （1350−629）= 721MiB。
+- 那段 **771MiB 空隙**（579→1350MiB）是 `-a no` 固定布局的产物，文档里没有可解释它的依据，
+  按实测记为空隙、不猜用途；反正 rootfs 用不到它，扩容时可以直接跳到 1350MiB 之后。
+- **相对原厂的变化**：启动链保留区从 117MiB 收到 68MiB（原厂那 117MiB 见上面「逐段内容」），
+  p1 因此从 117MiB 前移到 68MiB，正好压掉 68MiB 处的孤儿 `EMMC_BOOT` FAT；p2 从 629MiB 后移到 1350MiB。
 - 主线 U-Boot 位于 eMMC 起始区；原厂启动区备份在 `dav://192.168.1.53:5005/sata11-18072858035/x96-backup/emmc-original-backup/`。
 
 `/boot` 关键文件：
@@ -318,7 +354,7 @@ $OUT/modules/lib/modules/7.2.12-x96/
 | 第一轮裁剪后 | 1.8G/94777 → **821M / 69673 文件**；干净全量 `-j6` **rc=0，526 s = 8m46s** |
 | 第二轮裁剪后 | 821M/69673 → **545M / 37911 文件**；干净全量 `-j6` **rc=0，495 s = 8m15s**（目标 ≤10 分钟） |
 | 产物 | `Image` 35.8 MB / `Image.gz` 13.3 MB / `vmlinux` 44.9 MB（aarch64 PIE） |
-| 日志与计时 | `logs/timed-0058.log`（第一轮）、`logs/timed-clean-0815.log`（第二轮）；脚本 `/x96-build/run-timed.sh`，结果落 `.verify-rc` / `.verify-sec` |
+| 日志与计时 | `logs/timed-0058.log`（第一轮）、`logs/timed-clean-0815.log`（第二轮）；脚本 `x96max/build-kernel.sh`（旧名 `/x96-build/run-timed.sh`），结果落 `kbuild-7.2.12/.build-rc` / `.build-sec` |
 
 ```bash
 cd /x96-build/src-linux
@@ -945,7 +981,8 @@ ROOTFS_TYPE='ext4'
    - 写主线 U-Boot 会覆盖 eMMC 启动区，**必须先备份**：原厂启动区 117MiB、p1、p2 在 NAS `dav://192.168.1.53:5005/sata11-18072858035/x96-backup/emmc-original-backup/`（本地暂存 `~/x96-backup/emmc-original-backup/`）。
    - 手工只替换 p1/p2 而不写主线 U-Boot，会黑屏；不要再用。
    - 若要回退原厂系统：从 SD 启动，把备份的启动区/p1/p2 写回，或按原厂线刷流程恢复。
-4. **eMMC 前 117MiB 保留区**不要手写。
+4. **eMMC 起始区不要手写**：原厂占 0–117MiB（U-Boot 2015.01 + BL2/BL30/BL31 + 孤儿 FAT），
+   主线 U-Boot 后占 0–68MiB；这段只能由 `armbian-install -m yes` 或 `dd` 原厂备份整段写入。
 5. **失败恢复**：
    - 仍能 USB 启动：重新写 U 盘镜像即可。
    - 不能 USB 启动：用 Amlogic USB Burning Tool + 原厂/备份镜像救砖（需 USB 双公头线）。
@@ -973,6 +1010,7 @@ ROOTFS_TYPE='ext4'
 | SD/U 盘启动验证 | 完成（源码系统 `x96src`） |
 | eMMC 安装 | 完成（主线 U-Boot，`-m yes -a no`） |
 | eMMC 启动验证 | 完成（源码系统，`/dev/mmcblk1p2`，7.2.12-x96） |
+| 脚本归位 `x96max/`（build-kernel / pack-kernel / build-image / write-card / verify-card / flash-p1 / backup-card / rebuild-from-zero + README） | 完成（6 个是本次从临时目录收进来的） |
 
 > 最终 rootfs 是 **Armbian build framework + mmdebstrap 源码构建**；内核 7.2.12 是自编译。
 
@@ -984,7 +1022,7 @@ ROOTFS_TYPE='ext4'
 构建仓库      /x96-build/amlogic-s9xxx-armbian
 Armbian build /x96-build/armbian-build
 源码 rootfs   /x96-build/armbian-build/cache/rootfs/rootfs-arm64-trixie-minimal_*.tar.zst
-内核源码      /opt/linux/src/linux-7.2.12
+内核源码      /x96-build/src-linux（裁剪树 545M；/opt/linux/src 原版树已删，见 §5.3）
 内核构建      /x96-build/kbuild-7.2.12
 基础镜像      /x96-build/amlogic-s9xxx-armbian/build/output/images/
 内核包目录    /x96-build/amlogic-s9xxx-armbian/build-armbian/kernel/stable/7.2.12/
@@ -1341,10 +1379,13 @@ mkimage -A arm64 -O linux -T ramdisk -C gzip -n uInitrd \
 
 ### 19.5 打包 4 个内核包
 
+现成脚本：`x96max/pack-kernel.sh`（就是下面这段，硬编码改成 `X96_*` 变量，`KSRC` 默认裁剪树
+`$X96_BUILD_ROOT/src-linux`，缺 Image/initrd 会先报错）。下面是等价的手工命令，用于对照：
+
 ```bash
 ROOT=/x96-build
 OUT=$ROOT/kbuild-7.2.12
-KSRC=/opt/linux/src/linux-7.2.12
+KSRC=$ROOT/src-linux        # 裁剪树（/opt/linux/src 原版树已删，见 §5.3）
 K=$ROOT/amlogic-s9xxx-armbian/build-armbian/kernel/stable/7.2.12
 KNAME=7.2.12-x96
 
@@ -1470,7 +1511,7 @@ sudo X96_KSRC=/x96-build/src-linux ./x96max/rebuild-from-zero.sh
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `X96_BUILD_ROOT` | `/x96-build` | 工作根（`logs/`、`pkgs/`、`recovery/` 都在其下） |
-| `X96_KSRC` | `/opt/linux/src/linux-7.2.12` | 内核源码树；**裁剪树必须显式给** `X96_KSRC` |
+| `X96_KSRC` | `$X96_BUILD_ROOT/src-linux` | 内核源码树（默认即裁剪树；要给未裁剪的原版树才需要显式覆盖） |
 | `X96_KNAME` | `7.2.12-x96` | 内核 release 名 = 包名后缀 |
 | `X96_BASE_IMAGE` | `.../images/Armbian_26.11.0-trunk_trixie_arm64_6.18.60.img` | 基础镜像（取 rootfs 做 initrd） |
 
@@ -1504,6 +1545,9 @@ sudo ./x96max/write-card.sh /x96-build/recovery/x96src-autoinstall.img.gz /dev/s
 
 # 从构建脚本转调，内部就是第一条
 ./x96max/build-image.sh --skip-rootfs --write /dev/sdX
+
+# 只把镜像塞进卡上已分好区的 p1（卡上分区方案不变、不想重写整盘时用）
+sudo ./x96max/flash-p1.sh /x96-build/recovery/x96src-autoinstall.img.gz /dev/sdX1
 ```
 
 > 不要再手工 `dd`：见 §10.1.3（自动挂载把日志回放出的垃圾固化进卡）与 §10.1.4（裸盘 `cmp` 不是判据）。
