@@ -313,7 +313,8 @@ $OUT/modules/lib/modules/7.2.12-x96/
 | 裁剪树 | `/x96-build/src-linux`（原版 `/opt/linux/src/linux-7.2.12`，未动） |
 | 用的 config | `/x96-build/config-x96-20261115` 生成，`make olddefconfig` 后落 `kbuild-7.2.12/.config`
 （含 `CONFIG_DEBUG_INFO_NONE=y`，关 debug info 是最大的那一刀）；
-**归档副本 `configs/config-7.2.12-x96-20261115`**（与 `kbuild/.config` 字节一致，6672 行） |
+**归档副本 `configs/config-7.2.12-x96-20261115`**（与 `kbuild/.config` 字节一致，6672 行；
+2026-11-15 12:43 已刷新为 usbfix 版，补回 `USB_STORAGE=y`/`USB_UAS=y`，见 §5.4） |
 | 第一轮裁剪后 | 1.8G/94777 → **821M / 69673 文件**；干净全量 `-j6` **rc=0，526 s = 8m46s** |
 | 第二轮裁剪后 | 821M/69673 → **545M / 37911 文件**；干净全量 `-j6` **rc=0，495 s = 8m15s**（目标 ≤10 分钟） |
 | 产物 | `Image` 35.8 MB / `Image.gz` 13.3 MB / `vmlinux` 44.9 MB（aarch64 PIE） |
@@ -330,7 +331,7 @@ ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j6 O=/x96-build/kbuild-7.2.12
 > 脚本默认 `X96_KSRC=/opt/linux/src/linux-7.2.12`（**未裁剪的原版**，全量约 20 分钟），
 > 想复现 8 分钟那一档必须显式把 `X96_KSRC` 指向裁剪树。
 
-**四条踩出来的规矩**（这一轮都真炸过）：
+**五条踩出来的规矩**（这一轮都真炸过）：
 
 1. **删目录必须同步改父 Makefile。** `obj-y += 已删目录/` 会让 kbuild 直接失败。
    用 `x96max/trim-tools/fix_makefiles2.py`：按**逻辑行**（`\` 续行）削尾部 token，删完只剩 `obj-$(X) +=` 就丢整句。
@@ -348,6 +349,13 @@ ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j6 O=/x96-build/kbuild-7.2.12
    - `fs/squashfs` ← `init/do_mounts_rd.c`
    - `net/bridge` ← `net/ipv6/netfilter.c`、`net/netfilter/nfnetlink_{log,queue}.c`、`br_netfilter.h`、`trace/events/bridge.h`
 4. **验证顺序固定**：`make clean`（先暴露缺 Makefile）→ `syncconfig` → 全量编译 → 最后查 `undefined reference`。
+5. **删目录会连带删掉它的 `Kconfig`，config 里对应的 `=y` 于是被静默丢弃。** 前四条的症状都出现在编译期
+   （缺 Makefile / 缺头文件 / `undefined reference`），但**整目录删掉、且符号本来就不进 vmlinux 时，全程没有一声响**：
+   本轮把 `drivers/usb/storage/` 连同 `drivers/usb/Kconfig` 里那行 `source "drivers/usb/storage/Kconfig"`
+   一起删了，`CONFIG_USB_STORAGE=y`/`CONFIG_USB_UAS=y` 在 `olddefconfig` 后无声消失，`Image` 照编、照烧、照引导，
+   直到 initramfs 挂根盘那一刻才炸（§5.4）。**加一条判据**：删目录前先
+   `grep -rn 'source.*<dir>/Kconfig' --include=Kconfig .`，命中就必须保留 Kconfig（只删 `.c`），
+   或者确认 config 里该子系统确实没开。
 
 **第二轮：删掉非 arm64 架构（821M → 545M，省 276M / 31762 文件）**
 
@@ -383,6 +391,88 @@ ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j6 O=/x96-build/kbuild-7.2.12
 现已收敛；改判据改 `trimlib.py`，别在 `trim-tools/` 里复制。
 `sym2kc.py` 是 `trimlib.sym2kc()` 的命令行壳（`/tmp/sym2kc.tsv` 被清会自动重建）；
 config 位置按 `$KCONFIG` → `<tree>/.config` → `/x96-build/config-x96-20261115` 回退（out-of-tree 构建没有 `src-linux/.config`）。
+
+### 5.4 usbfix：裁掉 `drivers/usb/storage` 导致 U 盘根盘找不到（2026-11-15）
+
+**症状**：u-boot 阶段一切正常（`zImage`/`uInitrd`/`dtb` 都读得到、验得过），内核起来后在 initramfs 里刷
+
+```text
+Gave up waiting for root file system device.
+Common problems:
+ - Boot args (cat /proc/cmdline)
+ - Check rootdelay= (did the system wait long enough?)
+ - Missing modules (cat /proc/modules; ls /dev)
+ALERT!  UUID=d764b7d9-…  does not exist.  Dropping to a shell!
+```
+
+掉进 `(initramfs)`，`/dev/sda` 根本没出现，也无模块可 `modprobe`（`uInitrd` 里 0 个 `.ko`，全靠内建驱动）。
+
+**根因**：两层误判叠加。
+
+| 层 | 发生了什么 |
+|---|---|
+| 源码树裁剪 | `disable.list` 第 **1168**（`USB_STORAGE`）/ **1185**（`USB_UAS`）行把它们标成可删，`prune_src.py` 据此连**整个 `drivers/usb/storage/`（50 个文件：`.c` + `Makefile` + `Kconfig`）** 一起删了 |
+| Kconfig 连锁 | `drivers/usb/Kconfig` 里 `source "drivers/usb/storage/Kconfig"` 随之失效，两个符号成了「没有 Kconfig 的孤儿」，`make olddefconfig` 把它们**静默丢弃**（rc=0，无任何警告） |
+| 为什么没暴露 | 编译期全绿（符号本就不进 vmlinux）、u-boot 自带 USB 栈与内核无关、`Image` 大小与引导全程正常——**唯一故障点就是挂根盘那一秒** |
+
+> 关键认知：**u-boot 能读 U 盘 ≠ 内核能读 U 盘。** Amlogic 的 u-boot 有自己一套 USB 主机栈完成 `load usb 0 …`，
+> Linux 侧的 `usb-storage` 是另一条独立链路。「能引导」完全不能证明存储驱动在。
+
+**修复**（4 步，树 `/x96-build/src-linux`，构建目录 `O=/x96-build/kbuild-7.2.12`）：
+
+```bash
+cd /x96-build/src-linux
+# 1) 从同版本完整树拷回整个存储驱动目录
+cp -a /opt/linux/src/linux-7.2.12/drivers/usb/storage drivers/usb/
+# 2) 恢复被连带删掉的 Kconfig 钩子（当前在 114 行，插在 endmenu 之前）
+grep -q 'storage/Kconfig' drivers/usb/Kconfig || \
+  sed -i '/^endmenu/i source "drivers/usb/storage/Kconfig"' drivers/usb/Kconfig
+# 3) 打开开关
+./scripts/config --file /x96-build/kbuild-7.2.12/.config -e USB_STORAGE -e USB_UAS
+# 4) 用 syncconfig 而不是 olddefconfig —— 新符号是 NEW 状态，olddefconfig 会取默认值把它再关一次
+ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make O=/x96-build/kbuild-7.2.12 syncconfig
+```
+
+顺带从 `disable.list` 里摘掉这两行（`disable.list.bak-123920` 是摘除前的备份，可用 `diff` 复核）。
+
+**验证：三级断言，全在烧盘之前跑**
+
+```bash
+V=/x96-build/kbuild-7.2.12
+# ① vmlinux 里有驱动符号（最硬的证据，2026-11-15 实测已过）
+nm "$V/vmlinux" | grep -E ' (usb_stor_probe1|usb_stor_probe2|storage_probe|usb_storage_driver)$'
+# ② config 里是 =y（内建，不依赖 uInitrd 里有没有 .ko）
+grep -E '^CONFIG_(USB_STORAGE|USB_UAS)=y' "$V/.config"
+# ③ Image 里搜得到字符串（证明没被裁在链接外）
+strings "$V/arch/arm64/boot/Image" | grep -x 'usb-storage'
+```
+
+三条全过才烧盘。**`uInitrd` 不用重建**：驱动是 `=y` 内建，initramfs 里本来就没有存储相关的 `.ko`。
+
+**烧盘**（U 盘 p1，vfat）：
+
+```bash
+# uEnv.txt 里 LINUX= 指向的文件才是 u-boot 真正 load 的那份
+grep '^LINUX=' /media/$USER/BOOT/uEnv.txt           # 本机为 LINUX=/zImage
+cp "$V/arch/arm64/boot/Image" /media/$USER/BOOT/zImage
+cp "$V/arch/arm64/boot/Image" /media/$USER/BOOT/vmlinuz-7.2.12-x96   # 与 zImage 同内容
+cp "$V/.config"               /media/$USER/BOOT/config-7.2.12-x96
+sync && udisksctl unmount -b /dev/sdb1 && udisksctl unmount -b /dev/sdb2
+```
+
+> **别只换 `vmlinuz-*`**：那份是给人看的副本，`uEnv.txt` 的 `LINUX=/zImage` 才是真正被加载的文件，换错等于没换。
+> 换完 `sha256sum` 对拍两个文件必须相同，再对盘上那份 `strings … | grep -x usb-storage` 确认驱动在里面。
+
+**产物与备份**
+
+| 项 | 位置 |
+|---|---|
+| 新 `Image` 快照 | `/x96-build/Image-usbfix-20261115-1240`（sha256 `3d0e2a6d…`） |
+| 旧 U 盘内核备份 | `/x96-build/U-backup-{zImage,vmlinuz,config}-20261115-124215` |
+| config 归档 | `configs/config-7.2.12-x96-20261115`（已刷新，与 `kbuild/.config` 字节一致） |
+
+**待办**：新 `Image` 已烧进 U 盘，**真机启动断言还没跑**。启动后要确认三件事：
+`lsblk` 里出现 U 盘自己的 `sda`、`/proc/filesystems` 含 `ext4`、`dmesg` 里 xhci/dwc3 有设备枚举。
 
 ---
 
@@ -756,9 +846,28 @@ USB 读卡器大块读会返回错字节：`bs=1M` 几乎必错，`bs=256K` 仍�
 ### 10.2 盒子从 U 盘启动
 
 - X96 Max 的 U-Boot 通常 **USB 启动优先于 eMMC**。
-- 插入 U 盘、上电；若仍进 eMMC：
-  - 通过 SSH 把 eMMC 的 `/boot/boot.scr` 改名：`mv /boot/boot.scr /boot/boot.scr.bak`，再重启。
-  - 或从串口/HDMI 看 U-Boot 输出，手动 `usb start; usb storage`。
+- 插入 U 盘/SD、上电。
+
+> ⚠️ **绝对不要为了「逼它走 SD/U 盘」去改名 eMMC 上的 `boot.scr` / `uEnv.txt`——会黑屏变砖，且拔卡也无法自愈。**
+>
+> 2026-11-15 实测（SD 卡已插好、Linux 侧能认到 `mmc0`）：把 `/boot/uEnv.txt` 改名后上电 →
+> 盒子彻底黑屏、ARP `FAILED`、22 端口无响应。原因不是「卡没插好」，而是 eMMC 上的 `boot.scr` 只有
+> `for devnum in 2 1 0` 三段，**dev 0 ≠ SD 卡**（U-Boot 的 mmc 编号来自设备树 alias，和 Linux 的
+> `mmc0/mmc1` 不是一回事）；dev 1 失配后 dev 0 同样读不到，循环跑完无 `booti` → 黑屏。
+> 而且这条链是 **BootROM 直接选了 eMMC**：Linux 能识别那张 SD 卡 ≠ BootROM/U-Boot 也能。
+>
+> 正确做法：**上电瞬间按住复位孔 5 秒**强制 BootROM 走 SD（见 §10.2.1），或直接走串口/USB 烧录。
+> 想验证 SD 是否能启动，先「按复位上电」看 HDMI，**不要动 eMMC 上任何引导文件**。
+
+### 10.2.1 强制 BootROM 从 SD 启动（救砖第一步）
+
+1. 拔电源
+2. 卡针按住底部复位孔（AV 口内圈或底壳小孔），**不要松**
+3. 插电源，按满 **5 秒**再松
+4. HDMI 出启动信息 = 成功；若停在 `Hit any key`，**不要按键**
+
+Amlogic 官方救砖流程，绕开 eMMC 上一切 U-Boot 配置，不依赖 `boot.scr` 的 devnum 扫描。
+注意：被改坏的引导文件仍在 eMMC 上，起来后立刻 `mv /boot/uEnv.txt.disabled /boot/uEnv.txt` 复原。
 
 ### 10.3 验证
 
@@ -905,6 +1014,11 @@ NAS 备份目录  dav://192.168.1.53:5005/sata11-18072858035/x96-backup/
 7. **备份先行**：原厂启动区 117MiB、p1、p2 都在 `dav://192.168.1.53:5005/sata11-18072858035/x96-backup/emmc-original-backup/`；写主线 U-Boot 前必须保留。
 8. **写卡前关桌面自动挂载**：udisks2 会在 dd 结束后把卡以 **rw** 挂上 → ext4 日志回放 → 经不稳的读路径读到错字节再写回，垃圾被固化成真损坏（症状：文件字符错位、**长度不变**、`e2fsck -fn` 干净，只有逐文件 sha256 抓得到）。一条命令避开：`sudo x96max/write-card.sh <img.gz> /dev/sdX`，详见 §10.1.3。
 9. **别用整盘 `cmp` 判写卡成败**：USB 读卡器大块读会返回错字节，且同一位置重读给出**相同的错字节**，裸盘比对必然出现几百字节假差异，会把好卡判成坏卡、逼你反复重写（每次重写又在放大第 8 条的风险）。判据是逐文件 sha256 + `e2fsck -fn`，见 §10.1.4。
+10. **删源码目录前先看它的 `Kconfig` 有没有被 `source`。** `disable.list` 划掉一个 `CONFIG_*` 只是「不编它」，
+    但 `prune_src.py` 若因此删掉整个目录（含 `Makefile` + `Kconfig`），`drivers/*/Kconfig` 里的 `source` 行
+    就悬空了，`olddefconfig` 会把这个开关**静默丢成 `n`**：`Image` 照编照引导，直到挂根盘才报
+    `Gave up waiting for root file system device`。这次的代价是 `drivers/usb/storage/` 整目录被裁，
+    完整复盘与三级验证见 §5.4。
 
 ---
 

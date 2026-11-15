@@ -26,9 +26,9 @@
 
 ---
 
-## 0. 三条不可违背的前提
+## 0. 四条不可违背的前提
 
-这三条是 2026-11-11 事故换来的，写在最前面，因为它比后面所有步骤都重要。
+这几条是 2026-11-11 与 2026-11-15 两次事故换来的，写在最前面，因为它比后面所有步骤都重要。
 
 1. **驱动架构不参与裁剪。** 只裁"没有对应硬件"的驱动，不裁"驱动所依赖的子系统"。
    砍 `BLK_DEV_SD` / `MD` / `DRM` 这类东西，等于砍掉整条链路。
@@ -38,6 +38,12 @@
 3. **`MD` 是 `DM` 的闸门。** `BLK_DEV_DM` 在 menuconfig 里嵌在 MD 之内，
    `CONFIG_MD=n` 会把整块 DM 从菜单里隐藏，你单独写 `CONFIG_BLK_DEV_DM=y`
    会被 `make olddefconfig` **静默丢弃**（没有警告）。LVM 根盘直接没了。
+4. **删源码目录 = 删它的 `Kconfig` = 对应 config 项静默失效。** 用 `disable.list` 划掉一个
+   `CONFIG_*` 只是「不编它」；但如果 `prune_src.py` 因它把整个目录（含 `Makefile` + `Kconfig`）删掉，
+   父级 `drivers/*/Kconfig` 里的 `source "…/Kconfig"` 就悬空了，`olddefconfig` 会把这个开关变成
+   **没有 Kconfig 的孤儿并静默丢成 `n`**——rc=0、无警告，`Image` 照编照引导，直到挂根盘才炸。
+   删目录前先 `grep -rn 'source.*<dir>/Kconfig' --include=Kconfig .`。真事见 `X96max.md` §5.4
+   （`drivers/usb/storage/` 被裁 → u-boot 能读 U 盘，内核读不到，`Gave up waiting for root file system`）。
 
 ---
 
