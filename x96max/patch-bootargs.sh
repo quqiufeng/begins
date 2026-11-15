@@ -42,7 +42,10 @@ P1="/dev/${DISK}1"
 [ -b "$P1" ] || { echo "X 找不到 boot 分区 $P1"; exit 1; }
 
 # 已挂载就复用，否则临时挂
-MNT=$(findmnt -no TARGET "$P1" 2>/dev/null | head -1)
+# 注意：必须 `|| true`。findmnt 在"未挂载"时返回 1，配合 set -e/pipefail 会让
+# 整个赋值失败，脚本**无任何输出**直接退出 1（2026-11-15 实测：写完卡 p1 未挂载
+# 时 patch-bootargs.sh 静默失败，只有"已挂载"这种巧合情形才跑得通）。
+MNT=$(findmnt -no TARGET "$P1" 2>/dev/null | head -1 || true)
 TMPMNT=0
 if [ -z "$MNT" ]; then
   MNT=$(mktemp -d)
