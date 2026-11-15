@@ -2221,9 +2221,30 @@ mkimage -A arm64 -O linux -T ramdisk -C gzip -n uInitrd \
 
 ### 19.5 打包 4 个内核包
 
-现成脚本：`x96max/pack-kernel.sh`（就是下面这段，硬编码改成 `X96_*` 变量，`KSRC` 默认裁剪树
-`$X96_BUILD_ROOT/src-linux`，缺 Image/initrd 会先报错）。两种模式：默认全量（`kbuild-7.2.12` +
-`src-linux`），`--trim` 走 `kbuild-trim` + `src-clean`；`-n` 只打印三元组与 sha 校验不落包。
+现役做法只有一条：调脚本，别手敲。`x96max/pack-kernel.sh`（引擎）+ `x96max/{full,trim}/pack-kernel.sh`
+（两套固定入口），参数全由 `lib/mode.sh` 按 MODE 给出；`-n` 只打印三元组与 sha 校验不落包，
+`--stage` 打完同步进 ophub 的 `kernel/stable/7.2.12`。
+
+| 项 | full | trim（**现役，日常用这个**） |
+|---|---|---|
+| 入口 | `./x96max/full/pack-kernel.sh` | `./x96max/trim/pack-kernel.sh` |
+| 配置 | `x96max/kernel/config-7.2.12-x96-full` | `x96max/kernel/config-7.2.12-x96-trim` |
+| 源码树 | `/x96-build/src-full`（按需解压，可删） | `/x96-build/7.2.12-trim`（裁剪树，必须留） |
+| 产物树 | `/x96-build/kbuild-7.2.12` | `/x96-build/kbuild-trim` |
+| KNAME | `7.2.12-x96` | `7.2.12-x96-trim` |
+| 包仓 | `/x96-build/pkgs/full` | `/x96-build/pkgs/trim` |
+
+```bash
+cd /home/quqiufeng/kernel
+./x96max/trim/pack-kernel.sh              # 只打四包 → pkgs/trim/
+./x96max/trim/pack-kernel.sh --stage      # 打 + 同步进 ophub kernel/stable/7.2.12
+./x96max/full/pack-kernel.sh -n           # 只校验不落包（full 套）
+```
+
+> 旧的 `src-linux` / `src-clean` 都已作废：full 不常驻全量树（缺席时 `x96_ensure_src` 现解压
+> 1.8G，编完可 `--clean-src` 删），trim 的树实际叫 `7.2.12-trim`（`x96_pick_trim_src` 依次找
+> `src-trim`→`src-clean`→`7.2.12-trim`→`7.2.12-src`）。下面这段是**等价手工命令，仅用于对照**，
+> 照抄时要自己按上表把 `KNAME`/`KSRC`/`OUT`/`K` 换成对应一套。
 
 打包前强制校验：`$OUT/.config` 的 sha256 必须命中 `configs/config-<KNAME>[-trim]-<date>` 之一，
 否则说明这棵树的配置没进归档、打出的包无法溯源，直接 rc=1 拒绝（`--force` 可越过）。下面是等价的
@@ -2231,10 +2252,10 @@ mkimage -A arm64 -O linux -T ramdisk -C gzip -n uInitrd \
 
 ```bash
 ROOT=/x96-build
-OUT=$ROOT/kbuild-7.2.12
-KSRC=$ROOT/src-linux        # 裁剪树（/opt/linux/src 原版树已删，见 §5.3）
-K=$ROOT/amlogic-s9xxx-armbian/build-armbian/kernel/stable/7.2.12
-KNAME=7.2.12-x96
+OUT=$ROOT/kbuild-trim                   # full 套换成 kbuild-7.2.12
+KSRC=$ROOT/7.2.12-trim                  # 裁剪树（full 套换成 src-full，缺席会现解压；见 §5.3/§5.8）
+K=$ROOT/amlogic-s9xxx-armbian/build-armbian/kernel/stable/7.2.12   # ophub 只认这个版本号目录
+KNAME=7.2.12-x96-trim                   # full 套是 7.2.12-x96
 
 mkdir -p "$K"/{boot,dtb,modules,header}
 
@@ -2296,8 +2317,21 @@ header-7.2.12-x96.tar.gz        13M  91e525e950bcf0a9aa004bfd4a5fb7c2a0cab35b9d4
 modules-7.2.12-x96.tar.gz      226K  b113fef3d0dbef60ae1f56e981d3ba7dfa7a09c04cf47b46e3a8955dc3988eb6
 ```
 
-> `modules-*` 只有 226K 是当前 config 的正常结果：全树只剩 **1 个模块** `kernel/lib/test_bpf.ko`，
+> `modules-*` 只有 226K 是那版 full config 的正常结果：全树只剩 **1 个模块** `kernel/lib/test_bpf.ko`，
 > 其余（含无线）都是 `=y` 直接编进 `Image`——模块少换来的是 initrd 不用等 modprobe，但每次改驱动要重编内核。
+
+裁剪套实测（**现役**，2026-11-15 21:31，日志 `logs/from0-trim-1115-2131/19.5.log`，输出在 `pkgs/trim/`）：
+
+```text
+boot-7.2.12-x96-trim.tar.gz          34M  7ef1b227baa9cd11947f31264044027f3c2e6dab836ef7f4e6baf4e2d038502d
+dtb-amlogic-7.2.12-x96-trim.tar.gz   11K  1f9a827c3215fead20c6fc678e01bc680199022d227006a11d5d5951c7f61e55
+header-7.2.12-x96-trim.tar.gz        13M  1012760f4f2d59a2c4a1e9dafe54be90477f3efb594a4b843f12e7cb068e2200
+modules-7.2.12-x96-trim.tar.gz      2.4M  79da87b8a6805d598762601b654300d57ec1a9d32af3d0f4716da52f0100d41a
+```
+
+- 打前自检那行必须出现：`配置溯源 OK：config-7.2.12-x96-trim-20261115（52763fda73ce 字节一致）`——
+  这说明 `$OUT/.config` 与归档配置逐字节同源，包可溯源；不一致脚本会 rc=1 拒绝（`--force` 越权）。
+- trim 套 `Image` = **32,178,688 B（30.7M）**、dtb 51,123 B、模块 **140 个**（全量树是 35.9M / 5816 个，§5.8）。
 
 > 该 header 配方已在本次构建中校验：生成结果与已有 `header-7.2.12-x96.tar.gz` 的 13800 个文件一致。
 >
@@ -2307,7 +2341,7 @@ modules-7.2.12-x96.tar.gz      226K  b113fef3d0dbef60ae1f56e981d3ba7dfa7a09c04cf
 
 ```bash
 K=/x96-build/amlogic-s9xxx-armbian/build-armbian/kernel/stable/7.2.12
-KNAME=7.2.12-x96
+KNAME=7.2.12-x96-trim          # full 套换成 7.2.12-x96
 ls -l --time-style=+%m-%d_%H:%M "$K"/{boot,dtb}-*"$KNAME".tar.gz "$K"/{modules,header}-*"$KNAME".tar.gz
 tar -xzOf "$K/boot-$KNAME.tar.gz" ./vmlinuz-$KNAME | strings | grep -qx vfat && echo "包内 Image 有 vfat ✔"
 tar -xzOf "$K/boot-$KNAME.tar.gz" ./config-$KNAME | grep -E '^CONFIG_(VFAT|FAT|MSDOS)_FS=y'
@@ -2319,33 +2353,44 @@ tar -xzOf "$K/boot-$KNAME.tar.gz" ./config-$KNAME | grep -E '^CONFIG_(VFAT|FAT|M
 
 > 前提：19.3–19.5 已产出 `boot/dtb-amlogic/modules/header` 四个内核包，且 **mtime 晚于本次 Image**（§19.5 的必验）。
 > `build-image.sh` **不检查内核新旧**：四包是旧的它照样出镜像，只是镜像里是旧内核。改过内核就必须先 19.5。
+> 脚本也会自己兜底：四包缺任一个直接退出，并按 MODE 把本套 `pkgs/<mode>/` 同步进 ophub 目录（`x96_stage_pkgs`）。
 
 ```bash
 cd /home/quqiufeng/kernel
 
-# 完整构建：源码 rootfs + 注入 + rebuild + 裁剪 + gzip
-./x96max/build-image.sh
+# 裁剪套（现役）：用 pkgs/trim 的四包 → recovery/x96-trim-autoinstall.img.gz
+./x96max/trim/build-image.sh
 
-# 复用已有 rootfs，只重打包
-./x96max/build-image.sh --skip-rootfs
+# 完整套：用 pkgs/full 的四包 → recovery/x96-full-autoinstall.img.gz
+./x96max/full/build-image.sh
+
+# 复用已有 rootfs 产物，只重打包（最快，约 3–4 分钟）
+./x96max/trim/build-image.sh --skip-rootfs
 
 # 直接写 U 盘/SD（转调 write-card.sh：关自动挂载 → dd → 文件系统层校验 → 恢复）
-./x96max/build-image.sh --skip-rootfs --write /dev/sdX
+./x96max/trim/build-image.sh --skip-rootfs --write /dev/sdX
 ```
+
+不带 `full/` 前缀的 `x96max/build-image.sh` 也认 `--mode trim`（默认 full）；`lib/mode.sh` 决定
+`KNAME/PKGS/成品名`，两套互不覆盖。
 
 可用环境变量：
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `X96_BUILD_ROOT` | `/x96-build` | 工作目录 |
-| `X96_BASE_IMAGE` | 上面的 6.18.60 通用镜像 | 基础镜像 |
-| `X96_ROOT_PASSWORD` | 空 | 默认锁定 root 密码，仅 SSH key；需要控制台密码登录时显式设置 |
+| `X96_BASE_IMAGE` | 上面的 6.18.60 通用镜像 | 基础镜像（提供 boot 区与分区表） |
+| `X96_ROOT_PASSWORD` | `x96max`（脚本内默认，非空→开密码登录 + 控制台自动登录） | 置空则锁定 root 密码、仅 SSH key（§0.5 的坑） |
 | `X96_ROOT_SSH_KEY` | `~/.ssh/id_ed25519.pub` | 写入镜像的 root 公钥 |
 
-脚本会检查 sudo、基础镜像、4 个内核包、auto-install 文件和 rootfs 产物。输出：
+脚本会检查 passwordless sudo、基础镜像、4 个内核包、auto-install 文件（`x96-autoinstall.sh` +
+`.service`）、`config-x96-source.conf`、rootfs 产物；装完还要过两道工具断言（rootfs 侧
+`hexdump/parted/mkfs.*/losetup/fdisk/lsblk/tar/dbus-uuidgen`，交付镜像侧再加 `ampart/armbian-install`）。
+输出（`$OUT=$ROOT/recovery`）：
 
 ```text
-/x96-build/recovery/x96src-autoinstall.img.gz
+/x96-build/recovery/x96-trim-autoinstall.img.gz    # 现役
+/x96-build/recovery/x96-full-autoinstall.img.gz    # 全量套
 ```
 
 ### 19.6.1 一键从零重建（实际用的流程）
@@ -2355,45 +2400,72 @@ cd /home/quqiufeng/kernel
 ```bash
 cd /home/quqiufeng/kernel
 
-# 全流程：0 清空 → 19.3 内核 → 19.4 initrd → 19.5 四包 → 19.6 镜像
-sudo ./x96max/rebuild-from-zero.sh
+# 现役：裁剪套全流程（0 清空本套旧产物 → 19.3 内核 → 19.4 initrd → 19.5 四包 → 19.6 镜像）
+sudo ./x96max/trim/rebuild-from-zero.sh
 
-# 只重做某一段（都不清旧产物）
-sudo ./x96max/rebuild-from-zero.sh --from kernel    # 从编内核开始
-sudo ./x96max/rebuild-from-zero.sh --from initrd    # 复用 kbuild-*/Image
-sudo ./x96max/rebuild-from-zero.sh --from pkgs      # 只重打四包
-sudo ./x96max/rebuild-from-zero.sh --from image     # 只重做镜像（本次就是这么跑的）
+# 全量套（同样一条，互不覆盖）
+sudo ./x96max/trim/rebuild-from-zero.sh    # ← 换成 ./x96max/full/rebuild-from-zero.sh
 
-# 用裁剪树编内核（8 分钟那一档）：X96_KSRC 默认就是 $X96_BUILD_ROOT/src-linux，
-# 原版解压树 /opt/linux/src/linux-7.2.12 已删除（只剩 tar.xz），不要再往那儿指
-sudo ./x96max/rebuild-from-zero.sh --from kernel
+# 只重做某一段（--from 隐含 --no-clean，不清旧产物）
+sudo ./x96max/trim/rebuild-from-zero.sh --from kernel    # 从编内核开始
+sudo ./x96max/trim/rebuild-from-zero.sh --from initrd    # 复用 kbuild-*/Image，只重做 initrd/uInitrd
+sudo ./x96max/trim/rebuild-from-zero.sh --from pkgs      # 只重打四包
+sudo ./x96max/trim/rebuild-from-zero.sh --from image     # 只重做镜像（四包不变时用这个）
+
+# 无前缀入口 + --mode / --trim 等价写法
+sudo ./x96max/rebuild-from-zero.sh --mode trim
+sudo ./x96max/rebuild-from-zero.sh --trim --from pkgs
 ```
 
-| 变量 | 默认值 | 说明 |
+开跑前会自动做两件拦截：`x96_ensure_src`（full 缺席则现解压 1.8G 源码包；trim 缺裁剪树直接报
+「裁剪树是解压+裁剪的产物，还原不出来」并给两条补救路）、`x96_audit_trim`（trim 套先跑
+`tools/trim/audit_stubs.py`，被剥空的目录/被删的 Makefile 行会让它 rc≠0 立刻中止，不白编一轮）。
+
+| 变量 | 默认值（trim / full） | 说明 |
 |---|---|---|
 | `X96_BUILD_ROOT` | `/x96-build` | 工作根（`logs/`、`pkgs/`、`recovery/` 都在其下） |
-| `X96_KSRC` | `$X96_BUILD_ROOT/src-linux` | 内核源码树（默认即裁剪树；要给未裁剪的原版树才需要显式覆盖） |
-| `X96_KNAME` | `7.2.12-x96` | 内核 release 名 = 包名后缀 |
+| `X96_CFG_MODE` | `trim`（`trim/*.sh` 里导出）/ `full` | 选哪一套，就这一个开关 |
+| `X96_KSRC` | trim→`7.2.12-trim`（自动找）/ full→`src-full` | 源码树；full 不常驻，缺席现解压 |
+| `X96_KOUT` | `kbuild-trim` / `kbuild-7.2.12` | O= 输出树 |
+| `X96_KNAME` | `7.2.12-x96-trim` / `7.2.12-x96` | 内核 release 名 = 包名后缀 |
+| `X96_SKIP_AUDIT` | `0` | `1` = 跳过 trim 裁剪审计（确知无害时才用） |
 | `X96_BASE_IMAGE` | `.../images/Armbian_26.11.0-trunk_trixie_arm64_6.18.60.img` | 基础镜像（取 rootfs 做 initrd） |
 
-每步一个日志文件，`done.log` 收最终镜像大小 + sha256：
+每步一个日志文件，过滤时最好带上 MODE（两套日志目录不会混，但机器上会并排躺着）：
+`done.log` 收最终镜像大小 + sha256；本次未跑 image 阶段时会写「本次未跑 image 阶段」。
 
 ```text
-/x96-build/logs/from0-<mmdd-HHMM>/{0-clean,19.3,19.4,19.5,19.6,done}.log
+/x96-build/logs/from0-<MODE>-<mmdd-HHMM>/{0-clean,19.3,19.4,19.5,19.6,done}.log
 ```
 
-实测产物链（磁盘上的实际路径与大小，2026-11-15 09:15–09:28；本次 `--from image` 只重跑最后两段，10 分钟）：
+> 历史日志（09:xx 那批，无 MODE 段、用的是 `x96src-autoinstall.img.gz`）只作留档，别再照抄路径。
 
-| 阶段 | 路径 | 实测 |
-|---|---|---|
-| Image / dtb | `/x96-build/kbuild-7.2.12/arch/arm64/boot/{Image,dts/amlogic/meson-g12a-x96-max.dtb}` | 35.9M / 51K |
-| initrd、uInitrd | `/x96-build/{initrd.img,uInitrd}-7.2.12-x96` | 11,195,908 B / 11,195,972 B |
-| rootfs 缓存 | `/x96-build/armbian-build/cache/rootfs/rootfs-arm64-trixie-minimal_202611-a496fe484044-H6eccde-B5a6882.tar.zst` | 82,584,354 B（解开 319MiB） |
-| ophub 成品 | `/x96-build/amlogic-s9xxx-armbian/build/output/images/Armbian_26.11.0_amlogic_s905x2_trixie_7.2.12_server_2026.11.15.img.gz` | 285,274,831 B |
-| 交付镜像 | `/x96-build/recovery/x96src-autoinstall.img.gz` | 272M，sha256 `13ece9df273d3905a09fc4c5b62b7492356b7407c751b109450b70a65b5b1ad1` |
+### 19.6.2 裁剪套端到端实测（2026-11-15 21:0x，现役基线）
 
-> 各段实测（裁剪树）：内核 8m15s（495s，§5.3）+ initrd/uInitrd 约 1m + 四包 约 1m + rootfs+镜像 约 8m，全流程约 18 分钟；
-> `--from image` 只跑最后两段，10 分钟。
+从裁剪树到可刷镜像的完整链路，一次 `trim` 套分段跑完（不是一条命令到底，按段重试更省时）：
+
+```bash
+cd /home/quqiufeng/kernel
+sudo ./x96max/trim/rebuild-from-zero.sh --from initrd   # 21:28 → 21:29  initrd/uInitrd
+sudo ./x96max/trim/rebuild-from-zero.sh --from pkgs     # 21:31        四包 + 配置溯源校验
+sudo ./x96max/trim/rebuild-from-zero.sh --from image     # 21:32 → 21:39 rootfs 注入 + ophub rebuild
+```
+
+| 阶段 | 命令/脚本 | 产物（实测） | 日志 |
+|---|---|---|---|
+| 19.3 内核 | `trim/build-kernel.sh` | `kbuild-trim/arch/arm64/boot/Image` 32,178,688 B（30.7M）；dtb 51,123 B | `logs/…/19.3.log` |
+| 19.4 initrd | `--from initrd`（loop 挂 base + chroot qemu） | `initrd.img-7.2.12-x96-trim` 11,081,541 B，`uInitrd-…` 11,081,605 B（`slumber` 已由 30 抬到 90，回读自检通过） | `from0-trim-1115-2128/19.4.log` |
+| 19.5 四包 | `trim/pack-kernel.sh --stage` | `pkgs/trim/`：boot 34M / dtb 11K / header 13M / modules 2.4M，自检 `配置溯源 OK：config-7.2.12-x96-trim-20261115（52763fda73ce 字节一致）` | `from0-trim-1115-2131/19.5.log` |
+| 19.6 镜像 | `trim/build-image.sh` | `/x96-build/recovery/x96-trim-autoinstall.img.gz` **271M**，sha256 `ce37a41ed27891a5832e09a64e6f465e9eb72196842b04c3809babce4d75d8ff`；ophub 中间产物 `Armbian_26.11.0_amlogic_s905x2_trixie_7.2.12_server_2026.11.15.img.gz`；末行断言 `final image assertions ok` | `from0-trim-1115-2132/19.6.log` |
+
+19.6 这段日志里两处**看似报错其实无害**的输出，别再当故障查：
+
+- `docker: 未找到命令` → ophub 自动降级 `PREFER_DOCKER=no`，本机原生构建。
+- `tar: … Cannot change ownership to uid 1000 …` → root 打包、目标属主是普通用户，属主位无关紧要；
+  后面跟着 `(1.1) Armbian built successfully.` + `SUCCESS` 才算数。
+
+镜像体积参考：裁剪套 271M（gz）/ 全量套 271M→272M 一档，两者差在 `boot` 包与 `Image`（30.7M vs 35.9M），
+rootfs 部分相同——想再瘦要动 §18 的包清单，而不是内核。
 
 ### 19.7 写盘、首启与 eMMC 安装
 
