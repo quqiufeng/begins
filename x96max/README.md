@@ -21,6 +21,7 @@
 | 写卡 | `write-card.sh` | 安全写整盘镜像 + 文件系统层校验（关 automount/udisks2，逐文件 sha256） |
 | 写卡 | `flash-p1.sh` | 只把新 `Image` 写进已启动 U 盘 p1（按 rootfs UUID 定位父盘），快速试内核 |
 | 写卡 | `patch-bootargs.sh` | 改卡上 p1 `uEnv.txt` 的 `APPEND`：幂等追加/删除内核参数，`--usb-fix VID:PID` 一键禁 UAS + 关 USB 自动挂起（§10.2.2）|
+| 写卡 | `patch-initrd-wait.sh` | 把 initramfs 里 `scripts/local` 的 `slumber` 由 30 抬到 90（`--secs N` 可调）；吃 `initrd.img` 或 `uInitrd`（自动剥头/重打包 + 回读自检 + 首次改动留 `.bak.<时间戳>`）；`--check` 只读复查（§5.5）|
 | 校验 | `verify-card.sh` | 卡 vs 备份镜像：两侧 `ro,noload` 挂载逐文件 sha256 对拍（不用裸盘 cmp） |
 | 备份 | `backup-card.sh` | 把已验证可启动的卡备份成可还原镜像 |
 | 安装 | `x96-autoinstall.sh` + `x96-autoinstall.service` | 首启自动 `armbian-install` 装到 eMMC（防 apt 吃 stdin、done 标记只在成功后写） |

@@ -45,6 +45,7 @@
    - 应急：`(initramfs)` 里敲 `exit`，会重跑一轮 `mountroot` 并挂上，不用重启。
    - **`rootdelay=15` 是无效解，已弃用**（2026-11-15 读 `init`/`scripts/local` 源码证伪，见 §5.5「为什么 rootdelay 没用」）：`init` 先记 `starttime` 再 `sleep rootdelay`，而 `slumber=max(30, rootdelay)` → 15 秒只是从 30 秒预算里挖掉 15 秒，放弃时刻只提前、不推迟。
    - 固修（已写入卡 p1，**待真机复验**）：`x96max/patch-initrd-wait.sh` 把 initramfs 里 `scripts/local` 的 `slumber` 由 `30` 改成 `90`，重打包成 `uInitrd`；`uEnv.txt` 的 `rootdelay=15` 已用 `-r` 删除（`APPEND` 21 参数，`usb-storage.quirks=346d:5678:u` / `usbcore.autosuspend=-1` 保留）。
+   - 卡上**两份** uInitrd 都已打（16:27 `/uInitrd`、16:30 `/uInitrd-7.2.12-x96`），`--check` 均回读 `slumber=90`（判据见 §10.1.1 第 6 步）。
    - 判据表 + 可复现步骤见 **§5.5**；`rebuild-from-zero.sh --from initrd` 已内置该补丁，重打镜像不会回退。
 
 ### 0.1 源码缺失时的补齐来源（唯一权威包）
@@ -854,17 +855,21 @@ sudo ./x96max/patch-initrd-wait.sh /x96-build/initrd.img-7.2.12-x96 -o /tmp/i.im
 > **坑（2026-11-15 实测）**：`write-card.sh` 收尾会把卡上分区**全部卸载**，紧接着跑
 > `patch-bootargs.sh` 时 p1 未挂载 → 旧版 `findmnt` 返回 1 + `set -euo pipefail` 让赋值失败，
 > 脚本**零输出、直接退出 1**，极易被当成"跑过了"。已修（`|| true`，commit `8c40d19`）。
-> 现在正常输出应为 `+ 追加: rootdelay=15` 等三行，否则**当它没生效**，重跑并跟 `-l` 对拍。
+> 现在正常输出应为 `+ 追加: usb-storage.quirks=346d:5678:u` 等两行，否则**当它没生效**，重跑并跟 `-l` 对拍。
 
-> `rootdelay=15` 的代价是**每次开机多等 15 秒**（`prepare-root` 里 hard sleep，不是轮询，有就用不上「提前发现」）。
-> 只在这根 U 盘根盘上需要；装进 eMMC 后 root 是 `mmcblk1p2`，**要把它删掉**：
-> `sudo ./x96max/patch-bootargs.sh -r rootdelay=15`
+> **`rootdelay` 已彻底退出方案**（§5.5 上文源码证伪）。它既治不了竞态，又要每次开机硬睡，
+> 装进 eMMC 后更要删；现在盘上就不该有它。若见到旧卡还带着，`sudo ./x96max/patch-bootargs.sh -r rootdelay=15` 清掉。
 
-**验证参数真的进了内核**（改完盘、开机后第一步）：
+**验证两个改动真的生效**（改完盘、开机后第一步）：
 
 ```bash
+# ① 启动参数：只该有两条，且没有 rootdelay
 cat /proc/cmdline | tr ' ' '\n' | grep -E 'rootdelay|quirks|autosuspend'
-# 期望三行都在：rootdelay=15 / usb-storage.quirks=346d:5678:u / usbcore.autosuspend=-1
+# 期望两行：usb-storage.quirks=346d:5678:u / usbcore.autosuspend=-1
+
+# ② initramfs 等待窗口（根源修复，盘上就能验，不用开机）
+./x96max/patch-initrd-wait.sh /media/$USER/BOOT/uInitrd --check
+# 期望：slumber=90
 ```
 
 **写盘后的权威快照（2026-11-15 16:05，`cat /media/$USER/BOOT/uEnv.txt` 实录）**
@@ -877,19 +882,23 @@ APPEND=root=UUID=8e0a1be3-3e27-4733-9b1f-b5936d744996 rootflags=data=writeback r
   rootfstype=ext4 console=ttyAML0,115200n8 console=tty0 no_console_suspend consoleblank=0 \
   fsck.fix=yes fsck.repair=yes net.ifnames=0 max_loop=128 cgroup_enable=cpuset \
   cgroup_memory=1 cgroup_enable=memory swapaccount=1 video=HDMI-A-1:1920x1080@60e \
-  plymouth.enable=0 rootdelay=15 usb-storage.quirks=346d:5678:u usbcore.autosuspend=-1
+  plymouth.enable=0 usb-storage.quirks=346d:5678:u usbcore.autosuspend=-1
 ```
 
-下次要核对「盘上到底带没带参数」时，直接跟这段对拍，别只 `grep rootdelay`——
-**`rootwait` 和 `rootdelay` 是两个不同的参数**，`grep root` 会把两行混在一起误判。
+下次要核对「盘上到底带没带参数」时，直接跟这段对拍，别只 `grep root`——
+**`rootwait` / `rootdelay` 是两个不同的参数，而本方案里只留 `rootwait`**；`grep root` 会把两行混在一起误判。
+（`APPEND` 共 21 个参数；`rootdelay=15` 已用 `-r` 删除，见 §0 第 6 条。）
 
 **本条的可复现步骤（下一个人照做）**
 
 1. `sudo ./x96max/patch-bootargs.sh -l` 记下当前 APPEND 并确认**没有** `rootdelay`
 2. 插盘启动，在 `(initramfs)` 里敲 `exit` → 应能进系统（证明是竞态而不是缺驱动）
 3. `dmesg | grep -E 'Gave up|\[sda\]'` 换算成同一时间轴，确认「放弃时刻 < 枚举时刻」
-4. `patch-bootargs.sh --usb-fix <vid:pid> rootdelay=15` 写盘，`sync && umount`
-5. 再启动一次，黑屏 15 秒属正常，之后应直接到 `login:`
+4. 抬等待窗口（**根源修复**，不动 bootargs）：
+   `sudo ./x96max/patch-initrd-wait.sh /dev/sdX1/uInitrd --inplace`（或卡挂上后给 `$MNT/uInitrd`）
+5. USB 兜底（可选但推荐，§10.2.2）：`patch-bootargs.sh --usb-fix 346d:5678`
+6. 再启动：initramfs 最长等 90 秒（`slumber=90`），正常应在 2~3 秒内挂上 root 直接到 `login:`；
+   若仍卡到 90 秒，才回到 10.2.2 的掉盘分支（这是一次真超时，不是竞态）
 
 ---
 
@@ -1166,6 +1175,20 @@ sudo ./x96max/write-card.sh /x96-build/recovery/x96src-autoinstall.img.gz /dev/s
 全部通过 —— 卡内容与镜像等价
 ```
 
+**`write-card.sh` 只管分区里的字节等价，不动启动语义。** 镜像里带的是**出厂 `uInitrd`**
+（`slumber=30`）和**出厂 `APPEND`**，所以写完卡还要补两刀，否则 §5.5 的竞态照旧复发：
+
+| 步 | 命令 | 判据 |
+|---|---|---|
+| 6 | `sudo ./x96max/patch-initrd-wait.sh /dev/sdX1/uInitrd --inplace` | 回读 `slumber=90`（`--check` 可离线复查） |
+| 7 | `sudo ./x96max/patch-bootargs.sh --usb-fix 346d:5678` | `APPEND` 含 `usb-storage.quirks=346d:5678:u`、`usbcore.autosuspend=-1`，且**无** `rootdelay` |
+
+> 这两步语义幂等，可反复跑；`patch-initrd-wait.sh --inplace` 只在**首次真正改动**时留备份
+> （`uInitrd.bak.<unix时间戳>`），第二次不重复备份（但 sha256 会变，属正常）。
+> **卡上常有两份 uInitrd**（`uInitrd` 与 `uInitrd-7.2.12-x96`），`uEnv.txt` 的 `INITRD=/uInitrd` 才是真加载那份；
+> 两份都打一遍，再用 `--check` 逐个复查，别只改一个（见 §15 第 11 条）。
+> `--from initrd` 走全流程重建时，第 6 步已在 19.4 里自动做完，只在**重新写卡**后需要手动补。
+
 参数：`--yes` 跳过输入设备名确认；`--verify-only` 不写、只校验；`--img-cache DIR` 解压缓冲目录
 （默认 `$TMPDIR`，`.gz` 需约 3.1G 空间，已存在且比 `.gz` 新则复用）；`--bs 4M` 块大小。
 退出码：`0` 通过 / `1` 用法错 / `2` 设备被拒 / `3` 校验失败 / `4` 写盘失败。
@@ -1329,18 +1352,19 @@ Amlogic 官方救砖流程，绕开 eMMC 上一切 U-Boot 配置，不依赖 `bo
 **第 3 条的改法**（改 p1 的 `uEnv.txt`，不要手抠，用脚本）：
 
 ```bash
-sudo ./x96max/patch-bootargs.sh -l                              # 先看当前 APPEND
-sudo ./x96max/patch-bootargs.sh --usb-fix 346d:5678 rootdelay=15  # 追加下面三行
+sudo ./x96max/patch-bootargs.sh -l                        # 先看当前 APPEND
+sudo ./x96max/patch-bootargs.sh --usb-fix 346d:5678      # 追加下面两行
 ```
 
 等价于在 `APPEND=` 末尾加：
 
 ```text
-usb-storage.quirks=346d:5678:u usbcore.autosuspend=-1 rootdelay=15
+usb-storage.quirks=346d:5678:u usbcore.autosuspend=-1
 ```
 
-> `rootdelay=15` 严格说**不属于掉盘**（掉盘是链路层超时复位），它是治 §5.5 那个「枚举晚 1.3 秒被 initramfs 放弃」的竞态。
-> 但两种故障出现在同一根盘、同一台盒子上，实测**一起加最省事**——单独排查哪一个都是一轮插拔 + 一次重启。
+> 这两条治的是**掉盘**（链路层超时复位）。§5.5 那个「枚举晚 1.3 秒被 initramfs 放弃」的竞态
+> **不归它管**，要用 `patch-initrd-wait.sh` 抬 `slumber`（`rootdelay` 无效，已废）。
+> 两种故障出现在同一根盘、同一台盒子上，所以**两样都做**：先 `patch-initrd-wait.sh`，再 `--usb-fix`。
 
 `:u` = 对该盘禁用 UAS、强制走老的 BOT 协议（G12A 的 xHCI 上 UAS 翻车率高，症状与本例一致）。
 **但要老实说**：本例在 `high-speed` 下枚举，UAS 大概率本就没参与，真正起作用的是「换口」，这两行属于保险。
@@ -1390,8 +1414,16 @@ dmesg | grep -iE "meson8b-dwmac|RTL8211F|panfrost|meson-drm|snd|mmc"
 aplay -l
 ```
 
+**先验启动门槛（这两行不过，后面的都不用看）**：
+
+```bash
+cat /proc/cmdline | tr ' ' '\n' | grep -E 'rootdelay|quirks'   # 只有 quirks 两行，无 rootdelay
+dmesg | grep -E 'Gave up waiting|mounted filesystem'            # 只有后者；前者出现=等待窗口没打进去
+```
+
 预期：
 
+- root 挂在 USB 盘上（`findmnt -no SOURCE /` = `/dev/sda2` 之类），全程无 `Gave up waiting`
 - `eth0` 有 IPv4，`RTL8211F` 链路 1Gbps
 - SSH 可登录
 - 无线驱动在：`lsmod | grep -E 'rtw88|btrtl|hci_uart|btusb'`，`dmesg | grep -iE 'rtw88|btrtl|Bluetooth'` 无固件加载失败
@@ -1482,7 +1514,19 @@ ROOTFS_TYPE='ext4'
 | SD/U 盘启动验证 | 完成（源码系统 `x96src`） |
 | eMMC 安装 | 完成（主线 U-Boot，`-m yes -a no`） |
 | eMMC 启动验证 | 完成（源码系统，`/dev/mmcblk1p2`，7.2.12-x96） |
-| 脚本归位 `x96max/`（build-kernel / pack-kernel / build-image / write-card / verify-card / flash-p1 / backup-card / rebuild-from-zero + README） | 完成（6 个是本次从临时目录收进来的） |
+| initramfs 等待窗口固修（`slumber` 30 → 90） | 已打进卡（`patch-initrd-wait.sh`），**待真机复验** |
+| 启动参数 `rootdelay=15` 废弃并删除 | 完成（`patch-bootargs.sh -r rootdelay=15`，APPEND 21 参数） |
+| 脚本归位 `x96max/`（build-kernel / pack-kernel / build-image / write-card / verify-card / flash-p1 / backup-card / rebuild-from-zero / patch-bootargs / patch-initrd-wait + README） | 完成（多数是本次从临时目录收进来的） |
+
+**卡当前状态（2026-11-15 16:30 实测，`/dev/sdb`，只读取证）**
+
+| 项 | 值 | 怎么验的 |
+|---|---|---|
+| 卡内容 vs 镜像 | 等价（逐文件 sha256） | `write-card.sh … --verify-only` 全绿（§10.1.1） |
+| `uEnv.txt` `APPEND` | 21 参数，`rootdelay` 已无；保留 `rootwait` / `usb-storage.quirks=346d:5678:u` / `usbcore.autosuspend=-1` | `patch-bootargs.sh -l` |
+| `/uInitrd`（u-boot 实载，`INITRD=/uInitrd`） | `slumber=90` | `patch-initrd-wait.sh … --check` |
+| `/uInitrd-7.2.12-x96`（ophub 产物，原名保留） | `slumber=90`（16:30 补打） | 同上 |
+| 待办 | 插盒子上真机复验：开机不出现 `Gave up waiting`，直接到 `login:` | — |
 
 > 最终 rootfs 是 **Armbian build framework + mmdebstrap 源码构建**；内核 7.2.12 是自编译。
 
@@ -1501,6 +1545,8 @@ Armbian build /x96-build/armbian-build
 最终镜像      /x96-build/amlogic-s9xxx-armbian/build/output/images/
 仓库脚本      /home/quqiufeng/kernel/x96max/
 输出镜像      /x96-build/recovery/x96src-autoinstall.img.gz
+initrd 中间件 /x96-build/initrd.img-7.2.12-x96、/x96-build/uInitrd-7.2.12-x96
+卡上 uInitrd   <卡 p1>/uInitrd（已 patch 成 slumber=90，备份 uInitrd.bak.<时间戳>）
 源码镜像      Armbian_26.11.0_amlogic_s905x2_trixie_7.2.12_server_2026.11.02.img.gz
 eMMC 备份     dav://192.168.1.53:5005/sata11-18072858035/x96-backup/emmc-original-backup/
 NAS 备份目录  dav://192.168.1.53:5005/sata11-18072858035/x96-backup/
@@ -1525,7 +1571,16 @@ NAS 备份目录  dav://192.168.1.53:5005/sata11-18072858035/x96-backup/
 8. **写卡前关桌面自动挂载**：udisks2 会在 dd 结束后把卡以 **rw** 挂上 → ext4 日志回放 → 经不稳的读路径读到错字节再写回，垃圾被固化成真损坏（症状：文件字符错位、**长度不变**、`e2fsck -fn` 干净，只有逐文件 sha256 抓得到）。一条命令避开：`sudo x96max/write-card.sh <img.gz> /dev/sdX`，详见 §10.1.3。
 9. **U 盘掉盘先看 `speed`，别急着换卡**：`reset ... high-speed` + `cmd_age=30s` + `hostbyte=0x03` 是链路层超时，不是数据损坏；同一根盘在 PC 上 sha256 全绿就说明卡没问题。USB3 盘在盒子上只以 480M 枚举基本等于掉到了 USB2 链路，先换口/上有源 HUB。详见 §10.2.2。
 10. **别用整盘 `cmp` 判写卡成败**：USB 读卡器大块读会返回错字节，且同一位置重读给出**相同的错字节**，裸盘比对必然出现几百字节假差异，会把好卡判成坏卡、逼你反复重写（每次重写又在放大第 8 条的风险）。判据是逐文件 sha256 + `e2fsck -fn`，见 §10.1.4。
-10. **删源码目录前先看它的 `Kconfig` 有没有被 `source`。** `disable.list` 划掉一个 `CONFIG_*` 只是「不编它」，
+11. **卡 p1 上有两份 uInitrd，改错白改**：`uEnv.txt` 的 `INITRD=/uInitrd` 才是 u-boot 真加载的那份，
+    但同一目录还躺着 `uInitrd-7.2.12-x96`（ophub `rebuild` 产物，37MB，`slumber=30`）。
+    只打 `/uInitrd` 时它是**静默的地雷**——哪天 `INITRD=` 被改、或 boot 脚本回退到带版本号的名字，30 秒预算就回来了。
+    两份都打（`--check` 逐个复查），见 §10.1.1 第 6 步。
+12. **`patch-initrd-wait.sh --inplace` 是语义幂等、不是字节幂等**：重复跑会重新 `cpio | gzip -9`，
+    sha256 会变（存档顺序/时间戳），但 `slumber` 仍是 90、内容不丢；备份只在**首次真正改动**时留
+    （`<文件>.bak.<unix时间戳>`），第二次不会堆垃圾。
+13. **`patch-initrd-wait.sh` 只能处理 gzip initramfs**：`uInitrd` 头部之后若不是 gzip（`.xz`/`.zstd`）脚本会直接报错退出，
+    不会产出半成品；换了压缩方式的镜像要先 `--check` 一遍，别假设它能打。
+14. **删源码目录前先看它的 `Kconfig` 有没有被 `source`。** `disable.list` 划掉一个 `CONFIG_*` 只是「不编它」，
     但 `prune_src.py` 若因此删掉整个目录（含 `Makefile` + `Kconfig`），`drivers/*/Kconfig` 里的 `source` 行
     就悬空了，`olddefconfig` 会把这个开关**静默丢成 `n`**：`Image` 照编照引导，直到挂根盘才报
     `Gave up waiting for root file system device`。这次的代价是 `drivers/usb/storage/` 整目录被裁，
@@ -1855,7 +1910,14 @@ sudo losetup -d "$LOOP"
 
 mkimage -A arm64 -O linux -T ramdisk -C gzip -n uInitrd \
   -d "$ROOT/initrd.img-7.2.12-x96" "$ROOT/uInitrd-7.2.12-x96"
+
+# 5) 抬 initramfs 等待窗口（slumber 30 → 90，§5.5）——打包前的最后一道，别漏
+./x96max/patch-initrd-wait.sh "$ROOT/uInitrd-7.2.12-x96" --inplace
+./x96max/patch-initrd-wait.sh "$ROOT/uInitrd-7.2.12-x96" --check   # 期望 slumber=90
 ```
+
+> `rebuild-from-zero.sh --from initrd` 已把第 5 步内置；上面是手工分步时的等价命令。
+> 生成物 `uInitrd-7.2.12-x96` 就是 §19.5 打进 boot 包的那份，卡上也用它。
 
 ### 19.5 打包 4 个内核包
 
@@ -2043,11 +2105,15 @@ sudo ./x96max/write-card.sh /x96-build/recovery/x96src-autoinstall.img.gz /dev/s
 # 只把镜像塞进卡上已分好区的 p1（卡上分区方案不变、不想重写整盘时用）
 sudo ./x96max/flash-p1.sh /x96-build/recovery/x96src-autoinstall.img.gz /dev/sdX1
 
+# 写完卡必补两刀（镜像里是出厂 uInitrd 和出厂 APPEND，见 §10.1.1 第 6/7 步）
+sudo ./x96max/patch-initrd-wait.sh /dev/sdX1/uInitrd --inplace     # slumber 30 → 90（§5.5 根源修复）
+sudo ./x96max/patch-initrd-wait.sh /dev/sdX1/uInitrd --check       # 回读，期望 slumber=90
+
 # 改卡上 p1 的启动参数（uEnv.txt 的 APPEND），不重写任何分区
 sudo ./x96max/patch-bootargs.sh -l                     # 只列出当前 APPEND
-sudo ./x96max/patch-bootargs.sh --usb-fix 346d:5678 rootdelay=15   # USB 保险套餐（三参数，§5.5）
+sudo ./x96max/patch-bootargs.sh --usb-fix 346d:5678    # USB 保险套餐（两参数，§5.5 / §10.2.2）
 sudo ./x96max/patch-bootargs.sh quiet loglevel=7       # 追加任意参数（幂等）
-sudo ./x96max/patch-bootargs.sh -r rootdelay=15        # 删掉指定参数（装进 eMMC 后必做）
+sudo ./x96max/patch-bootargs.sh -r rootdelay=15        # 清掉历史遗留（现已不用，见 §5.5）
 ```
 
 `patch-bootargs.sh` 定位分区的方式和 `flash-p1.sh` 一样（`X96_ROOT_LABEL=ROOTFS` → 反查父盘 → 找 p1 的 FAT32），

@@ -13,6 +13,7 @@
 #
 # 用法：
 #   ./x96max/patch-initrd-wait.sh <initrd.img|uInitrd> [-o 输出] [--secs N] [--inplace]
+#   ./x96max/patch-initrd-wait.sh <initrd.img|uInitrd> --check   # 只读，打印当前 slumber
 #   给出 uInitrd（uImage，64 字节头）会自动重打包成 uInitrd
 #
 # 例：sudo ./x96max/patch-initrd-wait.sh /x96-build/initrd.img-7.2.12-x96
@@ -23,16 +24,18 @@ SECS=90
 IN=""
 OUT=""
 INPLACE=0
+CHECK=0
 while [[ $# -gt 0 ]]; do
   case $1 in
     -o) OUT=$2; shift 2 ;;
     --secs) SECS=$2; shift 2 ;;
     --inplace) INPLACE=1; shift ;;
+    --check) CHECK=1; shift ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) IN=$1; shift ;;
   esac
 done
-[[ -n $IN ]] || { echo "用法: $0 <initrd.img|uInitrd> [-o 输出] [--secs N] [--inplace]" >&2; exit 2; }
+[[ -n $IN ]] || { echo "用法: $0 <initrd.img|uInitrd> [-o 输出] [--secs N] [--inplace|--check]" >&2; exit 2; }
 [[ -f $IN ]] || { echo "没有这个文件: $IN" >&2; exit 2; }
 
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
@@ -61,6 +64,18 @@ SL=$WORK/root/scripts/local
 [[ -f $SL ]] || { echo "initramfs 里没有 scripts/local，跳过" >&2; exit 1; }
 
 OLD=$(grep -oP '^\t+slumber=\K[0-9]+' "$SL" | head -1 || true)
+
+if (( CHECK )); then
+  # 只读模式：不改、不重打包，判据就是 slumber 是否等于 SECS
+  if [[ -z ${OLD:-} ]]; then
+    echo "✘ 没匹配到 'slumber=<n>': $IN" >&2; exit 1
+  fi
+  if [[ $OLD == "$SECS" ]]; then
+    echo "✔ slumber=$OLD（已是目标值，$IN）"; exit 0
+  fi
+  echo "✘ slumber=$OLD（期望 $SECS）: $IN" >&2; exit 3
+fi
+
 echo "  原 slumber = ${OLD:-未找到}"
 if [[ -z ${OLD:-} ]]; then
   echo "⚠ 没匹配到 'slumber=<n>'，initramfs-tools 版本可能变了，人工确认：$SL" >&2; exit 1
@@ -91,7 +106,15 @@ mkdir -p "$WORK/chk"
   || { echo "回读自检失败，未写入任何东西" >&2; exit 1; }
 echo "  ✔ 回读自检通过"
 
-if (( INPLACE )); then OUT=$IN; fi
+if (( INPLACE )); then
+  OUT=$IN
+  # 只在真正改动时才备份（slumber 已是目标值的重复执行不留垃圾）
+  if [[ ${OLD:-} != "$SECS" ]]; then
+    BAK="$IN.bak.$(date +%s)"
+    sudo cp -a "$IN" "$BAK" 2>/dev/null || cp -a "$IN" "$BAK"
+    echo "  ⤶ 原文件备份: $BAK"
+  fi
+fi
 if [[ -z $OUT ]]; then
   OUT=$WORK/out
   echo "  (未给 -o，结果在 $OUT —— 临时目录会被删，请带 -o 或 --inplace)"
