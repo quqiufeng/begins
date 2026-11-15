@@ -10,6 +10,7 @@
 > ⚠️ **当前构建尚未达成**：裁剪树里 `net/wireless`、`net/mac80211`、`drivers/net/wireless/` 已整目录删除，配置里也没有 `RTW88*`，所以 7.2.12-x96 的内核**没有 Wi-Fi 驱动**（蓝牙源码 48 项还在，但 `CONFIG_BT*` 未开）。补法见 §0.3。
 > 仓库脚本：**本仓库 `x96max/`**（`build-image.sh` 一键镜像、`write-card.sh` 安全写卡 + 校验、`config-x96-source.conf` rootfs 配置、`x96-autoinstall.*` 首启自动安装、`x96max/kernel/config-7.2.12-x96` 最终内核配置、`mkbase.sh` 自造 rebuild 基础镜像）。
 > 📌 **最新（2026-11-15 17:08）**：裁掉目录会连带删掉 `Kconfig` → 符号静默消失。同配置下裁剪树比全量树少 **1789 个符号**（含 genpd/`HW_PERF_EVENTS`/`USB_GADGET`），`Image` 35.9→42.2MB。全量树已编好（`/x96-build/kbuild-clean`），尚未打包上机。详见 **§5.7**。
+> 📌 **新系统第一件事是校时（2026-11-15 17:55）**：镜像里**没有装任何 NTP 客户端**（`timesyncd`/`chrony`/`ntp` 全无），盒子 RTC 走偏后 `apt-get update` 会以 `is not signed` / `Not live until …` 报错，看着像源坏了其实是时钟错了。装 `systemd-timesyncd` + 国内 NTP 后全绿。详见 **§20**。
 
 ---
 
@@ -1700,6 +1701,7 @@ ROOTFS_TYPE='ext4'
 | 脚本归位 `x96max/`（build-kernel / pack-kernel / build-image / write-card / verify-card / flash-p1 / backup-card / rebuild-from-zero / patch-bootargs / patch-initrd-wait + README） | 完成（多数是本次从临时目录收进来的） |
 | 全量树对照编译（`src-clean` + `kbuild-clean`，同配置） | 完成（17:08，`Image` 42.2MB；量化出裁剪树静默丢 **1789** 个符号，见 §5.7） |
 | 用全量内核重出四包 / initrd / 镜像 | **未做**（下一步，§5.7 末） |
+| 系统校时（`systemd-timesyncd` + 国内 NTP） | 完成（17:55，`NTPSynchronized=yes`；镜像本身未装，见 §20） |
 
 **卡当前状态（2026-11-15 16:30 实测，`/dev/sdb`，只读取证）**
 
@@ -1773,6 +1775,10 @@ NAS 备份目录  dav://192.168.1.53:5005/sata11-18072858035/x96-backup/
     `Image` 35.9MB → 42.2MB。丢掉的 `=y` 里有 `PM_GENERIC_DOMAINS(_OF)`、`ARM_PSCI_CPUIDLE_DOMAIN`（genpd 整块）、
     `HW_PERF_EVENTS`、`USB_GADGET` 全家。**所以"裁剪树能编能启动"不能作为"裁剪无害"的证据**；
     判据是逐符号 diff（`diff <(grep '=' 全量.config) <(grep '=' 裁剪.config)`）或 `scripts/diffconfig`，见 §5.7。
+16. **`apt-get update` 报 `is not signed` / `Not live until 2026-11-15T07:38:06Z` 先查时钟，别急着换源**（2026-11-15 17:55）：
+    镜像**没装任何 NTP 客户端**（`timesyncd`/`chrony`/`ntp` 全无），RTC 一偏就是几个月，Debian 的 `InRelease`
+    签名"还没到生效时间" → sqv 判定整个仓库未签名，所有源全红，但网络和清华源本身完全正常。
+    判据：`timedatectl` 里 `System clock synchronized: no`、`NTP service: n/a`。修法见 **§20**。
 
 ---
 
@@ -2350,6 +2356,8 @@ ip -br a
 aplay -l
 arecord -l
 v4l2-ctl --list-devices
+timedatectl                       # 必看：System clock synchronized: yes / NTP service: active（见 §20）
+systemctl is-enabled systemd-timesyncd
 ```
 
 当前盒子装完 LuaJIT/音频/摄像头运行依赖后为 **177 包**；155 是裁剪后的基础系统包数（保留无线包后约 161）。
@@ -2364,4 +2372,71 @@ v4l2-ctl --list-devices
 
 ---
 
-*文档版本: 1.7 · 更新: 2026-11-15 · 设备: X96 Max / S905X2*
+## 20. 系统时间与 apt 源（新系统第一件事）
+
+> 2026-11-15 17:55 实测。**镜像出厂状态里没有任何 NTP 客户端**，`apt` 的"源坏了"多半是时间错了。
+
+### 20.1 症状：所有源都 "not signed"
+
+```text
+W: Failed to fetch http://mirrors.tuna.tsinghua.edu.cn/debian/dists/trixie/InRelease ...
+E: The repository '... debian trixie InRelease' is not signed.
+   Verifying signature: Not live until 2026-11-15T07:38:06Z
+```
+
+- `Not live until <未来时间>` 是关键指纹：**系统时钟早于签名生效时间**，`sqv` 直接判定仓库未签名
+  （本次盒子差 **7 个月**：`Tue Apr 14 2026` vs 真实 `2026-11-15`）。
+- 同一条时间线会连带打死 `apt-get install`、`dpkg` 校验、TLS（`curl`/`wget` 报证书未生效）。
+- 与镜像源无关：清华源本身可通（`apt-get update` 拿到 17.7MB 即可证明网络正常）。
+- 判据一条命令：`timedatectl` → `System clock synchronized: no` + `NTP service: n/a`。
+
+### 20.2 一次性修好（含开机自动同步）
+
+```bash
+# 1) 先把时间拨到"大致正确"（允许 apt 验证签名；-u 用 UTC，避免时区二次偏移）
+date -u -s '2026-11-15 09:56:00'
+
+# 2) 装时间同步服务（镜像里没有 chrony/ntp/timesyncd 任何一个）
+apt-get update            # 时钟修好后这次应该全绿、无 E:/W:
+apt-get install -y systemd-timesyncd
+
+# 3) 配国内 NTP（不配的话默认走 systemd 的 pool，盒子上延迟大且常失败）
+cat > /etc/systemd/timesyncd.conf <<'EOF'
+[Time]
+NTP=ntp.aliyun.com ntp1.aliyun.com time1.cloud.tencent.com cn.pool.ntp.org
+FallbackNTP=0.debian.pool.ntp.org time.cloudflare.com
+EOF
+
+systemctl enable --now systemd-timesyncd
+systemctl restart systemd-timesyncd
+
+# 4) 落进 RTC，重启不回退
+hwclock -w
+```
+
+### 20.3 验收
+
+```bash
+timedatectl                       # System clock synchronized: yes
+timedatectl show -p NTPSynchronized -p NTP     # NTPSynchronized=yes
+journalctl -u systemd-timesyncd -n 5 --no-pager # Contacted time server 203.107.6.88:123 (ntp.aliyun.com)
+hwclock -r                        # RTC 与系统一致
+apt-get update                    # rc=0，无 E:/W:
+```
+
+本次实测：`Contacted time server 203.107.6.88:123 (ntp.aliyun.com)` → `Initial clock synchronization to Sun 2026-11-15 17:55:06 CST`，
+`apt-get update` **rc=0，零 E/W**，`apt-get install tzdata` 正常。
+
+### 20.4 顺带记录
+
+- `apt-get install -y curl` 现在可以装了（之前 `curl` 不存在，盒子上只有 `wget` 级别的工具）。
+- `/etc/apt/sources.list.d/armbian.sources` 与 `armbian-config.sources` 在出厂镜像里是 **`.disabled`**，
+  Debian 源（清华 `debian.sources`，trixie + security）够用；要 Armbian 专属包再改回 `.sources`，
+  但先确认 `apt.armbian.com` / `github.armbian.com` 可达（本次未验证通过）。
+- **`RTC in local TZ: no`** 是正确状态（RTC 存 UTC）；别为了"看起来对"去改它。
+- 建议把 `systemd-timesyncd` + §20.2 的 `timesyncd.conf` 直接做进镜像（rootfs 注入阶段），
+  否则每次重装都要手工走一遍。
+
+---
+
+*文档版本: 1.8 · 更新: 2026-11-15 · 设备: X96 Max / S905X2*
