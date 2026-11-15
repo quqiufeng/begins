@@ -80,6 +80,19 @@ for s in preflight build-kernel pack-kernel rebuild-from-zero build-image; do
 done
 ck "patch-bootargs 支持 --usb-fix"  "grep -q -- '--usb-fix' $SELF_DIR/patch-bootargs.sh"
 
+# --- 参数解析：`--mode <v>` 分离写法必须真的吃值 ---
+# 三个脚本用 `for a in "$@"` 遍历，里面 shift 跳不过下一轮迭代项，裸值会被当成
+# 多余参数再扫一遍（pack-kernel 曾因此让 19.5 阶段直接报「多余参数: trim」）。
+# 用 -n/--dry-run 真跑一遍解析路径：退出码 0 且输出里 MODE=trim 才算过。
+for s in pack-kernel build-kernel; do
+  ck "$s.sh --mode trim -n 解析正确" \
+     "out=\$($SELF_DIR/$s.sh --mode trim -n 2>&1) && grep -q 'MODE=trim' <<<\"\$out\""
+  ck "$s.sh --mode=trim 等号写法可用" \
+     "out=\$($SELF_DIR/$s.sh --mode=trim -n 2>&1) && grep -q 'MODE=trim' <<<\"\$out\""
+done
+ck "flash-p1.sh --mode trim 解析正确（-n 免 root）" \
+   "out=\$($SELF_DIR/flash-p1.sh --mode trim -n 2>&1); grep -q 'MODE=trim' <<<\"\$out\""
+
 echo "== 通过 $P / 失败 $F =="
 [[ $F -eq 0 ]] || { echo "有 FAIL：先修前置，别开始重建（见 X96max.md §0.2）" >&2; exit 1; }
 echo "前置全绿，可开始：./x96max/$MODE/rebuild-from-zero.sh"

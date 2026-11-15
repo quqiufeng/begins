@@ -21,12 +21,19 @@ M=${X96_CFG_MODE:-full}
 ASSUME_YES=0
 DRY_RUN=0
 ARGS=()
+# `--mode <v>` 先归一成 --mode=<v>：下面 for 循环里 shift 不会跳过下一轮的迭代项，
+# 裸值会被再扫一遍当多余参数（rebuild-from-zero 的 19.5 阶段就是这么挂的）。
+_argv=(); while [[ $# -gt 0 ]]; do
+  case $1 in
+    --mode) _argv+=("--mode=${2:?--mode 需要 full|trim}"); shift 2 ;;
+    *)      _argv+=("$1"); shift ;;
+  esac
+done; set -- "${_argv[@]}"
 for a in "$@"; do case "$a" in
   -y|--yes)   ASSUME_YES=1 ;;
   -n|--dry-run) DRY_RUN=1 ;;
   --trim|-t)  M=trim ;;
   --full)     M=full ;;
-  --mode)     M=${2:?--mode 需要 full|trim}; shift ;;
   --mode=*)   M=${a#*=} ;;
   *)          ARGS+=("$a") ;;
 esac; done
