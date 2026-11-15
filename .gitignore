@@ -34,3 +34,6 @@ build/bzImage-*
 /mem.bin
 /mem.idx
 /mem.lock
+
+# plan.py 生成物（按 rules.txt 算出的禁用符号清单，随 config 变）
+x96max/trim-tools/disable.list

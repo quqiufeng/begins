@@ -297,10 +297,10 @@ $OUT/modules/lib/modules/7.2.12-x96/
 > 后台编译务必用 `setsid`/`nohup` 脱离当前 shell；否则终端超时会终止整个进程组。
 > 不要用 `pkill -f kbuild-7.2.12`，会匹配到当前 shell 自身；用进程组 `kill -- -PGID`。
 
-### 5.3 源码树裁剪（2026-11-15：全新构建 8 分 46 秒）
+### 5.3 源码树裁剪（2026-11-15：两轮裁到 545M，全量 8 分 15 秒）
 
 口径和 `docs/trim.md`（主机 `begin` 内核）不同：**不动 config，只删代码**——把源码树从
-1.8G / 94777 文件削到 **821M / 69673 文件（45%）**，用同一份 `.config` 换更短的全量编译。
+1.8G / 94777 文件两轮削到 **545M / 37911 文件（27%）**，用同一份 `.config` 换更短的全量编译。
 
 | 项 | 值 |
 |---|---|
@@ -308,9 +308,10 @@ $OUT/modules/lib/modules/7.2.12-x96/
 | 用的 config | `/x96-build/config-x96-20261115` 生成，`make olddefconfig` 后落 `kbuild-7.2.12/.config`
 （含 `CONFIG_DEBUG_INFO_NONE=y`，关 debug info 是最大的那一刀）；
 **归档副本 `configs/config-7.2.12-x96-20261115`**（与 `kbuild/.config` 字节一致，6672 行） |
-| 干净全量 `-j6` | **rc=0，526 s = 8m46s**（目标 ≤10 分钟已达成） |
-| 产物 | `Image` 35.9 MB / `vmlinux` 44.9 MB（aarch64 PIE） |
-| 日志与计时 | `/x96-build/logs/timed-0058.log`、计时脚本 `/x96-build/run-timed.sh` |
+| 第一轮裁剪后 | 1.8G/94777 → **821M / 69673 文件**；干净全量 `-j6` **rc=0，526 s = 8m46s** |
+| 第二轮裁剪后 | 821M/69673 → **545M / 37911 文件**；干净全量 `-j6` **rc=0，495 s = 8m15s**（目标 ≤10 分钟） |
+| 产物 | `Image` 35.8 MB / `Image.gz` 13.3 MB / `vmlinux` 44.9 MB（aarch64 PIE） |
+| 日志与计时 | `logs/timed-0058.log`（第一轮）、`logs/timed-clean-0815.log`（第二轮）；脚本 `/x96-build/run-timed.sh`，结果落 `.verify-rc` / `.verify-sec` |
 
 ```bash
 cd /x96-build/src-linux
@@ -337,7 +338,32 @@ ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j6 O=/x96-build/kbuild-7.2.12
    - `net/bridge` ← `net/ipv6/netfilter.c`、`net/netfilter/nfnetlink_{log,queue}.c`、`br_netfilter.h`、`trace/events/bridge.h`
 4. **验证顺序固定**：`make clean`（先暴露缺 Makefile）→ `syncconfig` → 全量编译 → 最后查 `undefined reference`。
 
-> 本轮只验证了「能编」。**Image 还没在盒子上启动过**，QEMU/真机启动断言未跑。
+**第二轮：删掉非 arm64 架构（821M → 545M，省 276M / 31762 文件）**
+
+目标架构固定 arm64，`arch/` 下 23 个其他架构目录里 **20 个纯删即可**：`rules.txt` 用 `FORCEKILL` 绕过 `judge()`，
+因为跨架构 Makefile 里出现 `CONFIG_64BIT=y` 会被启发式当成「活符号」而拒删。剩下 3 个（`um`/`x86`/`riscv`）
+**必须补回极小切片**，删整个目录就编不过——下面每一处都真炸过（括号里是日志行）：
+
+| 补回的切片 | 体积 | 谁要它 | 症状 |
+|---|---|---|---|
+| `arch/um` | 1.4M | `fs/Makefile` 无条件 `obj-y += hostfs/`；`fs/hostfs/Makefile` 末行 `include $(srctree)/arch/um/scripts/Makefile.rules` | `make clean` 直接 Error 2 |
+| `arch/x86/entry/syscalls` | 44K | `scripts/checksyscalls.sh`（`Kbuild:58` 的 `.tmp_missing-syscalls`）读 `syscall_32.tbl` | `timed-clean-0812.log:964` `grep: ... syscall_32.tbl: 没有那个文件或目录` |
+| `tools/include` | 2.0M | `scripts/Makefile:32-38` 给 `elf-parse.o`/`sorttable.o` 加 `-I$(srctree)/tools/include`，要 `tools/be_byteshift.h` | `timed-clean-0809.log:185` `elf-parse.h:7: fatal error: tools/be_byteshift.h` |
+| `arch/arm/boot/dts` | 27M | arm64 的 `arch/arm64/boot/dts/allwinner/*.dtsi` 跨架构 `#include <arm/allwinner/sunxi-h3-h5.dtsi>` | `timed-clean-0809.log:264` `sun50i-h5.dtsi:4: fatal error: arm/allwinner/sunxi-h3-h5.dtsi`（`make dtbs`） |
+| `arch/riscv/boot/dts` | 1.2M | arm64 的 `arch/arm64/boot/dts/sophgo/sg2000.dtsi:6-7` `#include <riscv/sophgo/cv180x.dtsi>` / `cv181x.dtsi` | 同上（dtbs 阶段） |
+| `rust` | 7.1M | 顶层 `Makefile:1742`、`1756-1758` 的 `clean` 目标列了 `rust/libmacros.so`、`rust/libpin_init_internal.so` 等 | `make clean` 前置检查失败 |
+
+`Documentation/`（84M / 11300 文件）也可以删，但**必须同时把 `Makefile:1332` 的 `clean-dirs` 里的 `Documentation` 去掉**，
+否则 `scripts/Makefile.clean:12` 找不到 `Documentation/Makefile`，`make clean` 一上来就失败。代价是
+`make htmldocs`/`dt_binding_check` 这类文档与设备树校验目标不可用（正常 `make`/`clean`/`Image` 完全不碰）。
+
+> **补回已自动化**：`prune_src.py --apply` 删完后按 `trim-tools/restore.txt` 从 `$KTREE_ORIG`
+> （默认 `/opt/linux/src/linux-7.2.12`）把这 6 处 `cp -a` 回来，所以 `--apply` 幂等——2026-11-15 08:33 实测：
+> 删 5 个目录 + 补 6 处切片后树仍是 **545M / 37911 文件**（回涨的 38M 正是这 6 处），
+> 6 处与原树 `diff -r` **零差异**。往 `restore.txt` 加条目的判据只有一条：编译链在
+> `clean`/`syncconfig`/`dtbs` 阶段硬引用它，而 `judge()` 看不见。
+
+> 两轮都只验证了「能编」。**Image 还没在盒子上启动过**，QEMU/真机启动断言未跑。
 
 裁剪工具（`plan.py` / `prune_src.py` / `fix_sources.py` / `fix_makefiles2.py` / `sym2kc.py` / `rules.txt`）
 在 `x96max/trim-tools/`，用法见那里的 `README.md`；`/x96-build/trim-tools` 是它的软链，老命令照跑。

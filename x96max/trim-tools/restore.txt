@@ -1,0 +1,24 @@
+# prune_src.py --apply 之后无条件从 $KTREE_ORIG 拷回的切片（一行一个目录）。
+#
+# 为什么需要：rules.txt 里的 FORCEKILL 是「整删」，但下面这些路径删完之后仍被编译链硬引用
+# （kbuild 的 clean / syncconfig / dtbs 阶段），缺了直接断。判据看不见它们，只能靠这张表补回。
+# 表里每一处都真炸过，日志证据见 README「四个必读坑」第 4 条与 ~/kernel/X96max.md §5.3。
+
+# fs/Makefile 无条件 obj-y += hostfs/；fs/hostfs/Makefile 末行 include 它
+arch/um
+
+# scripts/checksyscalls.sh 读 syscall_32.tbl（Kbuild:58 .tmp_missing-syscalls）
+arch/x86/entry/syscalls
+
+# scripts/Makefile:32-38 给 elf-parse.o / sorttable.o 加 -I$(srctree)/tools/include
+# → 要 tools/be_byteshift.h
+tools/include
+
+# arm64 的 allwinner dtsi 跨架构 include <arm/allwinner/sunxi-h3-h5.dtsi>（make dtbs）
+arch/arm/boot/dts
+
+# arm64 的 sophgo/sg2000.dtsi:6-7 include <riscv/sophgo/cv180x.dtsi> / cv181x.dtsi
+arch/riscv/boot/dts
+
+# 顶层 Makefile:1742、1756-1758 的 clean 目标列了 rust/libmacros.so 等
+rust

@@ -416,3 +416,54 @@ KILL sound/usb/misc
 KILL sound/virtio
 KILL sound/x86
 KILL sound/xen
+
+# ---- 2026-11-15 第二轮：目标架构固定 arm64，其他 arch 全删 ----
+# 证据：logs/timed-0058.log 里 arch/* 只出现 arch/arm64（689 次），其他 0 次；
+# include/linux/peci-cpu.h 等跨架构 #include 的宿主（CONFIG_PECI/AGP/LOCOMO）在本 config 里不可用。
+# 这些目录的 judge 误判来自「Makefile 里出现 CONFIG_64BIT=y」，故用 FORCEKILL。
+FORCEKILL arch/alpha
+FORCEKILL arch/arc
+FORCEKILL arch/arm
+FORCEKILL arch/csky
+FORCEKILL arch/hexagon
+FORCEKILL arch/loongarch
+FORCEKILL arch/m68k
+FORCEKILL arch/microblaze
+FORCEKILL arch/mips
+FORCEKILL arch/nios2
+FORCEKILL arch/openrisc
+FORCEKILL arch/parisc
+FORCEKILL arch/powerpc
+FORCEKILL arch/riscv
+FORCEKILL arch/s390
+FORCEKILL arch/sh
+FORCEKILL arch/sparc
+# ---- 本轮结果：821M/69673 → 545M/37911，干净全量 -j6 rc=0、495 s（logs/timed-clean-0815.log）
+#
+# FORCEKILL = 整删。但下面 6 处在 `prune_src.py --apply` 之后必须从
+# /opt/linux/src/linux-7.2.12 原样拷回（体积/文件数已核对与原树一致），否则编译链直接断：
+#   arch/um                  1.4M/198   fs/Makefile 无条件 obj-y += hostfs/，
+#                                        fs/hostfs/Makefile 末行 include arch/um/scripts/Makefile.rules
+#                                        → 缺了 make clean 直接 Error 2
+#   arch/x86/entry/syscalls  44K/3      scripts/checksyscalls.sh 读 syscall_32.tbl
+#                                        → Kbuild:58 .tmp_missing-syscalls（timed-clean-0812.log:964）
+#   tools/include            2.0M/255   scripts/Makefile:32-38 给 elf-parse.o / sorttable.o 加
+#                                        -I$(srctree)/tools/include → 要 tools/be_byteshift.h
+#                                        （timed-clean-0809.log:185）
+#   arch/arm/boot/dts        27M/2916   arch/arm64/boot/dts/allwinner/*.dtsi 跨架构 include
+#                                        <arm/allwinner/sunxi-h3-h5.dtsi>（timed-clean-0809.log:264，dtbs）
+#   arch/riscv/boot/dts      1.2M/130   arch/arm64/boot/dts/sophgo/sg2000.dtsi:6-7 include
+#                                        <riscv/sophgo/cv180x.dtsi> / cv181x.dtsi（dtbs）
+#   rust                     7.1M/585   顶层 Makefile:1742、1756-1758 的 clean 目标列了
+#                                        rust/libmacros.so 等 → make clean 前置检查失败
+# 即 arch/um|arch/x86|arch/riscv|rust 与 tools/ 都是「整删 + 补切片」，不是留着不删。
+# 补回已自动化：prune_src.py --apply 删完后按同目录 restore.txt 从 $KTREE_ORIG cp -a 回来——
+# 那张表才是「谁引用它」的权威记录，本文件的 FORCEKILL 只回答「敢不敢整删」。
+FORCEKILL arch/x86
+FORCEKILL arch/xtensa
+KILL tools
+FORCEKILL rust
+# Documentation 84M/11300 文件：删目录的同时要把顶层 Makefile:1332 的 clean-dirs 里的
+# Documentation 去掉，否则 scripts/Makefile.clean:12 找不到 Documentation/Makefile，
+# make clean 一上来就失败。代价：make htmldocs / dt_binding_check 不可用（make/clean/Image 不碰）。
+KILL Documentation

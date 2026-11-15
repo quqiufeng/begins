@@ -22,21 +22,26 @@ import re, os, collections, subprocess
 # ---------------------------------------------------------------- rules / config
 
 def read_rules(path, tree):
-    """-> (kill, protect)。KILL 只收磁盘上真存在的目录（已删的规则不重复报）。"""
-    kill, protect = [], []
+    """-> (kill, protect, force)。KILL 只收磁盘上真存在的目录（已删的规则不重复报）。
+
+    FORCEKILL = KILL + 跳过 `judge()`，只给「目标架构固定、编译日志里根本没碰」的目录用：
+    跨架构目录在启发式下全是误判（`arch/x86/Makefile` 里出现 `CONFIG_64BIT=y` 就算「活符号」）。"""
+    kill, protect, force = [], [], set()
     for ln in open(path, encoding='utf-8'):
         ln = ln.split('#')[0].strip()
         if not ln: continue
         k, _, v = ln.partition(' ')
         v = v.strip().rstrip('/')
         if not v: continue
-        if k == 'KILL' and os.path.isdir(os.path.join(tree, v)): kill.append(v)
+        if k in ('KILL', 'FORCEKILL') and os.path.isdir(os.path.join(tree, v)):
+            kill.append(v)
+            if k == 'FORCEKILL': force.add(v)
         elif k == 'PROTECT': protect.append(v)
     kill.sort(key=len)
     top = []
     for d in kill:                      # 去掉被父目录覆盖的子项
         if not any(d.startswith(t + '/') for t in top): top.append(d)
-    return top, protect
+    return top, protect, force
 
 def config_path(tree, fallback=None):
     """out-of-tree 构建没有 `<tree>/.config`：$KCONFIG → <tree>/.config → fallback。"""
@@ -122,9 +127,10 @@ def live_counts(top, en, s2k):
             if f.startswith(d + '/'): live[d] += 1; break
     return live
 
-def judge(tree, d, en, live, protect=()):
+def judge(tree, d, en, live, protect=(), force=()):
     """返回保留理由字符串；None = 可删。"""
     if d in protect: return 'PROTECT'
+    if d in force: return None
     if live[d]: return '%d 个 =y/=m 符号(按 Kconfig 归属)' % live[d]
     hit = sorted(makefile_syms(tree, d) & set(en))
     if hit: return 'Makefile 引用 %s (=y/=m)' % ','.join(hit[:3])
@@ -136,11 +142,11 @@ def judge(tree, d, en, live, protect=()):
 
 def plan(tree, cfg, rules):
     """-> (todo, skip)。skip = [(目录, 保留理由)]。"""
-    top, protect = read_rules(rules, tree)
+    top, protect, force = read_rules(rules, tree)
     en = enabled(cfg)
     s2k = sym2kc(tree)
     live = live_counts(top, en, s2k)
-    reason = {d: judge(tree, d, en, live, protect) for d in top}
+    reason = {d: judge(tree, d, en, live, protect, force) for d in top}
     return [d for d in top if reason[d] is None], [(d, reason[d]) for d in top if reason[d]]
 
 # ---------------------------------------------------------------- 体积统计
@@ -162,7 +168,12 @@ def mb(tree, d):
 # ---------------------------------------------------------------- 收尾清理
 
 def strip_sources(tree, dirs):
-    """删掉指向 `dirs`（已删目录）或已不存在的 `source ".../Kconfig"` 行，返回清理条数。"""
+    """删掉指向 `dirs`（已删目录）或已不存在的 `source ".../Kconfig"` 行，返回清理条数。
+
+    两个坑（2026-11-15 实测，删了 arch/x86 等目录后）：Kconfig 的 `source` 路径是**相对树根**
+    而不是相对所在文件，按 `root` 判存在会误删 `arch/Kconfig` 里的 `kernel/gcov/Kconfig`；
+    `$(SRCARCH)` 这类动态路径永远不存在，误删会让整个 arch 的 Kconfig 不再被 source。
+    """
     pat = re.compile(r'^\s*source\s+"([^"]+)/Kconfig"\s*$')
     removed = 0
     for root, _, fs in os.walk(tree):
@@ -177,8 +188,10 @@ def strip_sources(tree, dirs):
                 m = pat.match(ln.rstrip('\n'))
                 if m:
                     ref = m.group(1).lstrip('./')
+                    if '$(' in ref or '${' in ref:
+                        out.append(ln); continue
                     if any(ref == d or ref.startswith(d + '/') for d in dirs) or not os.path.exists(
-                            os.path.join(root, m.group(1))):
+                            os.path.join(tree, ref)):
                         ch = True; removed += 1; continue
                 out.append(ln)
             if ch: open(p, 'w', encoding='utf-8', errors='surrogateescape').write(''.join(out))
