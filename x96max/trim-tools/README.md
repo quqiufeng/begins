@@ -2,11 +2,12 @@
 
 配套文档：`~/kernel/X96max.md` **§5 源码树裁剪**（口径与四条规矩在那儿，这里只讲脚本怎么用）。
 
-和 `~/kernel/tools/trim/` 不是同一套：那套是主机 `begin` 内核（改 config + 真机启动断言），
-这套是 **Amlogic S905X2 盒子（arm64 交叉编译）**，口径是「不动 config，只删代码」。
-`plan/prune_src/fix_sources/fix_makefiles` 四个脚本与 `tools/trim/` 同源，
-**差别在 `rules.txt`（按 x96 的 config 核对）和 `fix_makefiles2.py` / `sym2kc.py`（这套独有，判据也升级了）**。
-`/x96-build/trim-tools` 是指向本目录的软链，老命令不用改；**改脚本只改这里**，否则两边分叉。
+口径是 **Amlogic S905X2 盒子（arm64 交叉编译）**，不动 config、只删代码；主机 `~/kernel/tools/trim/`
+那套是 `begin` 内核（改 config + 真机启动断言）。**判据单点在 `tools/trim/trimlib.py`**：
+本目录的 `plan.py`/`prune_src.py` 都是薄壳（只定默认树路径 + 自己的 `rules.txt`），
+`_trimpath.py` 通过 `realpath` 把 `../..` 找回去 import 它——所以两边**只有 `rules.txt` 该不同**，
+改判据改 `trimlib.py` 一处，别在本目录复制逻辑。
+`/x96-build/trim-tools` 是指向本目录的软链，老命令不用改（`_trimpath.py` 用 realpath，软链下也能找到 trimlib）。
 
 ## 环境
 
@@ -14,8 +15,8 @@
 |---|---|---|
 | `KTREE` | `/x96-build/src-linux` | 被裁剪的源码树（原版 `/opt/linux/src/linux-7.2.12` 保持不动） |
 | `RULES` | 本目录 `rules.txt` | `KILL <目录前缀>` / `KEEP <CONFIG 符号>` / `PROTECT <目录>` |
-| `KCONFIG` | `<tree>/.config` → `/x96-build/config-x96-trimmed` | 本机是 out-of-tree 构建，`src-linux` 里没有 `.config`，自动回退 |
-| `SYM2KC` | `/tmp/sym2kc.tsv` | Kconfig 符号表，`/tmp` 被清后 `plan`/`prune_src` 会自动重跑 `sym2kc.py` |
+| `KCONFIG` | `<tree>/.config` → `/x96-build/config-x96-20261115` | 本机是 out-of-tree 构建，`src-linux` 里没有 `.config`，自动回退 |
+| `SYM2KC` | `/tmp/sym2kc.tsv` | Kconfig 符号表，缺失时 `trimlib.sym2kc()` 自己扫树重建（`sym2kc.py` 只是它的命令行壳） |
 
 ## 用法（顺序）
 
@@ -43,7 +44,7 @@ grep -c 'undefined reference' 编译日志                                      
 **不能按目录名删 `=y` 子系统**，也**不能拿「符号 → 定义它的 Kconfig 所在目录」判归属**：
 `NET_DEVLINK`/`ETHTOOL_NETLINK` 定义在 `net/Kconfig`、`DVB_CORE` 在 `drivers/media/Kconfig`、
 `CGROUPS`/`PERF_EVENTS` 在 `init/Kconfig`，按归属算这些目录**永远 0 个活符号**。
-所以任一命中即保留，三层都不命中才删：
+所以任一命中即保留，三层都不命中才删（代码在 `~/kernel/tools/trim/trimlib.py:judge`，两个仓库共用这一份）：
 
 1. **目录 Makefile** 的 `CONFIG_*` ∩ config 的 `=y/=m` —— 命中例：`net/sched`(INET)、`net/ethtool`(ETHTOOL_NETLINK)。
 2. **父 Makefile** 的 `obj-$(CONFIG_X) += <dir>/` 且 X 在 config 里 `=y` —— 命中例：`net/devlink`
@@ -63,11 +64,13 @@ grep -c 'undefined reference' 编译日志                                      
 
 ## 本轮结果（2026-11-15）
 
-树 1.8G / 94777 文件 → **821M / 69673 文件（45%）**；`config-x96-trimmed` 干净全量 `-j6`
+树 1.8G / 94777 文件 → **821M / 69673 文件（45%）**；`config-x96-20261115` 干净全量 `-j6`
 **526 s（8m46s）rc=0**，`Image` 35.9 MB / `vmlinux` 44.9 MB。
 **只验证了「能编」，Image 尚未在盒子启动过。**
 
 ## 待办
 
-- `tools/trim/` 那套还留着旧的一层判据（`plan.py`/`prune_src.py` 的 `Kconfig` 归属 + 硬编码 `/tmp/sym2kc.tsv`），
-  两边该收敛成同一套判据（主机那套同样会踩 `net/devlink` 这类父 Kconfig 定义）。
+- ~~两边判据收敛~~ 已做（2026-11-15）：判据/解析/config 定位全搬进 `tools/trim/trimlib.py`，
+  本目录与 `tools/trim/` 的 `plan.py`/`prune_src.py` 只留默认路径；主机树 dry-run 同样得「可删 0 个」
+  （剩下的 `sound/atmel`、`drivers/video/fbdev/aty` 是空目录，0 文件）。
+- `fix_sources.py`/`fix_makefiles.py` 本来就与判据无关（只清指向不存在目录的引用），两边仍是各自拷贝。

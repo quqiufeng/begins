@@ -6,7 +6,7 @@
 > 本文目标：记录硬件、现有系统打包方式，以及**从 Linux 7.2.12 源码编译内核 → 源码构建 rootfs → ophub 打包 → SD/U 盘验证 → eMMC 安装 → 体积裁剪** 的完整过程。
 > 状态：**已成功从 eMMC 启动裁剪后的源码系统**（155 包，rootfs ~568M；主线 U-Boot）。
 > 无线策略（2026-11 更新）：**保留 Wi-Fi/蓝牙驱动与固件**（RTL8822BS → `rtw88_8822bs` + `btrtl`），内核里不再 `-d` 关闭；有线 RTL8211F 仍是主用网络。
-> 仓库脚本：**本仓库 `x96max/`**（`build-image.sh` 一键镜像、`config-x96-source.conf` rootfs 配置、`x96-autoinstall.*` 首启自动安装、`kernel/config-7.2.12-x96` 最终内核配置、`mkbase.sh` 自造 rebuild 基础镜像）。
+> 仓库脚本：**本仓库 `x96max/`**（`build-image.sh` 一键镜像、`config-x96-source.conf` rootfs 配置、`x96-autoinstall.*` 首启自动安装、`x96max/kernel/config-7.2.12-x96` 最终内核配置、`mkbase.sh` 自造 rebuild 基础镜像）。
 
 ---
 
@@ -305,7 +305,9 @@ $OUT/modules/lib/modules/7.2.12-x96/
 | 项 | 值 |
 |---|---|
 | 裁剪树 | `/x96-build/src-linux`（原版 `/opt/linux/src/linux-7.2.12`，未动） |
-| 用的 config | `/x96-build/config-x96-trimmed`（含 `CONFIG_DEBUG_INFO_NONE=y`，关 debug info 是最大的那一刀） |
+| 用的 config | `/x96-build/config-x96-20261115` 生成，`make olddefconfig` 后落 `kbuild-7.2.12/.config`
+（含 `CONFIG_DEBUG_INFO_NONE=y`，关 debug info 是最大的那一刀）；
+**归档副本 `configs/config-7.2.12-x96-20261115`**（与 `kbuild/.config` 字节一致，6672 行） |
 | 干净全量 `-j6` | **rc=0，526 s = 8m46s**（目标 ≤10 分钟已达成） |
 | 产物 | `Image` 35.9 MB / `vmlinux` 44.9 MB（aarch64 PIE） |
 | 日志与计时 | `/x96-build/logs/timed-0058.log`、计时脚本 `/x96-build/run-timed.sh` |
@@ -339,8 +341,11 @@ ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j6 O=/x96-build/kbuild-7.2.12
 
 裁剪工具（`plan.py` / `prune_src.py` / `fix_sources.py` / `fix_makefiles2.py` / `sym2kc.py` / `rules.txt`）
 在 `x96max/trim-tools/`，用法见那里的 `README.md`；`/x96-build/trim-tools` 是它的软链，老命令照跑。
-`sym2kc.py` 生成 `plan`/`prune_src` 要的 Kconfig 符号表（`/tmp/sym2kc.tsv` 被清会自动重建）；
-config 位置按 `$KCONFIG` → `<tree>/.config` → `/x96-build/config-x96-trimmed` 回退（out-of-tree 构建没有 `src-linux/.config`）。
+**三层判据只有一份实现**：`tools/trim/trimlib.py`（主机树与 x96 共用），两边脚本只是薄壳，
+差别只剩 `rules.txt` 和默认树路径——主机那套以前是一层判据（按 Kconfig 归属），同样会踩 `net/devlink`，
+现已收敛；改判据改 `trimlib.py`，别在 `trim-tools/` 里复制。
+`sym2kc.py` 是 `trimlib.sym2kc()` 的命令行壳（`/tmp/sym2kc.tsv` 被清会自动重建）；
+config 位置按 `$KCONFIG` → `<tree>/.config` → `/x96-build/config-x96-20261115` 回退（out-of-tree 构建没有 `src-linux/.config`）。
 
 ---
 
