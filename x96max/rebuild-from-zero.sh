@@ -90,11 +90,17 @@ if run_stage initrd; then
   {
     LOOP=$(sudo losetup -Pf --show "$BASE")
     echo "LOOP=$LOOP"
+    # 6.18.60 base 是单分区镜像（p1=rootfs）；旧两分区镜像才有 p2。分区节点由 udev 异步生成。
+    for _ in $(seq 20); do [[ -b ${LOOP}p1 ]] && break; sleep 0.3; done
+    PART=${LOOP}p2
+    [[ -b $PART ]] || PART=${LOOP}p1
+    [[ -b $PART ]] || { echo "无可用分区: ${LOOP}p1 / ${LOOP}p2" >&2; exit 1; }
+    echo "PART=$PART"
     trap 'sudo umount /mnt/x96root/sys /mnt/x96root/proc /mnt/x96root/dev 2>/dev/null || true
           sudo umount /mnt/x96root 2>/dev/null || true
           sudo losetup -d "$LOOP" 2>/dev/null || true' EXIT
     sudo mkdir -p /mnt/x96root
-    sudo mount "${LOOP}p2" /mnt/x96root
+    sudo mount "$PART" /mnt/x96root
     sudo cp -a "$OUT/modules/lib/modules/$KNAME" /mnt/x96root/lib/modules/
     sudo cp "$OUT/arch/arm64/boot/Image" /mnt/x96root/boot/vmlinuz-$KNAME
     sudo cp "$OUT/.config"    /mnt/x96root/boot/config-$KNAME

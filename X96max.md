@@ -2,7 +2,8 @@
 
 > 设备：X96 Max 4GB（AMedia X96 Max / Amlogic S905X2）
 > 主机名：`x96src`；局域网 IP：`192.168.1.121`（DHCP，可能变化）
-> 当前系统：eMMC 上的**源码构建 + 裁剪 rootfs**（Armbian build framework + mmdebstrap，Armbian 26.8.3 trixie，155 包）+ 自编译 `7.2.12-x96`（主线 U-Boot）；原商家系统为 Debian 12 bookworm + `6.12.112-ophub`。
+> 当前系统：eMMC 上的**源码构建 + 裁剪 rootfs**（Armbian build framework + mmdebstrap，Armbian 26.11.0 trixie，155 包）+ 自编译 `7.2.12-x96`（主线 U-Boot）；原商家系统为 Debian 12 bookworm + `6.12.112-ophub`。
+> 最近一次整车重建（2026-11-15 09:18→09:28，`sudo x96max/rebuild-from-zero.sh --from image`）：交付镜像 `/x96-build/recovery/x96src-autoinstall.img.gz` 272M，sha256 `13ece9df…b5b1ad1`。
 > 本文目标：记录硬件、现有系统打包方式，以及**从 Linux 7.2.12 源码编译内核 → 源码构建 rootfs → ophub 打包 → SD/U 盘验证 → eMMC 安装 → 体积裁剪** 的完整过程。
 > 状态：**已成功从 eMMC 启动裁剪后的源码系统**（155 包，rootfs ~568M；主线 U-Boot）。
 > 无线策略（2026-11 更新）：**保留 Wi-Fi/蓝牙驱动与固件**（RTL8822BS → `rtw88_8822bs` + `btrtl`），内核里不再 `-d` 关闭；有线 RTL8211F 仍是主用网络。
@@ -176,8 +177,13 @@ CONFIG_RFKILL=m
 | 构建机 | x86_64 Ubuntu 24.04（noble），6 核，23GiB 内存 |
 | 工作目录 | `/x96-build` |
 | ophub 仓库 | `/x96-build/amlogic-s9xxx-armbian` |
-| 内核源码 | `/opt/linux/src/linux-7.2.12` |
-| 内核构建目录 | `/x96-build/kbuild-7.2.12` |
+| 内核源码（原版，只做参照） | `/opt/linux/src/linux-7.2.12`（1.8G / 94777 文件，未动） |
+| **内核源码（实际编译的裁剪树）** | `/x96-build/src-linux`（545M / 37911 文件，裁剪过程见 §5.3） |
+| 内核构建目录（out-of-tree） | `/x96-build/kbuild-7.2.12`（`make O=`，源码树不落产物） |
+| 内核 4 包 | 产出 `/x96-build/pkgs/`；`rebuild` 实际读取 `.../build-armbian/kernel/stable/7.2.12/` |
+| Armbian build（源码 rootfs） | `/x96-build/armbian-build`，缓存 `cache/rootfs/rootfs-arm64-trixie-minimal_*.tar.zst` |
+| 成品镜像 | `/x96-build/recovery/x96src-autoinstall.img.gz` |
+| 日志 | `/x96-build/logs/from0-<mmdd-HHMM>/{0-clean,19.3,19.4,19.5,19.6,done}.log` |
 | 交叉工具链 | `aarch64-linux-gnu-gcc` 13.3.0 |
 | 模拟器 | `qemu-aarch64-static` + binfmt（用于 arm64 chroot） |
 
@@ -318,6 +324,11 @@ cd /x96-build/src-linux
 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make O=/x96-build/kbuild-7.2.12 clean
 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j6 O=/x96-build/kbuild-7.2.12
 ```
+
+> 这两条就是**实测用的编译命令**；`-j6` 即 `nproc`（构建机 6 核），`O=` 指到独立的构建目录。
+> 走一键脚本时对应 `X96_KSRC=/x96-build/src-linux ./x96max/rebuild-from-zero.sh`：
+> 脚本默认 `X96_KSRC=/opt/linux/src/linux-7.2.12`（**未裁剪的原版**，全量约 20 分钟），
+> 想复现 8 分钟那一档必须显式把 `X96_KSRC` 指向裁剪树。
 
 **四条踩出来的规矩**（这一轮都真炸过）：
 
@@ -977,10 +988,13 @@ apt-get install -y sudo u-boot-tools parted btrfs-progs   # 以后要 armbian-in
 |---|---|
 | 构建机 | x86_64 Ubuntu 24.04，6 核 / 23GiB（实测） |
 | 工作目录 | `/x96-build` |
-| 内核源码 | `/opt/linux/src/linux-7.2.12` |
-| 内核构建 | `/x96-build/kbuild-7.2.12` |
+| 内核源码（原版参照） | `/opt/linux/src/linux-7.2.12`（1.8G，未动） |
+| 内核源码（实际编译） | `/x96-build/src-linux`（裁剪树，`X96_KSRC` 指向它，见 §5.3） |
+| 内核构建 | `/x96-build/kbuild-7.2.12`（out-of-tree，`O=`） |
+| 内核 4 包 | 产出 `/x96-build/pkgs/`；`rebuild` 读 `.../build-armbian/kernel/stable/7.2.12/` |
 | ophub 仓库 | `/x96-build/amlogic-s9xxx-armbian` |
-| Armbian build | `/x96-build/armbian-build` |
+| Armbian build | `/x96-build/armbian-build`（rootfs 缓存 `cache/rootfs/*.tar.zst`） |
+| 日志 | `/x96-build/logs/from0-<mmdd-HHMM>/{0-clean,19.3,19.4,19.5,19.6,done}.log` |
 | 基础镜像 | `.../build/output/images/Armbian_26.11.0-trunk_trixie_arm64_6.18.60.img` |
 | 仓库脚本 | `x96max/build-image.sh`、`config-x96-source.conf`、`x96-autoinstall.*`、`mkbase.sh` |
 | 最终内核配置 | `x96max/kernel/config-7.2.12-x96` |
@@ -1018,7 +1032,7 @@ git clone https://github.com/armbian/build /x96-build/armbian-build
 
 ```bash
 REPO=/home/quqiufeng/kernel
-KSRC=/opt/linux/src/linux-7.2.12
+KSRC=/x96-build/src-linux        # 实际编译用的是裁剪树；原版 /opt/linux/src/linux-7.2.12 只做参照
 OUT=/x96-build/kbuild-7.2.12
 
 # 仅首次或源码树有树内产物时执行；会删除 .config
@@ -1060,8 +1074,10 @@ OUT=$ROOT/kbuild-7.2.12
 BASE=$ROOT/amlogic-s9xxx-armbian/build/output/images/Armbian_26.11.0-trunk_trixie_arm64_6.18.60.img
 
 LOOP=$(sudo losetup -Pf --show "$BASE")
+# 6.18.60 基础镜像是单分区（只有 p1=rootfs），老的两分区镜像才是 p2：按 p2 → p1 回退
+PART=${LOOP}p2; [[ -b $PART ]] || PART=${LOOP}p1
 sudo mkdir -p /mnt/x96root
-sudo mount "${LOOP}p2" /mnt/x96root
+sudo mount "$PART" /mnt/x96root
 
 sudo cp -a "$OUT/modules/lib/modules/7.2.12-x96" /mnt/x96root/lib/modules/
 sudo cp "$OUT/arch/arm64/boot/Image" /mnt/x96root/boot/vmlinuz-7.2.12-x96
@@ -1144,6 +1160,18 @@ tar -czf "$K/header-$KNAME.tar.gz" -C "$H" .
 ls -lh "$K"
 ```
 
+实测产物（2026-11-15 09:20，日志 `logs/from0-1115-0920/19.5.log`；同名副本拷到 `/x96-build/pkgs/`）：
+
+```text
+boot-7.2.12-x96.tar.gz          36M  69478137b5de77de966642477606c5e6be0ad5359e57a7e38393c18355c0dc39
+dtb-amlogic-7.2.12-x96.tar.gz   11K  2f0c8e209fb72282c6bef8f7a261a704af9674ec2f56723f03dc24a4e9b2df83
+header-7.2.12-x96.tar.gz        13M  91e525e950bcf0a9aa004bfd4a5fb7c2a0cab35b9d41fe90215647aea17a2965
+modules-7.2.12-x96.tar.gz      226K  b113fef3d0dbef60ae1f56e981d3ba7dfa7a09c04cf47b46e3a8955dc3988eb6
+```
+
+> `modules-*` 只有 226K 是当前 config 的正常结果：全树只剩 **1 个模块** `kernel/lib/test_bpf.ko`，
+> 其余（含无线）都是 `=y` 直接编进 `Image`——模块少换来的是 initrd 不用等 modprobe，但每次改驱动要重编内核。
+
 > 该 header 配方已在本次构建中校验：生成结果与已有 `header-7.2.12-x96.tar.gz` 的 13800 个文件一致。
 >
 > `rebuild` 检查 `boot-*`、`dtb-amlogic-*`、`modules-*`、`header-*` 四件套，缺一不可。
@@ -1179,6 +1207,52 @@ cd /home/quqiufeng/kernel
 ```text
 /x96-build/recovery/x96src-autoinstall.img.gz
 ```
+
+### 19.6.1 一键从零重建（实际用的流程）
+
+`x96max/rebuild-from-zero.sh` 把 §19.3→§19.6 串成一条，脚本里跑的就是上文那些命令：
+
+```bash
+cd /home/quqiufeng/kernel
+
+# 全流程：0 清空 → 19.3 内核 → 19.4 initrd → 19.5 四包 → 19.6 镜像
+sudo ./x96max/rebuild-from-zero.sh
+
+# 只重做某一段（都不清旧产物）
+sudo ./x96max/rebuild-from-zero.sh --from kernel    # 从编内核开始
+sudo ./x96max/rebuild-from-zero.sh --from initrd    # 复用 kbuild-*/Image
+sudo ./x96max/rebuild-from-zero.sh --from pkgs      # 只重打四包
+sudo ./x96max/rebuild-from-zero.sh --from image     # 只重做镜像（本次就是这么跑的）
+
+# 用裁剪树编内核（8 分钟那一档）；不加就落到未裁剪的原版树
+sudo X96_KSRC=/x96-build/src-linux ./x96max/rebuild-from-zero.sh
+```
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `X96_BUILD_ROOT` | `/x96-build` | 工作根（`logs/`、`pkgs/`、`recovery/` 都在其下） |
+| `X96_KSRC` | `/opt/linux/src/linux-7.2.12` | 内核源码树；**裁剪树必须显式给** `X96_KSRC` |
+| `X96_KNAME` | `7.2.12-x96` | 内核 release 名 = 包名后缀 |
+| `X96_BASE_IMAGE` | `.../images/Armbian_26.11.0-trunk_trixie_arm64_6.18.60.img` | 基础镜像（取 rootfs 做 initrd） |
+
+每步一个日志文件，`done.log` 收最终镜像大小 + sha256：
+
+```text
+/x96-build/logs/from0-<mmdd-HHMM>/{0-clean,19.3,19.4,19.5,19.6,done}.log
+```
+
+实测产物链（磁盘上的实际路径与大小，2026-11-15 09:15–09:28；本次 `--from image` 只重跑最后两段，10 分钟）：
+
+| 阶段 | 路径 | 实测 |
+|---|---|---|
+| Image / dtb | `/x96-build/kbuild-7.2.12/arch/arm64/boot/{Image,dts/amlogic/meson-g12a-x96-max.dtb}` | 35.9M / 51K |
+| initrd、uInitrd | `/x96-build/{initrd.img,uInitrd}-7.2.12-x96` | 11,195,908 B / 11,195,972 B |
+| rootfs 缓存 | `/x96-build/armbian-build/cache/rootfs/rootfs-arm64-trixie-minimal_202611-a496fe484044-H6eccde-B5a6882.tar.zst` | 82,584,354 B（解开 319MiB） |
+| ophub 成品 | `/x96-build/amlogic-s9xxx-armbian/build/output/images/Armbian_26.11.0_amlogic_s905x2_trixie_7.2.12_server_2026.11.15.img.gz` | 285,274,831 B |
+| 交付镜像 | `/x96-build/recovery/x96src-autoinstall.img.gz` | 272M，sha256 `13ece9df273d3905a09fc4c5b62b7492356b7407c751b109450b70a65b5b1ad1` |
+
+> 各段实测（裁剪树）：内核 8m15s（495s，§5.3）+ initrd/uInitrd 约 1m + 四包 约 1m + rootfs+镜像 约 8m，全流程约 18 分钟；
+> `--from image` 只跑最后两段，10 分钟。
 
 ### 19.7 写盘、首启与 eMMC 安装
 
