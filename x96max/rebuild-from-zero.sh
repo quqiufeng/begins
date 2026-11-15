@@ -1,74 +1,87 @@
 #!/usr/bin/env bash
-# rebuild-from-zero.sh — 从 0 重跑 X96max.md §19.3→§19.6
-#   .config 编译 7.2.12-x96 内核 → initrd/uInitrd → boot/dtb/modules/header 四包 → 可刷镜像
+# rebuild-from-zero.sh — 从 0 重跑 X96max.md §19.3→§19.6（两套：full 完整树 / trim 裁剪版）
+#   编译内核 → initrd/uInitrd → boot/dtb/modules/header 四包 → 可刷镜像
 #
 # 用法：
-#   ./x96max/rebuild-from-zero.sh              # 全流程（先清空旧产物）
-#   ./x96max/rebuild-from-zero.sh --from initrd # 跳过内核，复用 kbuild-*/Image
-#   ./x96max/rebuild-from-zero.sh --from pkgs   # 只重打四包
-#   ./x96max/rebuild-from-zero.sh --from image  # 只重做镜像（复用四包）
-#   ./x96max/rebuild-from-zero.sh --no-clean    # 不清旧产物
+#   ./x96max/rebuild-from-zero.sh                # 全量套（默认，先清空全量套旧产物）
+#   ./x96max/rebuild-from-zero.sh --trim         # 裁剪套（src-clean + kbuild-trim + 7.2.12-x96-trim）
+#   ./x96max/rebuild-from-zero.sh --mode trim    # 同上
+#   ./x96max/rebuild-from-zero.sh --from initrd   # 跳过内核，复用 kbuild-*/Image
+#   ./x96max/rebuild-from-zero.sh --from pkgs     # 只重打四包
+#   ./x96max/rebuild-from-zero.sh --from image    # 只重做镜像（复用四包）
+#   ./x96max/rebuild-from-zero.sh --no-clean      # 不清旧产物
+#   两套的固定入口：./x96max/full/rebuild-from-zero.sh、./x96max/trim/rebuild-from-zero.sh
 #
-# 路径全部可覆盖：X96_BUILD_ROOT(默认 /x96-build) / X96_KSRC / X96_KNAME
-# 日志落 $X96_BUILD_ROOT/logs/from0-<ts>/，每步一个文件。
+# 两套参数全部由 lib/mode.sh 给出，互不覆盖：
+#   MODE  CFG(=x96max/kernel/config-7.2.12-x96-<MODE>)  KSRC        OUT           KNAME              PKGS
+#   full  config-7.2.12-x96-full                          src-full    kbuild-7.2.12 7.2.12-x96        pkgs/full
+#   trim  config-7.2.12-x96-trim                          src-clean   kbuild-trim   7.2.12-x96-trim   pkgs/trim
+# 成品：recovery/x96-full-autoinstall.img.gz / recovery/x96-trim-autoinstall.img.gz
+# 路径可覆盖：X96_BUILD_ROOT(默认 /x96-build) / X96_KSRC / X96_KOUT / X96_KNAME / X96_CFG / X96_CFG_MODE
+# 日志落 $X96_BUILD_ROOT/logs/from0-<MODE>-<ts>/，每步一个文件。
 # 需要：aarch64-linux-gnu-gcc、qemu-aarch64-static、mkimage、sudo（loop 挂载 base 镜像）
 set -euo pipefail
 
 SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO=$(dirname "$SELF_DIR")                       # kernel 仓库根
-ROOT=${X96_BUILD_ROOT:-/x96-build}
-KSRC=${X96_KSRC:-$ROOT/src-linux}                 # 裁剪树（/opt/linux/src/linux-7.2.12 已删除，只剩 tar.xz）
-KNAME=${X96_KNAME:-7.2.12-x96}
-OUT=${X96_KOUT:-$ROOT/kbuild-${KNAME%-x96}}   # 可指向别的产物树，如全量树 kbuild-clean
-K=$ROOT/amlogic-s9xxx-armbian/build-armbian/kernel/stable/${KNAME%-x96}
-BASE=${X96_BASE_IMAGE:-$ROOT/amlogic-s9xxx-armbian/build/output/images/Armbian_26.11.0-trunk_trixie_arm64_6.18.60.img}
-CFG=$SELF_DIR/kernel/config-$KNAME
+source "$SELF_DIR/lib/mode.sh"
 
+M=${X96_CFG_MODE:-full}
 FROM=clean; CLEAN=1
 while [[ $# -gt 0 ]]; do
   case $1 in
     --from) FROM=$2; CLEAN=0; shift 2 ;;
     --no-clean) CLEAN=0; shift ;;
-    -h|--help) sed -n '2,16p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --clean-src) export X96_CLEAN_SRC=1; shift ;;   # 编完删掉按需解压的全量树
+    --full) M=full; shift ;;
+    --trim) M=trim; shift ;;
+    --mode) M=${2:?--mode 需要 full|trim}; shift 2 ;;
+    --mode=*) M=${1#*=}; shift ;;
+    -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "未知参数: $1（--help 看用法）" >&2; exit 2 ;;
   esac
 done
+
+x96_mode "$M" || exit 2
+BASE=${X96_BASE_IMAGE:-$ROOT/amlogic-s9xxx-armbian/build/output/images/Armbian_26.11.0-trunk_trixie_arm64_6.18.60.img}
 case $FROM in clean|kernel|initrd|pkgs|image) ;; *) echo "--from 只能是 clean|kernel|initrd|pkgs|image" >&2; exit 2 ;; esac
 
 step() { printf '=== [%s] %s ===\n' "$(date +%H:%M:%S)" "$*"; }
 run_stage() { case $FROM in clean) return 0;; kernel) [[ $1 == kernel ]];; initrd) [[ $1 == initrd ]];;
   pkgs) [[ $1 == pkgs ]];; image) [[ $1 == image ]];; esac; }
 
-for v in CFG BASE; do [[ -e ${!v} ]] || { echo "缺文件: $v=${!v}" >&2; exit 1; }; done
-[[ -d $KSRC ]] || { echo "缺内核源码树: $KSRC" >&2; exit 1; }
+for v in CFG BASE; do [[ -e ${!v} ]] || { echo "缺: $v=${!v}" >&2; exit 1; }; done
+# 源码树：full 缺席就现解压（不要求常驻）；trim 的 src-clean 必须有
+x96_ensure_src || exit 1
+mkdir -p "$OUT" "$ROOT/logs" "$(dirname "$IMG")"
 for t in aarch64-linux-gnu-gcc qemu-aarch64-static mkimage zstd; do
   command -v $t >/dev/null || { echo "缺工具: $t" >&2; exit 1; }
 done
 
-LOG=$ROOT/logs/from0-$(date +%m%d-%H%M)
+LOG=$ROOT/logs/from0-$MODE-$(date +%m%d-%H%M)
 mkdir -p "$LOG"
 echo "LOG=$LOG"
-echo "ROOT=$ROOT  KSRC=$KSRC  KNAME=$KNAME  FROM=$FROM  CLEAN=$CLEAN"
+x96_mode_show
+echo "FROM=$FROM  CLEAN=$CLEAN  INITRD=$INITRD  IMG_GZ=$IMG_GZ"
 
-# ---------------- 0. 清空旧产物 ----------------
+# ---------------- 0. 清空旧产物（只清本套） ----------------
 if [[ $CLEAN == 1 ]]; then
   step "0 clean"
   {
-    du -sh "$OUT" "$ROOT/pkgs" "$K" "$ROOT/armbian-build/cache/rootfs" 2>/dev/null || true
-    rm -rf "$OUT" "$ROOT/pkgs"
-    rm -f "$K"/*.tar.gz "$K"/sha256sums; rm -rf "$K"/*/
-    rm -f "$ROOT/initrd.img-$KNAME" "$ROOT/uInitrd-$KNAME"
+    du -sh "$OUT" "$PKGS" "$ROOT/armbian-build/cache/rootfs" 2>/dev/null || true
+    rm -rf "$OUT" "$PKGS"
+    rm -f "$INITRD" "$UINITRD"
+    rm -f "$KERNDIR"/*.tar.gz "$KERNDIR"/sha256sums 2>/dev/null || true
     # 源码 rootfs 缓存由 root 拥有，删掉才会真重建
     sudo rm -f "$ROOT"/armbian-build/cache/rootfs/rootfs-arm64-trixie-minimal_*.tar.zst || true
     # ophub 上一轮的 s905x2 成品（不动 6.18.60 基础镜像）
     rm -f "$ROOT"/amlogic-s9xxx-armbian/build/output/images/Armbian_26.11.0_amlogic_s905x2_*
-    echo "清理后:"; ls -la "$K" 2>/dev/null
+    echo "清理后:"; ls -la "$PKGS" 2>/dev/null
   } >"$LOG/0-clean.log" 2>&1
 fi
 
 # ---------------- 19.3 编译内核 ----------------
 if run_stage kernel; then
-  step "19.3 kernel"
+  step "19.3 kernel ($MODE)"
   mkdir -p "$OUT"
   cp "$CFG" "$OUT/.config"
   (
@@ -86,7 +99,7 @@ fi
 
 # ---------------- 19.4 initrd / uInitrd ----------------
 if run_stage initrd; then
-  step "19.4 initrd"
+  step "19.4 initrd ($MODE)"
   {
     LOOP=$(sudo losetup -Pf --show "$BASE")
     echo "LOOP=$LOOP"
@@ -125,65 +138,21 @@ if run_stage initrd; then
   } >"$LOG/19.4.log" 2>&1
 fi
 
-# ---------------- 19.5 四个内核包 ----------------
+# ---------------- 19.5 四个内核包（本套包仓） ----------------
 if run_stage pkgs; then
-  step "19.5 packages"
+  step "19.5 packages ($MODE)"
   {
-    mkdir -p "$K"/{boot,dtb,modules,header}
-    cp "$OUT/.config"                   "$K/boot/config-$KNAME"
-    cp "$OUT/System.map"                "$K/boot/System.map-$KNAME"
-    cp "$OUT/arch/arm64/boot/Image"     "$K/boot/vmlinuz-$KNAME"
-    cp "$ROOT/initrd.img-$KNAME"        "$K/boot/initrd.img-$KNAME"
-    cp "$ROOT/uInitrd-$KNAME"           "$K/boot/uInitrd-$KNAME"
-    tar -czf "$K/boot-$KNAME.tar.gz" -C "$K/boot" .
-
-    cp "$OUT/arch/arm64/boot/dts/amlogic/meson-g12a-x96-max.dtb" "$K/dtb/"
-    tar -czf "$K/dtb-amlogic-$KNAME.tar.gz" -C "$K/dtb" .
-
-    tar -czf "$K/modules-$KNAME.tar.gz" -C "$OUT/modules/lib/modules" "$KNAME"
-
-    H=$K/header; rm -rf "$H"; mkdir -p "$H"
-    (
-      cd "$KSRC"
-      head_list=$(mktemp); obj_list=$(mktemp)
-      {
-        find . arch/arm64 -maxdepth 1 -name 'Makefile*'
-        find include scripts -type f -o -type l
-        find arch/arm64 -name Kbuild.platforms -o -name Platform
-        find $(find arch/arm64 -name include -o -name scripts -type d) -type f
-      } >"$head_list"
-      {
-        grep -q '^CONFIG_OBJTOOL=y' "$OUT/include/config/auto.conf" 2>/dev/null && echo tools/objtool/objtool
-        find arch/arm64/include include scripts -type f
-        [[ -f Module.symvers ]] && echo Module.symvers
-        grep -q '^CONFIG_GCC_PLUGINS=y' "$OUT/include/config/auto.conf" 2>/dev/null && find scripts/gcc-plugins -name '*.so'
-        true
-      } >"$obj_list"
-      tar --exclude '*.orig' -cf - -T "$head_list" | tar -xf - -C "$H"
-      tar --exclude '*.orig' -cf - -T "$obj_list"  | tar -xf - -C "$H"
-      rm -f "$head_list" "$obj_list"
-    )
-    mkdir -p "$H/include" "$H/arch/arm64/include" "$H/scripts"
-    cp -a "$OUT/include/."            "$H/include/"
-    cp -a "$OUT/arch/arm64/include/." "$H/arch/arm64/include/"
-    cp -a "$OUT/scripts/."            "$H/scripts/"
-    cp -a "$OUT/.config" "$OUT/Module.symvers" "$H/"
-    tar -czf "$K/header-$KNAME.tar.gz" -C "$H" .
-
-    rm -rf "$H"
-    (cd "$K" && sha256sum *.tar.gz > sha256sums)
-    mkdir -p "$ROOT/pkgs"; cp "$K"/*.tar.gz "$K"/sha256sums "$ROOT/pkgs/"
-    ls -lh "$K"; cat "$K/sha256sums"
+    X96_BUILD_ROOT="$ROOT" X96_CFG_MODE="$MODE" "$SELF_DIR/pack-kernel.sh" --mode "$MODE" --force
   } >"$LOG/19.5.log" 2>&1
 fi
 
 # ---------------- 19.6 可刷镜像 ----------------
 if run_stage image; then
-  step "19.6 image"
-  X96_BUILD_ROOT="$ROOT" X96_BASE_IMAGE="$BASE" "$SELF_DIR/build-image.sh" >"$LOG/19.6.log" 2>&1
+  step "19.6 image ($MODE)"
+  X96_BUILD_ROOT="$ROOT" X96_BASE_IMAGE="$BASE" \
+    "$SELF_DIR/build-image.sh" --mode "$MODE" >"$LOG/19.6.log" 2>&1
 fi
 
 step "done"
-IMG=$ROOT/recovery/x96src-autoinstall.img.gz
-if [[ -f $IMG ]]; then ls -lh "$IMG" | tee "$LOG/done.log"; sha256sum "$IMG" | tee -a "$LOG/done.log"
-else echo "（本次未跑 image 阶段，无 $IMG）" | tee "$LOG/done.log"; fi
+if [[ -f $IMG_GZ ]]; then ls -lh "$IMG_GZ" | tee "$LOG/done.log"; sha256sum "$IMG_GZ" | tee -a "$LOG/done.log"
+else echo "（本次未跑 image 阶段，无 $IMG_GZ）" | tee "$LOG/done.log"; fi

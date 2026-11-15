@@ -20,7 +20,8 @@ def restore_list():
         ln = ln.split('#')[0].strip()
         if ln: out.append(ln.rstrip('/'))
     return out
-cfg = T.config_path(tree, '/x96-build/config-x96-20261115')
+cfg = T.config_path(tree, os.environ.get('KCONFIG') or os.path.join(
+    HERE, '..', '..', 'x96max', 'kernel', 'config-7.2.12-x96-full'))   # 仓库入口 -full 配置
 apply_ = '--apply' in sys.argv
 
 todo, skip = T.plan(tree, cfg, rules)

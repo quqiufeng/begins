@@ -2,7 +2,9 @@
 # x96max/kernel/gen-trim2.sh —— 第二轮（真正的硬件裁剪，2026-11-15）
 #
 # 与 gen-trim.sh（第一轮，只砍 =m 的一部分）的区别：
-#   1. 基线必须是【全量源码树】的配置（/x96-build/kbuild-clean/.config），
+#   1. 基线必须是【全量源码树】的配置（已归档为
+#      configs/config-7.2.12-fulltree-baseline-20261115，257801 B；
+#      原 /x96-build/kbuild-clean 构建树 2026-11-15 已删除，只留这份 .config），
 #      避免 §5.7 那种"Kconfig 悬空 → 符号静默消失"的假裁剪。
 #   2. 规则 A：除了白名单，全部 =m 一律关掉（板子上要的东西全是 =y，模块只需要
 #      WiFi/BT/音频/GPU/视频硬解/串口/网络扩展这几类）。
@@ -10,7 +12,7 @@
 #      SCSI 低层、virtio、KVM、其它文件系统），不动任何 MESON 驱动。
 #
 # 用法：
-#   BASE=/x96-build/kbuild-clean/.config ./x96max/kernel/gen-trim2.sh
+#   ./x96max/kernel/gen-trim2.sh        # 默认基线见下
 #   # 输出 /x96-build/trim2-$(date +%Y%m%d).fragment
 # 应用：
 #   cp $BASE /x96-build/kbuild-trim/.config
@@ -18,7 +20,10 @@
 #   make -C /x96-build/src-clean O=/x96-build/kbuild-trim ARCH=arm64 \
 #        CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 set -u
-BASE=${BASE:-/x96-build/kbuild-clean/.config}
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+BASE=${BASE:-$REPO/configs/config-7.2.12-fulltree-baseline-20261115}
+# 兜底：全量构建树若还在，仍优先用它的 .config（与归档同源）
+[[ -f /x96-build/kbuild-clean/.config && -z ${BASE_FORCE:-} ]] && BASE=/x96-build/kbuild-clean/.config
 OUT=${OUT:-/x96-build/trim2-$(date +%Y%m%d-%H%M).fragment}
 [ -f "$BASE" ] || { echo "缺基线配置: $BASE" >&2; exit 2; }
 

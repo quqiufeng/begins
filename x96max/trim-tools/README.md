@@ -17,7 +17,7 @@
 | `KTREE_ORIG` | `/opt/linux/src/linux-7.2.12` | 补回切片的来源（`--apply` 只从这里读，不写） |
 | `RESTORE` | 本目录 `restore.txt` | `--apply` 之后要拷回的切片清单，一行一个目录（见坑 4） |
 | `RULES` | 本目录 `rules.txt` | `KILL <目录前缀>` / `FORCEKILL <目录前缀>`（跳过 `judge()` 直接删，只给「目标架构固定、编译日志里 0 命中」的目录）/ `PROTECT <目录>`（注意没有 `KEEP`，`read_rules()` 只认这三个） |
-| `KCONFIG` | `<tree>/.config` → `/x96-build/config-x96-20261115` | 本机是 out-of-tree 构建，`src-linux` 里没有 `.config`，自动回退 |
+| `KCONFIG` | `<tree>/.config` → `x96max/kernel/config-7.2.12-x96-full` | 本机是 out-of-tree 构建，`src-linux` 里没有 `.config`，自动回退 |
 | `SYM2KC` | `/tmp/sym2kc.tsv` | Kconfig 符号表，缺失时 `trimlib.sym2kc()` 自己扫树重建（`sym2kc.py` 只是它的命令行壳） |
 
 ## 用法（顺序）
@@ -83,7 +83,7 @@ grep -c 'undefined reference' 编译日志                                      
 | 第一轮（判据收敛） | 1.8G/94777 → **821M / 69673（45%）** | rc=0，**526 s (8m46s)** | `logs/timed-0058.log` |
 | 第二轮（删非 arm64 架构 + `Documentation`） | → **545M / 37911（27%）** | rc=0，**495 s (8m15s)** | `logs/timed-clean-0815.log` |
 
-config 是 `config-x96-20261115`；`Image` 35.8 MB / `Image.gz` 13.3 MB / `vmlinux` 44.9 MB。
+config 是 `config-7.2.12-x96-full`（当时副本名 `config-x96-20261115`）；`Image` 35.8 MB / `Image.gz` 13.3 MB / `vmlinux` 44.9 MB。
 **两轮都只验证了「能编」，Image 尚未在盒子启动过。**
 
 第二轮用 `FORCEKILL` 删掉 20 个非 arm64 架构目录（证据：`timed-0058.log` 里 `arch/*` 只有 `arch/arm64`

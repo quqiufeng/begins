@@ -2,51 +2,78 @@
 # preflight.sh — 从零重建前的只读自检（X96max.md §0.2 第 0 步）
 # 只检查前置，不改任何文件；任何一项 FAIL 就不要往下走。
 #
-#   ./x96max/preflight.sh
+#   ./x96max/preflight.sh             # 查全量套（config-7.2.12-x96-full + src-full 按需解压）
+#   ./x96max/preflight.sh --trim      # 查裁剪套（config-7.2.12-x96-trim + src-clean）
+#   ./x96max/full/preflight.sh        # 两套固定入口
+#   ./x96max/trim/preflight.sh
 #   X96_BUILD_ROOT=/other ./x96max/preflight.sh
+#   X96_CFG_MODE=trim ./x96max/preflight.sh    # 等价于 --trim
 #
 # 退出码：0=全过；1=有 FAIL（逐条打印）
 set -uo pipefail
 
 SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO=$(dirname "$SELF_DIR")
-ROOT=${X96_BUILD_ROOT:-/x96-build}
-S=$ROOT/src-linux
-KNAME=${X96_KNAME:-7.2.12-x96}
-CFG=$SELF_DIR/kernel/config-$KNAME
-CFG2=$REPO/configs/config-$KNAME-20261115
-SRC_XZ=/opt/linux/src/linux-7.2.12.tar.xz
+source "$SELF_DIR/lib/mode.sh"
+
+M=${X96_CFG_MODE:-full}
+for a in "$@"; do case $a in --trim) M=trim ;; --full) M=full ;; --mode=*) M=${a#*=} ;; esac; done
+x96_mode "$M" || exit 2
+S=$KSRC
+CFG2=$CFG_ARCHIVE
+SRC_XZ=/opt/linux/src/linux-$KV.tar.xz
 
 P=0; F=0
 ck() { if eval "$2" >/dev/null 2>&1; then printf '  ok   %s\n' "$1"; P=$((P+1));
        else printf '  FAIL %s\n' "$1"; F=$((F+1)); fi; }
 
-echo "== preflight: ROOT=$ROOT KNAME=$KNAME =="
+echo "== preflight: MODE=$MODE KNAME=$KNAME ROOT=$ROOT =="
+x96_mode_show | sed 's/^/   /'
 
-# --- 源码树（裁剪树，含 §5.4 的 usb-storage 修复）---
-ck "源码树 $S 存在"                 "test -d $S"
-ck "drivers/usb/storage 目录"       "test -d $S/drivers/usb/storage"
-ck "Kconfig 钩子 source storage"    "grep -q 'storage/Kconfig' $S/drivers/usb/Kconfig"
-ck "Makefile 钩子 obj USB_STORAGE"  "grep -q 'CONFIG_USB_STORAGE.*storage/' $S/drivers/usb/Makefile"
+# --- 源码树 ---
+# full：树不是必备资产，缺了 x96_ensure_src 会从源码包现解压（约 9s / 1.8G），
+#       所以这里只要求「包在」，树在场时才做内容抽检。
+# trim：src-clean 是「解压+裁剪」的产物，解压还原不出来 → 必须存在。
+ck "源码包 $SRC_XZ"                 "test -f $SRC_XZ"
+if [[ -f $S/Makefile ]]; then
+  ck "源码树 $S 已就绪"             "test -d $S"
+  ck "drivers/usb/storage 目录"     "test -d $S/drivers/usb/storage"
+  ck "Kconfig 钩子 source storage"  "grep -q 'storage/Kconfig' $S/drivers/usb/Kconfig"
+  ck "Makefile 钩子 obj USB_STORAGE" "grep -q 'CONFIG_USB_STORAGE.*storage/' $S/drivers/usb/Makefile"
+  [[ $MODE == full && -f $S/.x96-extracted ]] && echo "  note $S 是解压缓存（可删，编前会再现解压）"
+else
+  if [[ $MODE == full ]]; then
+    echo "  ok   源码树 $S 缺席 → 开跑时从源码包现解压"
+  else
+    ck "裁剪源码树 $S 存在"         "test -d $S"
+  fi
+fi
+if [[ $MODE == trim ]]; then
+  ck "裁剪痕迹（trim-tools 标记）"   "test -f $S/.trimmed || test -f $ROOT/trim-tools/disable.list"
+fi
 
-# --- 配置（唯一入口：x96max/kernel/config-*）---
+# --- 配置（唯一入口：x96max/kernel/config-$KV-x96-$MODE）---
 ck "配置存在 $CFG"                  "test -f $CFG"
+LV=$(printf 'CONFIG_LOCALVERSION="-%s"' "${KNAME#$KV-}")
+ck "CONFIG_LOCALVERSION=$LV 对得上 KNAME=$KNAME" "grep -qxF '$LV' '$CFG'"
 ck "CONFIG_USB_STORAGE=y"           "grep -qx CONFIG_USB_STORAGE=y $CFG"
 ck "FAT/MSDOS/VFAT 三连 =y"         "[ \$(grep -cE '^CONFIG_(FAT_FS|MSDOS_FS|VFAT_FS)=y' $CFG) = 3 ]"
+ck "归档存在 $CFG2"                 "test -f $CFG2"
 ck "两份配置同源（diff -q）"        "diff -q $CFG $CFG2"
 
 # --- 素材与工具链 ---
-ck "完整源码包 $SRC_XZ"             "test -f $SRC_XZ"
 for t in aarch64-linux-gnu-gcc qemu-aarch64-static mkimage zstd sudo; do
   ck "工具 $t"                      "command -v $t"
 done
 
 # --- 脚本可执行 ---
-for s in rebuild-from-zero.sh pack-kernel.sh write-card.sh patch-bootargs.sh; do
-  ck "可执行 $s"                    "test -x $SELF_DIR/$s"
+for s in rebuild-from-zero.sh pack-kernel.sh write-card.sh patch-bootargs.sh lib/mode.sh; do
+  ck "存在 $s"                      "test -f $SELF_DIR/$s"
+done
+for s in preflight build-kernel pack-kernel rebuild-from-zero build-image; do
+  ck "两套入口 $s.sh（full/trim）" "test -f $SELF_DIR/full/$s.sh && test -f $SELF_DIR/trim/$s.sh"
 done
 ck "patch-bootargs 支持 --usb-fix"  "grep -q -- '--usb-fix' $SELF_DIR/patch-bootargs.sh"
 
 echo "== 通过 $P / 失败 $F =="
 [[ $F -eq 0 ]] || { echo "有 FAIL：先修前置，别开始重建（见 X96max.md §0.2）" >&2; exit 1; }
-echo "前置全绿，可开始：./x96max/rebuild-from-zero.sh"
+echo "前置全绿，可开始：./x96max/$MODE/rebuild-from-zero.sh"

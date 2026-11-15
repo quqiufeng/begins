@@ -7,7 +7,8 @@ import trimlib as T
 HERE = os.path.dirname(os.path.realpath(__file__))
 tree = os.environ.get('KTREE', '/x96-build/src-linux')
 rules = os.environ.get('RULES', os.path.join(HERE, 'rules.txt'))
-cfg = T.config_path(tree, '/x96-build/config-x96-20261115')
+cfg = T.config_path(tree, os.environ.get('KCONFIG') or os.path.join(
+    HERE, '..', '..', 'x96max', 'kernel', 'config-7.2.12-x96-full'))   # 仓库入口 -full 配置
 
 kill, keep = [], set()
 for ln in open(rules, encoding='utf-8'):

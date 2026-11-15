@@ -2,9 +2,16 @@
 # Reproducible X96 Max (S905X2) source-built image with first-boot auto-install.
 #
 # Usage:
-#   x96max/build-image.sh                 # rebuild rootfs + image
+#   x96max/build-image.sh                 # rebuild rootfs + image（默认 full 全量内核套）
+#   x96max/build-image.sh --trim           # 用裁剪内核套（7.2.12-x96-trim）出镜像
 #   x96max/build-image.sh --skip-rootfs   # reuse newest rootfs artifact
 #   x96max/build-image.sh --skip-rootfs --write /dev/sdX
+#
+# 两套固定入口：x96max/full/build-image.sh、x96max/trim/build-image.sh
+# 内核四件套来自本套包仓 pkgs/<mode>/（先用 x96max/<mode>/pack-kernel.sh 打好），
+# 出镜像前会同步进 ophub 的 kernel/stable/<ver>（同一时刻只放一套）：
+#   full → pkgs/full（*-7.2.12-x96.tar.gz）      trim → pkgs/trim（*-7.2.12-x96-trim.tar.gz）
+# 成品：recovery/x96-full-autoinstall.img.gz / recovery/x96-trim-autoinstall.img.gz
 #
 # Environment:
 #   X96_BUILD_ROOT       build workspace (default: /x96-build)
@@ -21,11 +28,29 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-ROOT=${X96_BUILD_ROOT:-/x96-build}
+source "$SCRIPT_DIR/lib/mode.sh"
+
+M=${X96_CFG_MODE:-full}
+SKIP_ROOTFS=no
+WRITE_DEV=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --skip-rootfs) SKIP_ROOTFS=yes ;;
+    --write) WRITE_DEV=${2:?missing device}; shift ;;
+    --trim|-t) M=trim ;;
+    --full) M=full ;;
+    --mode) M=${2:?--mode 需要 full|trim}; shift ;;
+    --mode=*) M=${1#*=} ;;
+    *) echo "usage: $0 [--mode full|trim] [--skip-rootfs] [--write /dev/sdX]"; exit 1 ;;
+  esac
+  shift
+done
+x96_mode "$M" || exit 2
+
+ROOT=$ROOT
 ARMBIAN=$ROOT/armbian-build
 OPHUB=$ROOT/amlogic-s9xxx-armbian
-KERNEL=7.2.12
-KNAME=${KERNEL}-x96
+KERNEL=$KV
 BOARD=s905x2
 BASE=${X96_BASE_IMAGE:-$OPHUB/build/output/images/Armbian_26.11.0-trunk_trixie_arm64_6.18.60.img}
 BOOTBAK=$ROOT/base-boot-backup
@@ -34,17 +59,6 @@ UNIT=$SCRIPT_DIR/x96-autoinstall.service
 ROOT_PASSWORD=${X96_ROOT_PASSWORD-x96max}
 ROOT_SSH_KEY=${X96_ROOT_SSH_KEY:-$HOME/.ssh/id_ed25519.pub}
 OUT=$ROOT/recovery
-
-SKIP_ROOTFS=no
-WRITE_DEV=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --skip-rootfs) SKIP_ROOTFS=yes ;;
-    --write) WRITE_DEV=${2:?missing device}; shift ;;
-    *) echo "usage: $0 [--skip-rootfs] [--write /dev/sdX]"; exit 1 ;;
-  esac
-  shift
-done
 
 mkdir -p "$OUT" "$BOOTBAK"
 
@@ -56,14 +70,16 @@ sudo -n true 2>/dev/null || { echo "passwordless sudo is required"; exit 1; }
 [[ -f "$AUTO" && -f "$UNIT" ]] || { echo "missing auto-install files next to this script"; exit 1; }
 [[ -f "$SCRIPT_DIR/config-x96-source.conf" ]] || { echo "missing config-x96-source.conf"; exit 1; }
 
-K=$OPHUB/build-armbian/kernel/stable/$KERNEL
+echo "MODE=$MODE KNAME=$KNAME PKGS=$PKGS→$KERNDIR"
 for p in boot dtb-amlogic modules header; do
-  [[ -f "$K/${p}-${KNAME}.tar.gz" ]] || {
-    echo "missing kernel package: $K/${p}-${KNAME}.tar.gz"
-    echo "run the kernel compile/package steps first"
+  [[ -f "$PKGS/${p}-${KNAME}.tar.gz" ]] || {
+    echo "missing kernel package: $PKGS/${p}-${KNAME}.tar.gz"
+    echo "run the kernel compile/package steps first: x96max/$MODE/pack-kernel.sh"
     exit 1
   }
 done
+# ophub 的 -k 只认版本号，两套包共用 kernel/stable/<ver>：先清空再放本套
+x96_stage_pkgs
 
 if [[ "$SKIP_ROOTFS" == no ]]; then
   install -m 644 "$SCRIPT_DIR/config-x96-source.conf" "$ARMBIAN/userpatches/config-x96-source.conf"
@@ -213,7 +229,7 @@ sudo losetup -d "$LOOP"
 GZ=$(ls -1t "$OPHUB"/build/output/images/Armbian_*_${BOARD}_*_${KERNEL}_server_*.img.gz 2>/dev/null | head -1 || true)
 [[ -n "$GZ" ]] || { echo "rebuild produced no image"; exit 1; }
 echo "REBUILT=$GZ"
-RAW=$OUT/x96src-autoinstall.img
+RAW=$IMG
 gzip -dc "$GZ" > "$RAW"
 
 # 6) Prune firmware/docs/headers in the final image; keep installer tools.

@@ -15,18 +15,24 @@
 #   X96_BUILD_ROOT  构建目录（默认 /x96-build）
 set -euo pipefail
 
-ROOT=${X96_BUILD_ROOT:-/x96-build}
-KNAME=${X96_KNAME:-7.2.12-x96}
-KV=${KNAME%-x96}
+SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$SELF_DIR/lib/mode.sh"
+M=${X96_CFG_MODE:-full}
 ASSUME_YES=0
 DRY_RUN=0
 ARGS=()
 for a in "$@"; do case "$a" in
   -y|--yes)   ASSUME_YES=1 ;;
   -n|--dry-run) DRY_RUN=1 ;;
+  --trim|-t)  M=trim ;;
+  --full)     M=full ;;
+  --mode)     M=${2:?--mode 需要 full|trim}; shift ;;
+  --mode=*)   M=${a#*=} ;;
   *)          ARGS+=("$a") ;;
 esac; done
-NEW=${ARGS[0]:-${X96_KOUT:-$ROOT/kbuild-$KV}/arch/arm64/boot/Image}
+x96_mode "$M" || exit 2
+echo "MODE=$MODE KNAME=$KNAME OUT=$OUT"
+NEW=${ARGS[0]:-$OUT/arch/arm64/boot/Image}
 ROOT_UUID=${X96_ROOT_UUID:-}
 ROOT_LABEL=${X96_ROOT_LABEL:-ROOTFS}
 

@@ -8,8 +8,8 @@
 > 状态：**已成功从 eMMC 启动裁剪后的源码系统**（155 包，rootfs ~568M；主线 U-Boot）。
 > 无线策略（2026-11 更新）：**目标是保留 Wi-Fi/蓝牙驱动与固件**（RTL8822BS → `rtw88_8822bs` + `btrtl`），内核里不再 `-d` 关闭；有线 RTL8211F 仍是主用网络。
 > ⚠️ **当前构建尚未达成**：裁剪树里 `net/wireless`、`net/mac80211`、`drivers/net/wireless/` 已整目录删除，配置里也没有 `RTW88*`，所以 7.2.12-x96 的内核**没有 Wi-Fi 驱动**（蓝牙源码 48 项还在，但 `CONFIG_BT*` 未开）。补法见 §0.3。
-> 仓库脚本：**本仓库 `x96max/`**（`build-image.sh` 一键镜像、`write-card.sh` 安全写卡 + 校验、`config-x96-source.conf` rootfs 配置、`x96-autoinstall.*` 首启自动安装、`x96max/kernel/config-7.2.12-x96` 最终内核配置、`mkbase.sh` 自造 rebuild 基础镜像）。
-> 📌 **最新（2026-11-15 17:08）**：裁掉目录会连带删掉 `Kconfig` → 符号静默消失。同配置下裁剪树比全量树少 **1789 个符号**（含 genpd/`HW_PERF_EVENTS`/`USB_GADGET`），`Image` 35.9→42.2MB。全量树已编好（`/x96-build/kbuild-clean`），尚未打包上机。详见 **§5.7**。
+> 仓库脚本：**本仓库 `x96max/`**（`build-image.sh` 一键镜像、`write-card.sh` 安全写卡 + 校验、`config-x96-source.conf` rootfs 配置、`x96-autoinstall.*` 首启自动安装、`x96max/kernel/config-7.2.12-x96-full` 最终内核配置、`mkbase.sh` 自造 rebuild 基础镜像）。
+> 📌 **最新（2026-11-15 17:08）**：裁掉目录会连带删掉 `Kconfig` → 符号静默消失。同配置下裁剪树比全量树少 **1789 个符号**（含 genpd/`HW_PERF_EVENTS`/`USB_GADGET`），`Image` 35.9→42.2MB。全量树已编好（`/x96-build/kbuild-clean`，**2026-11-15 19:12 已连同目录删除**，只保留其 `.config` → `configs/config-7.2.12-fulltree-baseline-20261115`，257801 B / sha1 `63ae9299`），尚未打包上机。详见 **§5.7**。
 > 📌 **新系统第一件事是校时（2026-11-15 17:55）**：镜像里**没有装任何 NTP 客户端**（`timesyncd`/`chrony`/`ntp` 全无），盒子 RTC 走偏后 `apt-get update` 会以 `is not signed` / `Not live until …` 报错，看着像源坏了其实是时钟错了。装 `systemd-timesyncd` + 国内 NTP 后全绿。详见 **§20**。
 
 ---
@@ -22,16 +22,33 @@
 
 | 项 | 路径 |
 |---|---|
-| 裁剪源码树 | `/x96-build/src-linux`（7.2.12，549M） |
-| 内核 `O=` 输出 | `/x96-build/kbuild-7.2.12` |
-| 内核配置 | `/home/quqiufeng/kernel/x96max/kernel/config-7.2.12-x96`（`LOCALVERSION=-x96`，**必须含 FAT**；与 `configs/config-7.2.12-x96-20261115` 逐字节相同） |
+| 源码树 | 全量套 `/x96-build/src-clean`（1.8G，未裁剪，必须留）；另有 `src-full`（**按需解压，可删**，见 §21.5） |
+| 内核 `O=` 输出 | `/x96-build/kbuild-trim`（现役；旧的 `kbuild-7.2.12` 2026-11-15 19:15 已删） |
+| 内核配置 | `/home/quqiufeng/kernel/x96max/kernel/config-7.2.12-x96-full`（`LOCALVERSION=-x96`，**必须含 FAT**；与 `configs/config-7.2.12-x96-full-20261115` 逐字节相同） |
 | 脚本 | `/home/quqiufeng/kernel/x96max/*.sh` |
 | 目标产物 | 可刷 `img.gz`（ophub 布局，首启自动装 eMMC） |
+
+**命名约定（2026-11-15 19:00）**：内核配置名里 `-full` = 全量未裁剪，`-trim` = 硬件裁剪版；
+`configs/` 归档同名再加日期。设备/包里的 `boot/config-7.2.12-x96` 是**产物名**（与 `vmlinuz-7.2.12-x96` 同名，
+因 `LOCALVERSION=-x96`），不带 `-full/-trim`，别跟着改。
+
+**两份配置别混用（2026-11-15 18:40 定稿）**：
+
+| 文件 | sha256 | 行 / `=y` / `=m` | 对应内核 |
+|---|---|---|---|
+| `configs/config-7.2.12-x96-full-20261115` = `x96max/kernel/config-7.2.12-x96-full` | `e137d0d5…08c94` | 6706 / 2506 / 1 | **裁剪前**全量配置，编 `kbuild-7.2.12/Image`（35.8MB，§5） |
+| `configs/config-7.2.12-x96-trim-20261115` = `x96max/kernel/config-7.2.12-x96-trim` | `92c79a3d…5577e` | 8227 / 2069 / 153 | **当前运行内核**，编 `kbuild-trim/Image`（32.1MB），fragment 见 `configs/trim2-20261115.fragment` |
+
+判据（已实测）：`kbuild-trim/.config`、两份 trim 归档、盒子 `/proc/config.gz` 四者 sha256 **完全相同**；
+`/boot/vmlinuz-7.2.12-x96` 与 `kbuild-trim/arch/arm64/boot/Image` 同为 `69124869…8ae8f7`。
+相对全量版共关闭 **690** 个 `=y`（`ARCH_SUNXI/ROCKCHIP`、整套 `KVM`、大半 `ACPI_*`、`BINFMT_MISC` 等），
+反向新开 BPF 组（`BPF_SYSCALL/BPF_JIT`）。trim 版 `=m` 有 153 条但只落 140 个 `.ko`：差的是
+`CONFIG_IP6_NF_FILTER→ip6table_filter.ko` 这类改名，抽查 `nf_tables`/`panfrost`/`snd-soc-meson-aiu` 全在，非缺失。
 
 **进度（卡在这里）**：
 
 1. ✅ 补回被裁掉的 FAT 支持：源码 `fs/fat/` 已回，钩子 `fs/Kconfig:136`、`fs/Makefile:55` 已接，配置加 `FAT_FS/MSDOS_FS/VFAT_FS=y` + `FAT_DEFAULT_UTF8/codepage=437/iocharset=utf8`。原因：p1 是 FAT32，缺 FAT 则 `/boot` 挂不上。
-   - 合并后的配置已落到**两个权威路径**（与 `kbuild-7.2.12/.config` 逐字节相同，即编出当前 Image 的那份）：`x96max/kernel/config-7.2.12-x96`（`build-kernel.sh` / `rebuild-from-zero.sh` 的默认 CFG）和 `configs/config-7.2.12-x96-20261115`。`/x96-build/config-x96-20261115-fat` 只是同一份的临时副本，不再作为入口。
+   - 合并后的配置已落到**两个权威路径**（14:43 编写 `Image` 时与 `kbuild-7.2.12/.config` 逐字节相同；该树 `.config` 后来在 16:58 被另一轮 `olddefconfig` 改成了 `b71c4f6c…`，**归档的 `e137d0d5…` 才是编出 35.8MB Image 的那份**）：`x96max/kernel/config-7.2.12-x96-full`（`build-kernel.sh` / `rebuild-from-zero.sh` 的默认 CFG）和 `configs/config-7.2.12-x96-full-20261115`。`/x96-build/config-x96-20261115-fat` 只是同一份的临时副本，不再作为入口。
 2. ✅ 内核已编出：`/x96-build/kbuild-7.2.12/arch/arm64/boot/Image`，14:23，35.9MB；`.config` 三项 `=y`，`strings Image | grep -x vfat` 命中。
 3. ✅ **重打包四件套**：`./x96max/pack-kernel.sh` 已在 14:59 跑完，`/x96-build/pkgs/` 全是新时间戳（boot 36.9M / dtb 10.7K / header 13.4M / modules 239K + `sha256sums`）。
 4. ✅ **重出镜像**：`./x96max/rebuild-from-zero.sh --from image` 已在 15:07 出图 `/x96-build/recovery/x96src-autoinstall.img.gz`（284662631 B），时间晚于 14:58 的 `Image`，即含 FAT 的新内核。
@@ -62,6 +79,9 @@
    - **下一步（未做）**：用 `kbuild-clean/Image` 走 `pack-kernel.sh` → `--from initrd` → `--from image`，替换卡上的 35.9MB 内核，真机复验第 8 条掉盘是否与 genpd 缺失有关。
 
 ### 0.1 源码缺失时的补齐来源（唯一权威包）
+
+> ⚠️ **2026-11-15 19:15 起 `src-linux` 与 `kbuild-7.2.12` 已删除**，现在只剩 `src-clean`（全量树，1.8G）
+> 与 `kbuild-trim`（736M）。全量树**不缺任何文件**，本节「缺文件要解回来」的流程只在重建裁剪树时才用得到。
 
 裁剪树 `/x96-build/src-linux` 删过整目录，编译报「找不到某文件/某目录」时**不要手写、不要从别处抄**，一律从完整源码包解回来：
 
@@ -98,8 +118,8 @@ cp -a /tmp/linux-7.2.12/fs/fat /x96-build/src-linux/fs/
 ```bash
 cd /home/quqiufeng/kernel
 ROOT=/x96-build; OUT=$ROOT/kbuild-7.2.12
-CFG1=x96max/kernel/config-7.2.12-x96
-CFG2=configs/config-7.2.12-x96-20261115
+CFG1=x96max/kernel/config-7.2.12-x96-full
+CFG2=configs/config-7.2.12-x96-full-20261115
 K=$ROOT/amlogic-s9xxx-armbian/build-armbian/kernel/stable/7.2.12
 KNAME=7.2.12-x96
 ```
@@ -122,7 +142,7 @@ KNAME=7.2.12-x96
 
 **三个已踩过的坑（写进纪律，别再犯）**：
 
-1. **配置入口只有一个**：`rebuild-from-zero.sh` / `build-kernel.sh` 的 `CFG=$SELF_DIR/kernel/config-$KNAME`。改配置要改**这里**（并同步 `configs/`），只改 `/x96-build/*` 下的副本等于没改——本轮就因此差点用无 FAT 的配置重编。
+1. **配置入口只有一个**：`rebuild-from-zero.sh` 的 `CFG=$SELF_DIR/kernel/config-$KNAME-$MODE`、`build-kernel.sh` 的 `config-$KNAME-trim|-full`、`preflight.sh` 同款 `$MODE`（`-full` 全量未裁剪 / `-trim` 硬件裁剪）。改配置要改**这里**（并同步 `configs/`），只改 `/x96-build/*` 下的副本等于没改——本轮就因此差点用无 FAT 的配置重编。
 2. **`--from pkgs` / `--from image` 不重做内核**：它们只吃 `$OUT/Image` 和 `$K/*.tar.gz`。所以"改了配置/源码 → 必须至少 `--from kernel`（或先手工重编 + `pack-kernel.sh`）"，顺序反了就是拿旧内核再出一遍镜像。
    - 反过来：`--from pkgs` 不会重做 initrd。当前配置下所有驱动 `=y`，`modules-*` 只有 `test_bpf.ko`，所以**只改配置重编 Image 时 initrd 可复用**；哪天开了 `=m`（尤其 usb/storage、ext4、meson 相关），必须 `--from initrd` 重做，否则首启找不到根盘。
 3. **写卡 ≠ 可以启动**：`write-card.sh` 只拷镜像，**既不写 `uEnv.txt` 的 APPEND、也不改 `uInitrd`**。每次写完卡必须紧跟第 6 步（`patch-initrd-wait.sh` + `patch-bootargs.sh --usb-fix 346d:5678`），否则 `slumber=30` 撞上 USB 读卡器 `~38s` 枚举，必回退 §5.5 的竞态、卡在 initramfs。两个脚本都幂等，重复跑无副作用。
@@ -169,7 +189,7 @@ grep -E 'CONFIG_(WLAN|CFG80211|MAC80211|RTW88|BT|RFKILL)' /x96-build/kbuild-7.2.
 注意两点：
 
 - 一开 `=m` 就破坏"零模块"前提，**必须 `--from initrd` 重做 initrd**（§0.2 坑 2）。
-- 补完记得把新配置同步回 `x96max/kernel/config-7.2.12-x96` 和 `configs/config-7.2.12-x96-20261115`，否则下一轮又回到无 Wi-Fi。
+- 补完记得把新配置同步回 `x96max/kernel/config-7.2.12-x96-full` 和 `configs/config-7.2.12-x96-full-20261115`，否则下一轮又回到无 Wi-Fi。
 
 ---
 
@@ -468,8 +488,9 @@ CONFIG_RFKILL=m
 | 工作目录 | `/x96-build` |
 | ophub 仓库 | `/x96-build/amlogic-s9xxx-armbian` |
 | 内核源码（原版，只做参照） | `/opt/linux/src/linux-7.2.12.tar.xz`（完整树 2026-11-15 已删；要用先解到 `/tmp/linux-7.2.12`，见 §0.1） |
-| **内核源码（实际编译的裁剪树）** | `/x96-build/src-linux`（545M / 37911 文件，裁剪过程见 §5.3） |
-| 内核构建目录（out-of-tree） | `/x96-build/kbuild-7.2.12`（`make O=`，源码树不落产物） |
+| **内核源码（实际编译，全量树）** | `/x96-build/src-clean`（1.8G，未裁剪，`kbuild-trim/source` 指向它） |
+| 内核构建目录（out-of-tree） | `/x96-build/kbuild-trim`（736M，`Image` 32.2MB + 280 个 `.ko`） |
+| 已删除（2026-11-15 19:15） | `src-linux`（第一轮裁剪树 553M）+ `kbuild-7.2.12`（739M）；配置分别归档为 `configs/config-7.2.12-x96-trim-20261115`、`configs/config-7.2.12-x96-round1-kbuild7.2.12-20261115` |
 | 内核 4 包 | 产出 `/x96-build/pkgs/`；`rebuild` 实际读取 `.../build-armbian/kernel/stable/7.2.12/` |
 | Armbian build（源码 rootfs） | `/x96-build/armbian-build`，缓存 `cache/rootfs/rootfs-arm64-trixie-minimal_*.tar.zst` |
 | 成品镜像 | `/x96-build/recovery/x96src-autoinstall.img.gz` |
@@ -494,7 +515,7 @@ sudo apt-get install -y $(cat compile-kernel/tools/script/ubuntu2404-build-armbi
 
 ### 5.1 源码与配置
 
-> 本次最终 `.config` 已保存到 `x96max/kernel/config-7.2.12-x96`；直接复制即可复现。下面是从 6.18 基线重建/理解配置的步骤。
+> 本次最终 `.config` 已保存到 `x96max/kernel/config-7.2.12-x96-full`；直接复制即可复现。下面是从 6.18 基线重建/理解配置的步骤。
 
 源码：`/opt/linux/src/linux-7.2.12.tar.xz`（Makefile：`VERSION=7 PATCHLEVEL=2 SUBLEVEL=12`）。
 **原版完整树已删**，只剩这个包；实际编译用裁剪树 `/x96-build/src-linux`，缺文件一律按 §0.1 从包里解。
@@ -610,7 +631,7 @@ $OUT/modules/lib/modules/7.2.12-x96/
 | 裁剪树 | `/x96-build/src-linux`（原版完整树 2026-11-15 已删，仅存 `/opt/linux/src/linux-7.2.12.tar.xz`） |
 | 用的 config | `/x96-build/config-x96-20261115` 生成，`make olddefconfig` 后落 `kbuild-7.2.12/.config`
 （含 `CONFIG_DEBUG_INFO_NONE=y`，关 debug info 是最大的那一刀）；
-**归档副本 `configs/config-7.2.12-x96-20261115`**（与 `kbuild/.config` 字节一致，6672 行；
+**归档副本 `configs/config-7.2.12-x96-full-20261115`**（与 `kbuild/.config` 字节一致，6672 行；
 2026-11-15 12:43 已刷新为 usbfix 版，补回 `USB_STORAGE=y`/`USB_UAS=y`，见 §5.4） |
 | 第一轮裁剪后 | 1.8G/94777 → **821M / 69673 文件**；干净全量 `-j6` **rc=0，526 s = 8m46s** |
 | 第二轮裁剪后 | 821M/69673 → **545M / 37911 文件**；干净全量 `-j6` **rc=0，495 s = 8m15s**（目标 ≤10 分钟） |
@@ -688,7 +709,7 @@ ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -j6 O=/x96-build/kbuild-7.2.12
 差别只剩 `rules.txt` 和默认树路径——主机那套以前是一层判据（按 Kconfig 归属），同样会踩 `net/devlink`，
 现已收敛；改判据改 `trimlib.py`，别在 `trim-tools/` 里复制。
 `sym2kc.py` 是 `trimlib.sym2kc()` 的命令行壳（`/tmp/sym2kc.tsv` 被清会自动重建）；
-config 位置按 `$KCONFIG` → `<tree>/.config` → `/x96-build/config-x96-20261115` 回退（out-of-tree 构建没有 `src-linux/.config`）。
+config 位置按 `$KCONFIG` → `<tree>/.config` → 仓库 `x96max/kernel/config-7.2.12-x96-full` 回退（out-of-tree 构建没有 `src-linux/.config`）。
 
 ### 5.4 usbfix：裁掉 `drivers/usb/storage` 导致 U 盘根盘找不到（2026-11-15）
 
@@ -772,7 +793,7 @@ sync && udisksctl unmount -b /dev/sdb1 && udisksctl unmount -b /dev/sdb2
 |---|---|
 | 新 `Image` 快照 | `/x96-build/Image-usbfix-20261115-1240`（sha256 `3d0e2a6d…`） |
 | 旧 U 盘内核备份 | `/x96-build/U-backup-{zImage,vmlinuz,config}-20261115-124215` |
-| config 归档 | `configs/config-7.2.12-x96-20261115`（已刷新，与 `kbuild/.config` 字节一致） |
+| config 归档 | `configs/config-7.2.12-x96-full-20261115`（已刷新，与 `kbuild/.config` 字节一致） |
 
 **真机启动断言结果（2026-11-15 16:00，三条全过）**：
 
@@ -1004,7 +1025,7 @@ ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -C /x96-build/src-clean O=$CU -
 **自查断言（任何裁剪树都该跑，5 秒）**
 
 ```bash
-A=/x96-build/kbuild-clean/.config      # 全量树基准
+A=/home/quqiufeng/kernel/configs/config-7.2.12-fulltree-baseline-20261115   # 全量树基准（原 kbuild-clean/.config 归档）
 B=/x96-build/kbuild-7.2.12/.config     # 待查的裁剪树
 diff <(grep -E '^CONFIG_[A-Z0-9_]+=' $A) <(grep -E '^CONFIG_[A-Z0-9_]+=' $B) \
   | sed -n 's/^< //p' | tee /tmp/lost.txt | wc -l          # 1789（本次实测）
@@ -1023,6 +1044,8 @@ grep -E '=y$' /tmp/lost.txt | grep -E 'GENPD|PM_GENERIC|PERF_EVENT|USB_GADGET|SE
 
 ```bash
 # 1) 全量内核进四包（脚本认 X96_KOUT / X96_KSRC，不是 O=）
+#    ⚠ kbuild-clean 构建树已于 2026-11-15 19:12 删除：这一步要么改用现成的裁剪产物
+#    （X96_KOUT=/x96-build/kbuild-trim），要么用 src-clean 重编一次全量树再打包。
 X96_KOUT=/x96-build/kbuild-clean X96_KSRC=/x96-build/src-clean ./x96max/pack-kernel.sh
 # 2) 重做 initrd → 重出镜像 → 写卡（写卡后仍要补 patch-initrd-wait + patch-bootargs，见 §0.2 第 6 步）
 sudo ./x96max/rebuild-from-zero.sh --from initrd
@@ -1060,10 +1083,14 @@ sudo ./x96max/rebuild-from-zero.sh --from initrd
 
 **复现**
 
+> 已脚本化：`./x96max/build-kernel.sh --trim`（= config-7.2.12-x96-trim + src-clean → kbuild-trim，
+> 带 `.config` sha 比对与归档对照；`--dry-run` 只打印路径不编译）。下面是不依赖脚本的命令行原文，
+> 用于从头生成 fragment / 补模块的场景。
+
 ```bash
-BASE=/x96-build/kbuild-clean/.config OUT=/x96-build/trim2-20261115.fragment \
-  ./x96max/kernel/gen-trim2.sh                       # 生成 fragment（自带板载驱动误砍自检）
-cp /x96-build/kbuild-clean/.config /x96-build/kbuild-trim/.config
+# 基线已归档（kbuild-clean 构建树 2026-11-15 删除），默认值即归档路径
+OUT=/x96-build/trim2-20261115.fragment ./x96max/kernel/gen-trim2.sh   # 生成 fragment（自带板载驱动误砍自检）
+cp configs/config-7.2.12-fulltree-baseline-20261115 /x96-build/kbuild-trim/.config
 cat /x96-build/trim2-20261115.fragment >> /x96-build/kbuild-trim/.config
 make -C /x96-build/src-clean O=/x96-build/kbuild-trim ARCH=arm64 \
      CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
@@ -1078,8 +1105,10 @@ make -C /x96-build/src-clean O=/x96-build/kbuild-trim ARCH=arm64 \
      CROSS_COMPILE=aarch64-linux-gnu- -j6 Image modules dtbs 2>&1 | tee /x96-build/build-trim.log
 ```
 
-归档：`configs/config-7.2.12-x96-trim-20261115` = `x96max/kernel/config-7.2.12-x96-trim` = 实编 `.config`；
-fragment 在 `configs/trim2-20261115.fragment`。
+归档：`configs/config-7.2.12-x96-trim-20261115` = `x96max/kernel/config-7.2.12-x96-trim` = 实编 `.config`
+= 盒子 `/proc/config.gz`，四者 sha256 同为 `92c79a3d40b23b9612d5cc55c56dc81da3b1db7d21bcd4e4efee7d20bbc5577e`
+（8227 行 / 2069 `=y` / 153 `=m`）；fragment 在 `configs/trim2-20261115.fragment`。
+与裁剪前的 `configs/config-7.2.12-x96-full-20261115`（`e137d0d5…`）**不是同一份**，见文首"两份配置别混用"。
 
 **板载全链复核（全部 `=y`，本轮逐个 grep 过）**
 
@@ -1100,7 +1129,8 @@ x86 专用的 ATA/触摸屏/USB gadget 旧机、以及 §5.7 恢复回来的 gen
 
 1. 模块从 5816 个变 140 个，**`--from initrd` 必须重做**（depmod + update-initramfs），否则 initramfs 里
    引用的旧模块名在 rootfs 里已不存在。
-2. 打四件套要指到新树：`X96_KOUT=/x96-build/kbuild-trim X96_KSRC=/x96-build/src-clean ./x96max/pack-kernel.sh`。
+2. 打四件套要指到新树：`./x96max/pack-kernel.sh --trim`（等价 `X96_KOUT=/x96-build/kbuild-trim
+   X96_KSRC=/x96-build/src-clean`，并会先校验 `kbuild-trim/.config` 的 sha 在 `configs/` 归档里）。
 3. 本轮**只验证到"编译零错误 + 配置对得上"**，没上机；上机判据仍是 §10.3 的 dmesg 清单
    （以太网 PHY、mmcblk、xhci、HDMI 声卡、掉盘）。
 
@@ -2071,7 +2101,7 @@ apt-get install -y sudo u-boot-tools parted btrfs-progs   # 以后要 armbian-in
 | 日志 | `/x96-build/logs/from0-<mmdd-HHMM>/{0-clean,19.3,19.4,19.5,19.6,done}.log` |
 | 基础镜像 | `.../build/output/images/Armbian_26.11.0-trunk_trixie_arm64_6.18.60.img` |
 | 仓库脚本 | `x96max/build-image.sh`、`config-x96-source.conf`、`x96-autoinstall.*`、`mkbase.sh` |
-| 最终内核配置 | `x96max/kernel/config-7.2.12-x96` |
+| 最终内核配置 | `x96max/kernel/config-7.2.12-x96-full` |
 | 输出镜像 | `/x96-build/recovery/x96src-autoinstall.img.gz` |
 
 > 基础镜像约 2.5G、内核 4 个 tar 包、rootfs 缓存和 recovery 镜像都**不入库**；仓库只保留脚本和配置。
@@ -2107,17 +2137,18 @@ git clone https://github.com/armbian/build /x96-build/armbian-build
 
 ```bash
 REPO=/home/quqiufeng/kernel
-KSRC=/x96-build/src-linux        # 实际编译用的是裁剪树；原版 /opt/linux/src/linux-7.2.12 只做参照
+KSRC=/x96-build/src-full         # 全量套：解压缓存，缺席时从 linux-7.2.12.tar.xz 现解压（9s/1.8G），编完可删
+# 现役源码树 /x96-build/src-clean（= 原样解压的全量树，1.8G；裁剪只在 .config 层，必须保留）
 OUT=/x96-build/kbuild-7.2.12
 
 # 仅首次或源码树有树内产物时执行；会删除 .config
 # (cd "$KSRC" && make ARCH=arm64 mrproper)
 
 mkdir -p "$OUT"
-cp "$REPO/x96max/kernel/config-7.2.12-x96" "$OUT/.config"
+cp "$REPO/x96max/kernel/config-7.2.12-x96-full" "$OUT/.config"
 
 # 配置前置断言：p1 是 FAT32，缺 FAT 就挂不上 /boot（§0.2 #0）
-diff -q "$REPO/x96max/kernel/config-7.2.12-x96" "$REPO/configs/config-7.2.12-x96-20261115"
+diff -q "$REPO/x96max/kernel/config-7.2.12-x96-full" "$REPO/configs/config-7.2.12-x96-full-20261115"
 grep -cE '^CONFIG_(FAT_FS|MSDOS_FS|VFAT_FS)=y' "$OUT/.config"     # 必须 3
 
 cd "$KSRC"
@@ -2141,7 +2172,7 @@ $OUT/modules/lib/modules/7.2.12-x96/
 
 ```bash
 grep '^CONFIG_LOCALVERSION=' "$OUT/.config"                     # "-x96"
-diff <(sort "$OUT/.config") <(sort x96max/kernel/config-7.2.12-x96)   # 无输出
+diff <(sort "$OUT/.config") <(sort x96max/kernel/config-7.2.12-x96-full)   # 无输出
 strings "$OUT/arch/arm64/boot/Image" | grep -x vfat             # 命中 vfat
 ```
 
@@ -2191,7 +2222,12 @@ mkimage -A arm64 -O linux -T ramdisk -C gzip -n uInitrd \
 ### 19.5 打包 4 个内核包
 
 现成脚本：`x96max/pack-kernel.sh`（就是下面这段，硬编码改成 `X96_*` 变量，`KSRC` 默认裁剪树
-`$X96_BUILD_ROOT/src-linux`，缺 Image/initrd 会先报错）。下面是等价的手工命令，用于对照：
+`$X96_BUILD_ROOT/src-linux`，缺 Image/initrd 会先报错）。两种模式：默认全量（`kbuild-7.2.12` +
+`src-linux`），`--trim` 走 `kbuild-trim` + `src-clean`；`-n` 只打印三元组与 sha 校验不落包。
+
+打包前强制校验：`$OUT/.config` 的 sha256 必须命中 `configs/config-<KNAME>[-trim]-<date>` 之一，
+否则说明这棵树的配置没进归档、打出的包无法溯源，直接 rc=1 拒绝（`--force` 可越过）。下面是等价的
+手工命令，用于对照：
 
 ```bash
 ROOT=/x96-build
@@ -2512,6 +2548,82 @@ apt-get update                    # rc=0，无 E:/W:
 - 建议把 `systemd-timesyncd` + §20.2 的 `timesyncd.conf` 直接做进镜像（rootfs 注入阶段），
   否则每次重装都要手工走一遍。
 
+## 21. 两套打包（完整源码树 / 裁剪版）
+
+需求：**同时维护两套可打包的流水线** —— 一套全量源码树、一套裁剪版，各自的 sh 脚本、编译 config、
+源码目录都分开，产物互不覆盖。
+
+### 21.1 参数矩阵（唯一出处在 `x96max/lib/mode.sh`）
+
+| 项 | `full`（完整源码树） | `trim`（裁剪版） |
+|---|---|---|
+| 配置 | `x96max/kernel/config-7.2.12-x96-full` | `x96max/kernel/config-7.2.12-x96-trim` |
+| `CONFIG_LOCALVERSION` | `-x96` | `-x96-trim` |
+| 源码树 | `/x96-build/src-linux` | `/x96-build/src-clean` |
+| 产物树 (`O=`) | `/x96-build/kbuild-7.2.12` | `/x96-build/kbuild-trim` |
+| 内核名 `KNAME` | `7.2.12-x96` | `7.2.12-x96-trim` |
+| 模块目录 | `.../lib/modules/7.2.12-x96` | `.../lib/modules/7.2.12-x96-trim` |
+| initrd / uInitrd | `initrd.img-7.2.12-x96` | `initrd.img-7.2.12-x96-trim` |
+| 四件套包仓 | `/x96-build/pkgs/full` | `/x96-build/pkgs/trim` |
+| 成品镜像 | `recovery/x96-full-autoinstall.img.gz` | `recovery/x96-trim-autoinstall.img.gz` |
+| 入口脚本 | `x96max/full/*.sh` | `x96max/trim/*.sh` |
+
+要点（都是这次踩出来的）：
+
+1. **两套必须有两个 `KNAME`**。以前两套共用一个 `7.2.12-x96`，`boot-7.2.12-x96.tar.gz`
+   名字一模一样，后打的把先打的覆盖掉，`/lib/modules/7.2.12-x96` 也会串味。
+   现在 `trim` 的 `CONFIG_LOCALVERSION="-x96-trim"`，`uname -r` 就能分辨在跑哪套。
+2. **ophub 的 `-k` 只认版本号**（`7.2.12`），两套包最终都要落到 `kernel/stable/7.2.12`。
+   所以做成「包仓（各一套）→ 出镜像前同步」：`build-image.sh` 调 `x96_stage_pkgs`，
+   先清空该目录再放本套四个包，同一时刻只有一套在位，包仓里两套都留着。
+3. **成品名带 MODE**，`x96-full-…` / `x96-trim-…`，写卡不会拿错。
+
+### 21.2 用法
+
+```bash
+./x96max/full/preflight.sh              ./x96max/trim/preflight.sh
+./x96max/full/rebuild-from-zero.sh      ./x96max/trim/rebuild-from-zero.sh
+
+# 等价的分步写法（引擎脚本 + --mode）
+./x96max/build-kernel.sh --trim
+./x96max/pack-kernel.sh --trim --stage     # --stage：打完同步进 ophub 的 kernel/stable/7.2.12
+./x96max/build-image.sh --mode trim
+./x96max/rebuild-from-zero.sh --from initrd --mode trim
+```
+
+`full/*.sh`、`trim/*.sh` 里没有任何参数，只有一行 `export X96_CFG_MODE=<mode>` 再 exec 引擎，
+所以「两份脚本」不会分叉成两份逻辑：改引擎两套同时生效。
+
+### 21.3 配置溯源用语义比对
+
+`olddefconfig` 会把 `.config` 重写一遍（`=m` 与注释行顺序全变），字节 sha 对不上并不等于配置不同。
+`pack-kernel.sh` 现在先比 sha，**字节不同再比「符号=值」语义**（`x96_cfg_same`），
+语义一致也放行并打印「语义一致，olddefconfig 噪声已忽略」；真不同才要 `--force`。
+
+### 21.4 当前状态（2026-11-15 19:0x）
+
+- 两套参数、入口、脚本已就绪，`full/preflight.sh` 27 项、`trim/preflight.sh` 28 项全绿。
+- **`full` 需要重编一次**：`kbuild-7.2.12/.config` 与归档的 `-full` 配置有 1686 个符号不同
+  （大量 `=m` vs `=y`），即现在这棵树不是用 `config-…-full` 编出来的，重编后包才可溯源。
+- **`trim` 需要重编一次**：`LOCALVERSION` 改成 `-x96-trim` 后，旧产物仍是 `7.2.12-x96`，
+  `pack-kernel.sh` 会直接报「缺模块目录 / 缺 initrd」。
+- 旧的同名包已挪到 `/x96-build/pkgs/_legacy-7.2.12-x96/` 留档（对应现在卡上跑的那版）。
+
+### 21.5 源码树：full 不常驻，按需解压（2026-11-15 19:08）
+
+决定：**全量源码树不再作为长期资产保留**，它随时能从源码包还原，所以脚本改成「用前解压」。
+
+- `lib/mode.sh` 新增 `SRC_XZ=/opt/linux/src/linux-<KV>.tar.xz`、`x96_ensure_src`、`x96_drop_src`：
+  - full 的 `KSRC` 默认 `/x96-build/src-full`；树不在就从包里
+    `tar -xJf ... --strip-components=1` 现解压（实测 **9s / 1.8G / 94776 文件**），并写标记 `.x96-extracted`。
+  - 编完带 `--clean-src`（或 `X96_CLEAN_SRC=1`）就整目录删掉；下次再编自动重解。
+- `preflight.sh`：full 只要求**源码包**在，树缺席直接判 ok（提示「开跑时现解压」）；trim 仍要求 `src-clean` 在。
+- `rebuild-from-zero.sh`：把 `-d $KSRC` 硬检查换成 `x96_ensure_src`，新增 `--clean-src` 透传。
+- **旧 `/x96-build/src-linux` 不再默认使用**：实测它被削过——38 332 文件 vs 完整树 94 776，
+  缺 `Documentation` 与 alpha/mips/riscv 等非 arm64 架构（553M vs 1.8G）。要用它得显式 `X96_KSRC=`。
+- trim 的 `src-clean` 仍然必须保留：它是原样解压的全量树（1.8G，未裁剪；裁剪只在 `.config` 层），解压要重来一遍 160M 包 + 时间
+  （删了用 `kernel/gen-trim.sh` 重生成，耗时远大于解压）。
+
 ---
 
-*文档版本: 1.8 · 更新: 2026-11-15 · 设备: X96 Max / S905X2*
+*文档版本: 2.0 · 更新: 2026-11-15 · 设备: X96 Max / S905X2*

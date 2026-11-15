@@ -10,7 +10,7 @@
 # 约束：只动 =m。MESON/G12A/AIU/AXG/STMMAC/XHCI/DWC3/HDMI/PINCTRL/MMC/VIDEOBUF2 由 KEEP 保护。
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
-CFG=${CFG:-$HERE/config-7.2.12-x96}
+CFG=${CFG:-$HERE/config-7.2.12-x96-full}
 OUT=${OUT:-$HERE/x96-trim.fragment}
 [ -f "$CFG" ] || { echo "缺 config: $CFG" >&2; exit 2; }
 
@@ -26,7 +26,7 @@ emit() {
 cat <<'HDR'
 # ============================================================
 # X96 Max（S905X2 / meson-g12a）内核裁剪 fragment —— 激进版
-# 由 x96max/kernel/gen-trim.sh 从 config-7.2.12-x96 实际扫描生成；手改请改脚本。
+# 由 x96max/kernel/gen-trim.sh 从 config-7.2.12-x96-full 实际扫描生成；手改请改脚本。
 # 目标：2896 个 =m 压到 ~1100 以内，做法同本机 sandy-dbg3。
 # ============================================================
 CONFIG_DEBUG_INFO_NONE=y
