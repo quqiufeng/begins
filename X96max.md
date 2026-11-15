@@ -7,7 +7,7 @@
 > 本文目标：记录硬件、现有系统打包方式，以及**从 Linux 7.2.12 源码编译内核 → 源码构建 rootfs → ophub 打包 → SD/U 盘验证 → eMMC 安装 → 体积裁剪** 的完整过程。
 > 状态：**已成功从 eMMC 启动裁剪后的源码系统**（155 包，rootfs ~568M；主线 U-Boot）。
 > 无线策略（2026-11 更新）：**保留 Wi-Fi/蓝牙驱动与固件**（RTL8822BS → `rtw88_8822bs` + `btrtl`），内核里不再 `-d` 关闭；有线 RTL8211F 仍是主用网络。
-> 仓库脚本：**本仓库 `x96max/`**（`build-image.sh` 一键镜像、`config-x96-source.conf` rootfs 配置、`x96-autoinstall.*` 首启自动安装、`x96max/kernel/config-7.2.12-x96` 最终内核配置、`mkbase.sh` 自造 rebuild 基础镜像）。
+> 仓库脚本：**本仓库 `x96max/`**（`build-image.sh` 一键镜像、`write-card.sh` 安全写卡 + 校验、`config-x96-source.conf` rootfs 配置、`x96-autoinstall.*` 首启自动安装、`x96max/kernel/config-7.2.12-x96` 最终内核配置、`mkbase.sh` 自造 rebuild 基础镜像）。
 
 ---
 
@@ -620,15 +620,138 @@ gzip -9 -k -f "$IMG"
 
 ## 10. 写 U 盘与启动验证
 
-### 10.1 写盘（在主电脑上）
+### 10.1 写卡（完整流程）
+
+> 一句话：**用 `x96max/write-card.sh`**。它把「关自动挂载 → 写 → 校验 → 恢复」封成一条，
+> 判据放在文件系统层（逐文件 sha256），不依赖裸盘 `cmp`。手工分步见 10.1.2，两个必踩的坑见 10.1.3 / 10.1.4。
+
+#### 10.1.1 一键（推荐）
 
 ```bash
-lsblk -o NAME,SIZE,MODEL,TRAN          # 先确认 U 盘设备，不要选错
-sudo dd if=<final>.img of=/dev/sdX bs=4M status=progress conv=fsync
-sync
+cd /home/quqiufeng/kernel
+lsblk -o NAME,SIZE,MODEL,TRAN,MOUNTPOINTS   # 先看清哪个是卡
+
+sudo ./x96max/write-card.sh /x96-build/recovery/x96src-autoinstall.img.gz /dev/sdX
+# 只校验已写好的卡，不动数据
+sudo ./x96max/write-card.sh /x96-build/recovery/x96src-autoinstall.img.gz /dev/sdX --verify-only
 ```
 
-> `dd` 会覆盖整个 U 盘；务必确认 `/dev/sdX` 是 U 盘，不是系统盘。
+脚本做的事，以及每步失败的含意：
+
+| 步 | 动作 | 失败意味着 |
+|---|---|---|
+| 0 | 拒绝非整盘（`/dev/sdX1`）、拒绝系统盘、拒绝任何已挂载分区 | 设备选错 |
+| 1 | `gsettings automount/automount-open=false` + `systemctl stop udisks2`，退出时 `trap` 恢复原值 | 见 10.1.3 |
+| 2 | `dd bs=4M conv=fsync,notrunc` + `blockdev --flushbufs` + `partprobe` | 卡或读卡器写失败 |
+| 3 | `losetup -rP` 挂镜像，`sfdisk -d` 比对分区表 start/size/type | 分区表没写进去 |
+| 4 | 前 4MiB 裸区（U-Boot + 分区表，不在任何分区内）3 次重读，任一次一致即通过 | 真可疑，重写 |
+| 5 | 逐分区：`e2fsck -fn` → 文件清单 → **逐文件 sha256** | 卡内容与镜像不等价 |
+
+实测输出（2026-11-15，3076MiB 镜像 → 14.6G 卡）：
+
+```text
+✔ /dev/sdb 是 STORAGE DEVICE 14.6G，未挂载，非系统盘
+✔ automount=false / udisks2 stopped
+✔ 分区表一致: start=8192 size=1046528 type=c / start=1056768 size=5242880 type=83
+✔ 第 1 次重读一致
+✔ 分区 1 (vfat): 194 条目，逐文件 sha256 全部一致（190 个文件）
+✔ 分区 2 (ext4): e2fsck -fn 干净，9868 条目，逐文件 sha256 全部一致（7495 个文件）
+全部通过 —— 卡内容与镜像等价
+```
+
+参数：`--yes` 跳过输入设备名确认；`--verify-only` 不写、只校验；`--img-cache DIR` 解压缓冲目录
+（默认 `$TMPDIR`，`.gz` 需约 3.1G 空间，已存在且比 `.gz` 新则复用）；`--bs 4M` 块大小。
+退出码：`0` 通过 / `1` 用法错 / `2` 设备被拒 / `3` 校验失败 / `4` 写盘失败。
+
+#### 10.1.2 手工分步（等价命令）
+
+```bash
+IMG=/x96-build/recovery/x96src-autoinstall.img     # 先解压：校验必须对着落盘的 img 比
+DEV=/dev/sdX                                       # 确认过是卡
+
+# 1) 关自动挂载（关键，别跳）
+gsettings set org.gnome.desktop.media-handling automount false
+gsettings set org.gnome.desktop.media-handling automount-open false
+sudo systemctl stop udisks2
+lsblk -o NAME,MOUNTPOINTS $DEV                     # 必须为空，否则先 umount
+
+# 2) 写
+sudo dd if=$IMG of=$DEV bs=4M conv=fsync,notrunc status=progress
+sync; sudo blockdev --flushbufs $DEV; sudo partprobe $DEV
+
+# 3) 分区表（去掉设备名差异后应完全相同）
+LP=$(sudo losetup -rP --show $IMG)
+diff <(sudo sfdisk -d $LP  | sed 's#^/dev/[a-z0-9]*##') \
+     <(sudo sfdisk -d $DEV | sed 's#^/dev/[a-z0-9]*##') && echo 分区表一致
+
+# 4) 前 4MiB 裸区（U-Boot + 分区表）——两行 sha256 应相同，不同就重读几次
+sudo dd if=$DEV bs=512 count=8192 status=none | sha256sum
+dd if=$IMG      bs=512 count=8192 status=none | sha256sum
+
+# 5) 逐文件对拍：判据在这里，不在裸盘 cmp
+mkdir -p /mnt/i /mnt/c
+for n in 1 2; do
+  sudo mount -o ro,noload ${LP}p$n /mnt/i
+  sudo mount -o ro,noload ${DEV}$n /mnt/c
+  sudo e2fsck -fn ${DEV}$n			# 只有 ext4 分区有这步
+  diff <(cd /mnt/i && find . | sort) <(cd /mnt/c && find . | sort) && echo "分区$n 清单一致"
+  diff <(cd /mnt/i && find . -type f -print0 | sort -z | xargs -0 sha256sum) \
+       <(cd /mnt/c && find . -type f -print0 | sort -z | xargs -0 sha256sum) \
+    && echo "分区$n 内容一致"
+  sudo umount /mnt/i /mnt/c
+done
+sync; sudo losetup -d $LP
+
+# 6) 恢复自动挂载
+gsettings set org.gnome.desktop.media-handling automount true
+gsettings set org.gnome.desktop.media-handling automount-open true
+sudo systemctl start udisks2
+```
+
+`ro,noload` 不能省：卡上的 ext4 日志可能还没回放，plain `-o ro` 挂不上去，
+会被误判成「文件系统结构损坏」（脚本同理，它按 fstype 自动加 `noload`）。
+
+#### 10.1.3 坑一：dd 之前必须关桌面自动挂载
+
+GNOME/udisks2 会在 dd 结束、内核重读分区表的瞬间把 `${DEV}2` 以 **rw** 挂上，于是：
+
+```text
+dd 写完 → 内核读到新分区表 → udisks2 自动 mount rw
+        → ext4 做日志回放 → 经 USB 读卡器读到错字节
+        → 回放结果写回卡里 → 垃圾被「固化」成真实损坏
+```
+
+实测症状：`/usr/lib/udev/hwdb.d/20-pci-vendor-model.hwdb` 字符错位、**文件长度不变**、
+`e2fsck -fn` 干净、能正常挂载，只有逐文件 sha256 抓得到。同一镜像连写两次，坏的是同一个文件——
+不是偶发，是「写 → 自动挂载 → 日志回放」这条固定链路。
+
+正确顺序：关自动挂载 → dd → 校验 → 才恢复。脚本用 `trap` 保证异常退出也恢复，
+不会把桌面长期留在「插卡不自动挂载」的状态。
+
+#### 10.1.4 坑二：裸盘 `cmp` 不是判据
+
+USB 读卡器大块读会返回错字节：`bs=1M` 几乎必错，`bs=256K` 仍有约 0.1% 的块出错。
+更麻烦的是**同一位置重读多次给出相同的错字节**，所以「重读 3 次一致」证明不了内容正确。
+
+对同一张卡做裸盘比对，能看到几百字节散布在小块里与镜像不同；但 `ro` 挂上逐文件 sha256，
+7500 个文件全一致、`e2fsck -fn` 干净、条目数一致。这类差异只落在未分配空间，
+成因可能是读路径返回错字节，也可能是 10.1.3 的日志回放写入——两者都**不影响文件系统语义**。
+
+| 现象 | 判定 |
+|---|---|
+| 裸盘 cmp 有几百字节不同，但逐文件 sha256 全一致 + `e2fsck -fn` 干净 | **通过**，差异在未分配空间 |
+| 逐文件 sha256 有差异（尤其同一文件反复坏） | **失败**，重写；连坏两次换读卡器/换卡 |
+| 某分区挂不上，或 `e2fsck` 报结构错 | **失败**，重写 |
+| 分区表 start/size 与镜像不同 | **失败**，重写（多半 dd 没跑完或写到别名设备） |
+
+所以：**别用 `cmp`/`diff` 比整个裸盘来判写卡成败**——它会把好卡判成坏卡，逼你反复重写，
+而每次重写又在放大 10.1.3 的风险。
+
+#### 10.1.5 写完立刻拔卡
+
+校验一通过就**马上从读卡器拔下来**。卡留在电脑上，任何一次 media-change 事件
+（切 VT、插拔别的 USB、`systemctl restart udisks2`）都可能触发 rw 挂载，重复 10.1.3 的污染，
+而这次的污染发生在你「已经校验过」之后，最难发现。
 
 ### 10.2 盒子从 U 盘启动
 
@@ -780,6 +903,8 @@ NAS 备份目录  dav://192.168.1.53:5005/sata11-18072858035/x96-backup/
 5. **eMMC 启动验证前先 SD 启动**：SD 是可靠的救援盘；失败可随时插 SD 回来修。
 6. **Amlogic Maskrom 的 `update` 工具在本机控制传输不稳定**：T95 的 Allwinner FEL 经验不能直接套用；能 SD 启动就不要再纠结 Maskrom。
 7. **备份先行**：原厂启动区 117MiB、p1、p2 都在 `dav://192.168.1.53:5005/sata11-18072858035/x96-backup/emmc-original-backup/`；写主线 U-Boot 前必须保留。
+8. **写卡前关桌面自动挂载**：udisks2 会在 dd 结束后把卡以 **rw** 挂上 → ext4 日志回放 → 经不稳的读路径读到错字节再写回，垃圾被固化成真损坏（症状：文件字符错位、**长度不变**、`e2fsck -fn` 干净，只有逐文件 sha256 抓得到）。一条命令避开：`sudo x96max/write-card.sh <img.gz> /dev/sdX`，详见 §10.1.3。
+9. **别用整盘 `cmp` 判写卡成败**：USB 读卡器大块读会返回错字节，且同一位置重读给出**相同的错字节**，裸盘比对必然出现几百字节假差异，会把好卡判成坏卡、逼你反复重写（每次重写又在放大第 8 条的风险）。判据是逐文件 sha256 + `e2fsck -fn`，见 §10.1.4。
 
 ---
 
@@ -1189,7 +1314,7 @@ cd /home/quqiufeng/kernel
 # 复用已有 rootfs，只重打包
 ./x96max/build-image.sh --skip-rootfs
 
-# 直接写 U 盘/SD（危险，确认设备名）
+# 直接写 U 盘/SD（转调 write-card.sh：关自动挂载 → dd → 文件系统层校验 → 恢复）
 ./x96max/build-image.sh --skip-rootfs --write /dev/sdX
 ```
 
@@ -1257,12 +1382,18 @@ sudo X96_KSRC=/x96-build/src-linux ./x96max/rebuild-from-zero.sh
 ### 19.7 写盘、首启与 eMMC 安装
 
 ```bash
-# 写 U 盘/SD（二选一）
-gzip -dc /x96-build/recovery/x96src-autoinstall.img.gz | \
-  sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
-# 或
+# 写 U 盘/SD：一律走 write-card.sh（关自动挂载 → dd → 逐文件 sha256 → 恢复设置）
+sudo ./x96max/write-card.sh /x96-build/recovery/x96src-autoinstall.img.gz /dev/sdX
+
+# 只校验卡上现有内容，不重写（1~2 分钟）
+sudo ./x96max/write-card.sh /x96-build/recovery/x96src-autoinstall.img.gz /dev/sdX --verify-only
+
+# 从构建脚本转调，内部就是第一条
 ./x96max/build-image.sh --skip-rootfs --write /dev/sdX
 ```
+
+> 不要再手工 `dd`：见 §10.1.3（自动挂载把日志回放出的垃圾固化进卡）与 §10.1.4（裸盘 `cmp` 不是判据）。
+> 完整流程、手工等价命令、失败判定表在 **§10.1**。
 
 盒子从 U 盘/SD 启动后确认：
 
@@ -1318,4 +1449,4 @@ v4l2-ctl --list-devices
 
 ---
 
-*文档版本: 1.4 · 更新: 2026-11-02 · 设备: X96 Max / S905X2*
+*文档版本: 1.5 · 更新: 2026-11-15 · 设备: X96 Max / S905X2*

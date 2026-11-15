@@ -229,8 +229,9 @@ gzip -9 -f "$RAW"
 echo "IMAGE=$RAW.gz"
 
 if [[ -n "$WRITE_DEV" ]]; then
+  # 统一走 write-card.sh：关自动挂载 + 写 + 文件系统层校验 + 恢复（裸 dd 会被 udisks2
+  # 自动 rw 挂载触发 ext4 日志回放，把读卡器错字节固化进卡里，见 X96max.md §10.1.3）
   [[ -b "$WRITE_DEV" ]] || { echo "not a block device: $WRITE_DEV"; exit 1; }
-  gzip -dc "$RAW.gz" | sudo dd of="$WRITE_DEV" bs=4M status=progress conv=fsync
-  sync
+  sudo "$SCRIPT_DIR/write-card.sh" "$RAW.gz" "$WRITE_DEV"
   echo "WROTE=$WRITE_DEV"
 fi
