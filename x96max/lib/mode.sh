@@ -12,15 +12,19 @@
 #
 # 两套参数对照（路径前缀 ROOT=/x96-build）：
 #   full  KNAME=7.2.12-x96        CFG=config-7.2.12-x96-full   KSRC=src-full    OUT=kbuild-7.2.12
-#   trim  KNAME=7.2.12-x96-trim   CFG=config-7.2.12-x96-trim   KSRC=src-clean   OUT=kbuild-trim
+#   trim  KNAME=7.2.12-x96-trim   CFG=config-7.2.12-x96-trim   KSRC=src-trim    OUT=kbuild-trim
 #
 # 源码树策略：
 #   full —— **不长期占地方**。src-full 由 x96_ensure_src 从源码包
 #           /opt/linux/src/linux-<KV>.tar.xz 现解压（约 9s / 1.8G），编完可删
 #           （--clean-src 或 X96_CLEAN_SRC=1 自动删）。默认不用旧目录 src-linux：
 #           那棵树被削过（无 Documentation、只剩 arm64 等），要它请显式 X96_KSRC。
-#   trim —— src-clean 是「解压 + 裁剪」的产物，解压本身还原不出来，必须保留；
-#           删了用 kernel/gen-trim.sh 重新生成。
+#   trim —— src-trim 是「解压 + trim-tools 裁剪」的产物（782M / 50552 文件，原版
+#           1.4G），解压本身还原不出来，必须保留；删了用 kernel/gen-trim.sh 重新生成，
+#           或对解压树跑 trim-tools/prune_src.py --apply。
+#           目录名不强求：依次找 src-trim / src-clean / $KV-trim，取第一个存在的
+#           （实测现役树叫 7.2.12-trim，旧文档写的 src-clean 从没在这个机器上落盘过，
+#            于是 trim 模式一律「缺源码树」——默认值必须认实际存在的那个）。
 # 包仓：full→pkgs/full  trim→pkgs/trim；两者都按需同步进 ophub 的 kernel/stable/7.2.12
 # （同一时刻只放一套，见 x96_stage_pkgs），成品：recovery/x96-<MODE>-autoinstall.img.gz
 #
@@ -30,6 +34,15 @@
 
 X96_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)   # x96max/
 X96_REPO=$(dirname "$X96_DIR")                             # 仓库根
+
+# trim 源码树的实际落点（名字随历史变过，别写死一个）。
+x96_pick_trim_src() {
+  local root=$1 d
+  for d in src-trim src-clean "$KV-trim" "$KV-src"; do
+    [[ -f $root/$d/Makefile ]] && { echo "$root/$d"; return 0; }
+  done
+  echo "$root/src-trim"        # 都没有 → 报这个名字，别再造 src-clean 这种不存在路径
+}
 
 x96_mode() {
   local m=${1:-full}
@@ -43,7 +56,7 @@ x96_mode() {
   if [[ $MODE == trim ]]; then
     KNAME=${X96_KNAME:-$KV-x96-trim}
     CFG=${X96_CFG:-$X96_DIR/kernel/config-$KV-x96-trim}
-    KSRC=${X96_KSRC:-$ROOT/src-clean}
+    KSRC=${X96_KSRC:-$(x96_pick_trim_src "$ROOT")}
     OUT=${X96_KOUT:-$ROOT/kbuild-trim}
   else
     KNAME=${X96_KNAME:-$KV-x96}
@@ -72,7 +85,10 @@ x96_ensure_src() {
   fi
   if [[ $MODE == trim ]]; then
     echo "缺裁剪源码树: $KSRC" >&2
-    echo "  src-clean 是「解压+裁剪」的产物，解压源码包还原不出来；用 x96max/kernel/gen-trim.sh 重新生成。" >&2
+    echo "  裁剪树是「解压+裁剪」的产物，解压源码包还原不出来。两条路：" >&2
+    echo "    a) 复用现成的：X96_KSRC=/x96-build/<已有裁剪树> ./x96max/preflight.sh --trim" >&2
+    echo "    b) 重新生成：x96max/kernel/gen-trim.sh，或解压后跑 trim-tools/prune_src.py --apply" >&2
+    echo "  已找过的位置：$ROOT/{src-trim,src-clean,$KV-trim,$KV-src}" >&2
     return 2
   fi
   [[ -f $SRC_XZ ]] || { echo "缺源码包: $SRC_XZ（解压不出 $KSRC）" >&2; return 2; }

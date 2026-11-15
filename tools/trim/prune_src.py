@@ -34,3 +34,7 @@ if not apply_:
 for d in todo:
     subprocess.run(['rm', '-rf', os.path.join(tree, d)], check=True)
 print(f"删除 {len(todo)} 个目录，清理 {T.strip_sources(tree, todo)} 条 source 行")
+print(f"补回 {T.restore_kconfigs(tree)} 个 Kconfig（源 {T.TAR}）—— 符号定义不能随目录消失")
+open(os.path.join(tree, '.trimmed'), 'w').write(
+    'pruned %s  dirs=%d\n' % (__import__('time').strftime('%F %T'), len(todo)))
+print(f"写标记 {tree}/.trimmed（preflight 用它确认这是裁剪树）")

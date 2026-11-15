@@ -42,8 +42,8 @@
 | 项 | full（完整源码树） | trim（裁剪版） |
 |---|---|---|
 | 配置 | `kernel/config-7.2.12-x96-full` | `kernel/config-7.2.12-x96-trim` |
-| 源码树 | `/x96-build/src-full`（**按需解压，可删**） | `/x96-build/src-clean`（**全量树 1.8G，必须留**；现役唯一源码树） |
-| 产物树 | `/x96-build/kbuild-7.2.12`（**2026-11-15 已删**，`--full` 会重建） | `/x96-build/kbuild-trim`（现役，源码树 `src-clean`）|
+| 源码树 | `/x96-build/src-full`（**按需解压，可删**） | `/x96-build/src-trim`（**裁剪树 782M，必须留**；现役叫 `7.2.12-trim`，`x96_pick_trim_src` 自动找） |
+| 产物树 | `/x96-build/kbuild-7.2.12`（**2026-11-15 已删**，`--full` 会重建） | `/x96-build/kbuild-trim`（现役，源码树 `7.2.12-trim`）|
 | 内核名 / 模块目录 | `7.2.12-x96` | `7.2.12-x96-trim` |
 | initrd / uInitrd | `initrd.img-7.2.12-x96` | `initrd.img-7.2.12-x96-trim` |
 | 四件套包仓 | `/x96-build/pkgs/full` | `/x96-build/pkgs/trim` |
@@ -99,8 +99,12 @@ sudo ./x96max/patch-bootargs.sh --usb-fix 346d:5678   # U 盘读一半掉线时�
   `tar -xJf /opt/linux/src/linux-7.2.12.tar.xz --strip-components=1` 现解压（实测 **9s / 1.8G**），
   编完可 `--clean-src` 删掉；下次再编自动重解。旧的 `/x96-build/src-linux` 是被削过的树
   （无 `Documentation`、只剩 arm64 等，38k 文件 vs 完整 95k），已不默认使用，要它请显式 `X96_KSRC`。
-- **trim**：`src-clean` 是**原样全量树**（1.8G / 94775 文件，顶层 31 项、`Documentation` 84M、9 个架构全在；与源码包比只少 100 个 symlink 类条目）——**裁剪只发生在 `.config` 层，源码一棵没删**；
-  删了用 `kernel/gen-trim.sh` 重生成。
+- **trim**：源码树**真删过**（`trim-tools/prune_src.py --apply`：删无用驱动/文档，`Kconfig` 全部从源码包补回，
+  所以符号定义不会随目录消失）。现役 `/x96-build/7.2.12-trim`：**782M / 50553 文件**，顶层 45 项、
+  `Documentation` 只剩 24K、`drivers` 142 个目录——比原版 1.4G/95k 文件小一半。
+  目录名不写死：`x96_pick_trim_src` 依次找 `src-trim` → `src-clean` → `7.2.12-trim` → `7.2.12-src`，
+  取第一个带 `Makefile` 的（旧文档写的 `src-clean` 这台机器上从没落盘，trim 模式因此一直报「缺源码树」）。
+  删了用 `kernel/gen-trim.sh` 重生成，或解压后跑 `trim-tools/prune_src.py --apply`（会写 `<树>/.trimmed` 标记）。
 
 ## 4. 公共环境变量（各脚本都认，默认值都在 `lib/mode.sh`）
 
@@ -108,7 +112,7 @@ sudo ./x96max/patch-bootargs.sh --usb-fix 346d:5678   # U 盘读一半掉线时�
 |---|---|---|
 | `X96_BUILD_ROOT` | `/x96-build` | 构建工作区 |
 | `X96_CFG_MODE` | `full` | 选哪一套：`full`（完整源码树）/ `trim`（裁剪版）；`full/*.sh`、`trim/*.sh` 就是设它 |
-| `X96_KSRC` | full→`src-full` / trim→`src-clean` | 源码树；**full 不常驻**，缺席时从 `X96_SRC_XZ` 现解压 |
+| `X96_KSRC` | full→`src-full` / trim→自动找（`src-trim`/`src-clean`/`7.2.12-trim`） | 源码树；**full 不常驻**，缺席时从 `X96_SRC_XZ` 现解压 |
 | `X96_SRC_XZ` | `/opt/linux/src/linux-7.2.12.tar.xz` | 完整源码包（full 的解压源）|
 | `X96_CLEAN_SRC` | `0` | `1` = 编完删掉解压出来的 `src-full`（省 1.8 G，下次自动再解）|
 | `X96_KNAME` | full→`7.2.12-x96` / trim→`7.2.12-x96-trim` | 内核版本名（= `CONFIG_LOCALVERSION` + `7.2.12`）|

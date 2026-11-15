@@ -25,6 +25,14 @@ cfg = T.config_path(tree, os.environ.get('KCONFIG') or os.path.join(
 apply_ = '--apply' in sys.argv
 
 todo, skip = T.plan(tree, cfg, rules)
+rest = restore_list()
+# restore.txt 里的切片删了又原样补回，纯 churn：先从 todo 摘掉，
+# 否则对已裁剪的树 dry-run 永远报「可删 5 个」（rust/tools/arch/*），看不出判据是否收敛。
+covered = [d for d in todo
+           if any(d == r or d.startswith(r + '/') or r.startswith(d + '/') for r in rest)]
+if covered:
+    todo = [d for d in todo if d not in covered]
+    print(f"跳过 {len(covered)} 个本来就要补回的切片：{', '.join(covered)}")
 print(f"config: {cfg}")
 tot_l = tot_m = 0
 print(f"可删目录 {len(todo)} 个：")
@@ -37,7 +45,6 @@ if skip:
     for d, why in skip: print(f"  保留 {d}  <- {why}")
 print(f"总计 {tot_m}MB / {tot_l}行")
 
-rest = restore_list()
 if rest:
     rm_m = sum(T.mb(tree, d) for d in rest)
     print(f"\n--apply 后补回 {len(rest)} 个切片（源 {orig}，{rm_m}MB）：")
@@ -49,6 +56,10 @@ if not apply_:
 for d in todo:
     subprocess.run(['rm', '-rf', os.path.join(tree, d)], check=True)
 print(f"删除 {len(todo)} 个目录，清理 {T.strip_sources(tree, todo)} 条 source 行")
+print(f"补回 {T.restore_kconfigs(tree)} 个 Kconfig（源 {T.TAR}）—— 符号定义不能随目录消失")
+open(os.path.join(tree, '.trimmed'), 'w').write(
+    'pruned %s  dirs=%d\n' % (__import__('time').strftime('%F %T'), len(todo)))
+print(f"写标记 {tree}/.trimmed（preflight 用它确认这是裁剪树）")
 for d in rest:
     src, dst = os.path.join(orig, d), os.path.join(tree, d)
     if not os.path.isdir(src): sys.exit(f"补回源不存在: {src}（设 KTREE_ORIG 指向原版源码树）")

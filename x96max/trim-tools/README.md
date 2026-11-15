@@ -70,6 +70,9 @@ grep -c 'undefined reference' 编译日志                                      
    `arch/x86/entry/syscalls`(3)、`tools/include`(255)、`arch/arm/boot/dts`(2916)、`arch/riscv/boot/dts`(130)、
    `rust`(585) 六处在 `--apply` 删完后立刻从 `$KTREE_ORIG` `cp -a` 回来，表就是 `restore.txt`
    （每行上方写了谁引用它，日志行号在 `~/kernel/X96max.md` §5.3）。
+   第 7 处是 `tools/lib/bpf`：`kernel/bpf/{btf,btf_relocate,relo_core,btf_iter}.c` 直接 `#include`
+   `../../tools/lib/bpf/*.c|*.h`（include 的是源码本体），删 `tools/` 不是 clean 阶段断，而是
+   `CC kernel/bpf/btf.o` → `fatal error: ../tools/lib/bpf/relo_core.h: 没有那个文件或目录`。
    `KILL Documentation` 还必须同时删掉顶层 `Makefile` 的 `clean-dirs` 里那一项，否则 `make clean` 报
    `scripts/Makefile.clean:12: Documentation/Makefile: 没有那个文件或目录`。
    2026-11-15 08:33 实测 `--apply` 幂等：删 5 目录 + 补 6 切片后仍是 **545M / 37911 文件**，

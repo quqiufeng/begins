@@ -8,7 +8,7 @@
 #
 # 用法：
 #   ./x96max/pack-kernel.sh                # 打全量版（kbuild-7.2.12 + src-full 按需解压）
-#   ./x96max/pack-kernel.sh --trim         # 打裁剪版（kbuild-trim + src-clean）
+#   ./x96max/pack-kernel.sh --trim         # 打裁剪版（kbuild-trim + src-trim）
 #   ./x96max/pack-kernel.sh --trim --stage # 打完并把裁剪包放进 ophub 目录（做裁剪镜像前必做）
 #   ./x96max/pack-kernel.sh -n             # 只打印三元组与 sha 校验，不落包
 #   ./x96max/full/pack-kernel.sh | ./x96max/trim/pack-kernel.sh   # 两套固定入口

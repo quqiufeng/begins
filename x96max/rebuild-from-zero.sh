@@ -4,7 +4,7 @@
 #
 # 用法：
 #   ./x96max/rebuild-from-zero.sh                # 全量套（默认，先清空全量套旧产物）
-#   ./x96max/rebuild-from-zero.sh --trim         # 裁剪套（src-clean + kbuild-trim + 7.2.12-x96-trim）
+#   ./x96max/rebuild-from-zero.sh --trim         # 裁剪套（src-trim + kbuild-trim + 7.2.12-x96-trim）
 #   ./x96max/rebuild-from-zero.sh --mode trim    # 同上
 #   ./x96max/rebuild-from-zero.sh --from initrd   # 跳过内核，复用 kbuild-*/Image
 #   ./x96max/rebuild-from-zero.sh --from pkgs     # 只重打四包
@@ -15,7 +15,7 @@
 # 两套参数全部由 lib/mode.sh 给出，互不覆盖：
 #   MODE  CFG(=x96max/kernel/config-7.2.12-x96-<MODE>)  KSRC        OUT           KNAME              PKGS
 #   full  config-7.2.12-x96-full                          src-full    kbuild-7.2.12 7.2.12-x96        pkgs/full
-#   trim  config-7.2.12-x96-trim                          src-clean   kbuild-trim   7.2.12-x96-trim   pkgs/trim
+#   trim  config-7.2.12-x96-trim                          src-trim    kbuild-trim   7.2.12-x96-trim   pkgs/trim
 # 成品：recovery/x96-full-autoinstall.img.gz / recovery/x96-trim-autoinstall.img.gz
 # 路径可覆盖：X96_BUILD_ROOT(默认 /x96-build) / X96_KSRC / X96_KOUT / X96_KNAME / X96_CFG / X96_CFG_MODE
 # 日志落 $X96_BUILD_ROOT/logs/from0-<MODE>-<ts>/，每步一个文件。
@@ -50,7 +50,7 @@ run_stage() { case $FROM in clean) return 0;; kernel) [[ $1 == kernel ]];; initr
   pkgs) [[ $1 == pkgs ]];; image) [[ $1 == image ]];; esac; }
 
 for v in CFG BASE; do [[ -e ${!v} ]] || { echo "缺: $v=${!v}" >&2; exit 1; }; done
-# 源码树：full 缺席就现解压（不要求常驻）；trim 的 src-clean 必须有
+# 源码树：full 缺席就现解压（不要求常驻）；trim 的裁剪树必须有（src-trim/src-clean/$KV-trim 自动找）
 x96_ensure_src || exit 1
 mkdir -p "$OUT" "$ROOT/logs" "$(dirname "$IMG")"
 for t in aarch64-linux-gnu-gcc qemu-aarch64-static mkimage zstd; do

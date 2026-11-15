@@ -17,7 +17,7 @@
 # 应用：
 #   cp $BASE /x96-build/kbuild-trim/.config
 #   cat <fragment> >> /x96-build/kbuild-trim/.config
-#   make -C /x96-build/src-clean O=/x96-build/kbuild-trim ARCH=arm64 \
+#   make -C /x96-build/src-trim O=/x96-build/kbuild-trim ARCH=arm64 \
 #        CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 set -u
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)

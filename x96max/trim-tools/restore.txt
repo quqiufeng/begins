@@ -22,3 +22,7 @@ arch/riscv/boot/dts
 
 # 顶层 Makefile:1742、1756-1758 的 clean 目标列了 rust/libmacros.so 等
 rust
+
+# kernel/bpf/{btf,syscall,btf_relocate,relo_core,btf_iter}.c 跨目录 #include ../../tools/lib/bpf/*.c|*.h
+# （直接 include 源码，不是头文件搜索路径）→ 删 tools/ 会在 CC kernel/bpf/btf.o 阶段 fatal error
+tools/lib/bpf

@@ -3,7 +3,7 @@
 # 只检查前置，不改任何文件；任何一项 FAIL 就不要往下走。
 #
 #   ./x96max/preflight.sh             # 查全量套（config-7.2.12-x96-full + src-full 按需解压）
-#   ./x96max/preflight.sh --trim      # 查裁剪套（config-7.2.12-x96-trim + src-clean）
+#   ./x96max/preflight.sh --trim      # 查裁剪套（config-7.2.12-x96-trim + src-trim，名字自动找）
 #   ./x96max/full/preflight.sh        # 两套固定入口
 #   ./x96max/trim/preflight.sh
 #   X96_BUILD_ROOT=/other ./x96max/preflight.sh
@@ -32,7 +32,7 @@ x96_mode_show | sed 's/^/   /'
 # --- 源码树 ---
 # full：树不是必备资产，缺了 x96_ensure_src 会从源码包现解压（约 9s / 1.8G），
 #       所以这里只要求「包在」，树在场时才做内容抽检。
-# trim：src-clean 是「解压+裁剪」的产物，解压还原不出来 → 必须存在。
+# trim：裁剪树是「解压+裁剪」的产物，解压还原不出来 → 必须存在（x96_pick_trim_src 自动找）。
 ck "源码包 $SRC_XZ"                 "test -f $SRC_XZ"
 if [[ -f $S/Makefile ]]; then
   ck "源码树 $S 已就绪"             "test -d $S"

@@ -6,7 +6,7 @@
 #
 # 用法：
 #   ./x96max/build-kernel.sh              # 全量版（默认）：config-...-full + src-full → kbuild-7.2.12
-#   ./x96max/build-kernel.sh --trim       # 裁剪版：config-...-trim + src-clean → kbuild-trim
+#   ./x96max/build-kernel.sh --trim       # 裁剪版：config-...-trim + src-trim → kbuild-trim
 #   ./x96max/build-kernel.sh --mode trim  # 同上（另一种写法）
 #   ./x96max/build-kernel.sh my.config    # 用指定 .config（仍按 MODE 选源码树/产物树）
 #   ./x96max/build-kernel.sh -n           # 只打印解析出的路径/校验，不编译
@@ -17,7 +17,7 @@
 # 参数由 lib/mode.sh 统一决定（两套成对，不会串）：
 #   MODE  CFG(=kernel/config-7.2.12-x96-<MODE>)  KSRC                 OUT
 #   full  config-7.2.12-x96-full                 src-full(按需解压)    kbuild-7.2.12
-#   trim  config-7.2.12-x96-trim                 src-clean            kbuild-trim
+#   trim  config-7.2.12-x96-trim                 src-trim             kbuild-trim
 # KNAME：full=7.2.12-x96  trim=7.2.12-x96-trim（与 CONFIG_LOCALVERSION 对应）
 # 可用 X96_KOUT / X96_KSRC / X96_CFG 覆盖路径。
 #

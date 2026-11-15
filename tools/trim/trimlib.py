@@ -19,6 +19,9 @@
 """
 import re, os, collections, subprocess
 
+# 原版源码包：补回 Kconfig 用（见 restore_kconfigs）。
+TAR = os.environ.get('KTAR', '/opt/linux/src/linux-7.2.12.tar.xz')
+
 # ---------------------------------------------------------------- rules / config
 
 def read_rules(path, tree):
@@ -109,7 +112,9 @@ def parent_gate(tree, d):
     except OSError: return (None, None)
     txt = txt.replace('\\\n', ' ')            # 续行拉平
     for ln in txt.splitlines():
-        if base + '/' not in ln: continue
+        # 按 token 比对，不能 `base + '/' in ln`：`squashfs/` 里就含 `hfs/`，
+        # 于是 fs/hfs 被误判成「由 CONFIG_SQUASHFS 收」（实测，导致它白留 1M）。
+        if base + '/' not in ln.split('#')[0].split(): continue
         m = re.match(r'\s*obj-\$\(CONFIG_([A-Za-z0-9_]+)\)\s*\+?=', ln)
         if m: return ('cond', m.group(1))
         if re.match(r'\s*obj-y\s*\+?=', ln): return ('always', None)
@@ -136,7 +141,10 @@ def judge(tree, d, en, live, protect=(), force=()):
     if hit: return 'Makefile 引用 %s (=y/=m)' % ','.join(hit[:3])
     kind, sym = parent_gate(tree, d)
     if kind == 'cond' and sym in en: return '父 Makefile obj-$(CONFIG_%s) 收它 (=y)' % sym
-    if kind == 'cond': return '父 Makefile obj-$(CONFIG_%s)，config 里没有 → 真没人用' % sym
+    # 父 Makefile 是 obj-$(CONFIG_X) 条件收，而 config 里 X 根本不存在 → 这个目标恒不进编译树，可删。
+    # 注意必须 return None：judge() 的约定是「返回字符串 = 保留，None = 可删」。旧代码这里返回了一句
+    # 「真没人用」的理由字符串，于是判据判它可删、调用方却当它保留，165 个目录（含 drm/amd 538M）全部漏删。
+    if kind == 'cond': return None
     if kind == 'always': return '父 Makefile 无条件 obj-y 收它'
     return None
 
@@ -147,7 +155,8 @@ def plan(tree, cfg, rules):
     s2k = sym2kc(tree)
     live = live_counts(top, en, s2k)
     reason = {d: judge(tree, d, en, live, protect, force) for d in top}
-    return [d for d in top if reason[d] is None], [(d, reason[d]) for d in top if reason[d]]
+    todo = [d for d in top if reason[d] is None and not only_kconfig(tree, d)]
+    return todo, [(d, reason[d]) for d in top if reason[d]]
 
 # ---------------------------------------------------------------- 体积统计
 
@@ -167,6 +176,17 @@ def mb(tree, d):
 
 # ---------------------------------------------------------------- 收尾清理
 
+def only_kconfig(tree, d):
+    """目录里只剩 Kconfig*（已裁过、Kconfig 被补回）→ 不算待删，保证 dry-run 幂等。"""
+    p = os.path.join(tree, d)
+    if not os.path.isdir(p): return False
+    seen = False
+    for root, _, fs in os.walk(p):
+        for f in fs:
+            seen = True
+            if not f.startswith('Kconfig'): return False
+    return seen
+
 def strip_sources(tree, dirs):
     """删掉指向 `dirs`（已删目录）或已不存在的 `source ".../Kconfig"` 行，返回清理条数。
 
@@ -174,7 +194,10 @@ def strip_sources(tree, dirs):
     而不是相对所在文件，按 `root` 判存在会误删 `arch/Kconfig` 里的 `kernel/gcov/Kconfig`；
     `$(SRCARCH)` 这类动态路径永远不存在，误删会让整个 arch 的 Kconfig 不再被 source。
     """
-    pat = re.compile(r'^\s*source\s+"([^"]+)/Kconfig"\s*$')
+    # 文件名不一定是 Kconfig：scsi 用的是 Kconfig.megaraid / Kconfig.iscsi 这类。
+    # 旧正则写死 "/Kconfig" 结尾，于是 `source "drivers/scsi/megaraid/Kconfig.megaraid"`
+    # 匹配不上、行留着，olddefconfig 直接 can't open file 报错（本轮实测卡在这）。
+    pat = re.compile(r'^\s*source\s+"([^"]+)"\s*$')
     removed = 0
     for root, _, fs in os.walk(tree):
         if '/.git' in root: continue
@@ -196,3 +219,23 @@ def strip_sources(tree, dirs):
                 out.append(ln)
             if ch: open(p, 'w', encoding='utf-8', errors='surrogateescape').write(''.join(out))
     return removed
+
+def restore_kconfigs(tree, tar=None):
+    """从源码包再抽一遍所有 Kconfig*（覆盖回原位），返回补回的个数。
+
+    为什么必须补（2026-11-15 实测）：符号的定义一旦随目录消失，它在**别处**就成了
+    undefined，而 `depends on X=n` 这类表达式会从「真」翻成「假」——删掉 fs/ext2/
+    之后 `config EXT4_USE_FOR_EXT2`（depends on EXT2_FS=n）直接没了，
+    ext4 就不再接管 ext2/ext3 挂载，这种掉配置不报错、只有 diff 才看得见。
+    补回后目录里只剩 Kconfig（几 KB），Makefile 里 `obj-$(CONFIG_X) += dir/` 因为 X=n
+    不会进编译，符号定义却还在，olddefconfig 与原 config 逐行一致。
+    """
+    tar = tar or TAR
+    if not os.path.isfile(tar):
+        raise SystemExit('缺源码包 %s（设 KTAR 指向 linux-<ver>.tar.xz）' % tar)
+    subprocess.run(['tar', '-xJf', tar, '-C', tree, '--strip-components=1',
+                    '--wildcards', '*/Kconfig*'], check=True)
+    n = 0
+    for root, _, fs in os.walk(tree):
+        n += sum(1 for f in fs if f.startswith('Kconfig'))
+    return n
