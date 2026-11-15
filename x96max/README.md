@@ -12,7 +12,8 @@
 |---|---|---|
 | **开工** | `preflight.sh` | **只读自检 19 项**（源码树钩子三连 / 配置 `=y` / 两份配置同源 / 工具链 / 脚本可执行），全绿才开建，对应 `X96max.md` §0.2 第 0 步 |
 | 环境 | `mkbase.sh` | 用源码 rootfs 造 rebuild 需要的基础镜像 `base-own.img`（2560M ext4 + base-boot-backup） |
-| 裁剪 | `kernel/gen-trim.sh` → `kernel/x96-trim.fragment` | 从 `config-7.2.12-x96` 扫出激进裁剪 fragment（2896 个 `=m` → ~1100） |
+| 裁剪 | `kernel/gen-trim.sh` → `kernel/x96-trim.fragment` | 第一轮：从 `config-7.2.12-x96` 扫出激进裁剪 fragment（只动 `=m`），**基线是裁剪树，会踩 §5.7 的符号丢失** |
+| 裁剪 | `kernel/gen-trim2.sh` → `configs/trim2-*.fragment` | **第二轮（2026-11-15，现用）**：基线必须是全量树 `kbuild-clean/.config`；规则 A 除白名单外关掉所有 `=m`，规则 B 只关整块 `=y` 子系统 → 镜像 42.2→32.2 MB、模块 5816→140（§5.8）|
 | 裁剪 | `trim-tools/*.py` | 源码树裁剪工具箱（`prune_src.py` 删目录、`fix_makefiles*.py` 补 Makefile、`plan.py`、`sym2kc.py`），规则见 `trim-tools/rules.txt` |
 | 编译 | `build-kernel.sh` | 只编内核（§19.3）：olddefconfig + Image + modules + dtb + modules_install，带计时、`rc`/`sec` 落盘（原 `/x96-build/run-timed.sh`） |
 | initrd | —（在 `rebuild-from-zero.sh --from initrd`） | loop 挂 base → chroot qemu → `depmod` + `update-initramfs` → `mkimage` 出 uInitrd |
@@ -26,7 +27,8 @@
 | 校验 | `verify-card.sh` | 卡 vs 备份镜像：两侧 `ro,noload` 挂载逐文件 sha256 对拍（不用裸盘 cmp） |
 | 备份 | `backup-card.sh` | 把已验证可启动的卡备份成可还原镜像 |
 | 安装 | `x96-autoinstall.sh` + `x96-autoinstall.service` | 首启自动 `armbian-install` 装到 eMMC（防 apt 吃 stdin、done 标记只在成功后写） |
-| 配置 | `kernel/config-7.2.12-x96` | 实编归档的最终 .config |
+| 配置 | `kernel/config-7.2.12-x96` | 第一轮（裁剪树）实编归档的 .config |
+| 配置 | `kernel/config-7.2.12-x96-trim` | **第二轮（全量树 + 硬件裁剪）实编归档的 .config**，与 `configs/config-7.2.12-x96-trim-20261115` 同源 |
 | 配置 | `config-x96-source.conf` | armbian-build 的 rootfs 构建参数（BLOCK 列表在此） |
 
 第三方工具（不是我们写的，别改）：`/x96-build/{armbian-build, amlogic-s9xxx-armbian, pyamlboot, radxa-aml, aml-flash-tool}`。

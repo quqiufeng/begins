@@ -1029,6 +1029,81 @@ sudo ./x96max/rebuild-from-zero.sh --from initrd
 ./x96max/rebuild-from-zero.sh --from image
 ```
 
+### 5.8 第二轮裁剪：在**全量树**上按硬件剪（2026-11-15 18:11，镜像 42.2→32.2 MB，模块 5816→140）
+
+§5.7 的教训是"裁剪树会静默丢符号"，所以这一轮**不改源码树**，只在**全量树 `src-clean`** 上改配置：
+符号空间完整，丢一个符号就一定是自己划掉的。
+
+**两条规则**（脚本 `x96max/kernel/gen-trim2.sh`，可重跑）
+
+| 规则 | 内容 | 结果 |
+|---|---|---|
+| A | 除白名单外**所有 `=m` 一律关** | 2896 → 153 |
+| B | `=y` 只关"整块子系统"：`ARCH_{SUNXI,ROCKCHIP}`、媒体 DVB/模拟电视/摄像头/SDR/测试、`ATA` `MD` `MTD` `SCSI_LOWLEVEL` `VIRTIO` `KVM` `INFINIBAND` `ISDN` `HAMRADIO` `CAN` `NFC` `ATM` `WAN` `6LOWPAN` `IEEE802154` `TARGET_CORE`、xfs/btrfs/f2fs/nfs/nfsd/cifs/ceph/ocfs2/udf/hfs/… | 2631 → 2069 |
+
+白名单只留板上真用得上的模块：`SND_MESON_*`（音频）、`DRM_PANFROST`（GPU）、
+`VIDEO_MESON_VDEC/GE2D`（硬解，**在 staging/media 里，所以 `STAGING` 不能关**）、
+`RTW88*`+`MAC80211`+`CFG80211`+`BT*`（Wi-Fi/BT，见 §0.3，本轮一并补上 `=m`）、
+`NF_TABLES`/`NFT_*`/`IP_NF_*`/`IP6_NF_*`（防火墙）、`TUN/VETH/VLAN/WIREGUARD/ZRAM`、
+`NTFS3/ISO9660`、`USB_SERIAL_{FTDI_SIO,PL2303}`。
+
+**实测数字（同一棵树、同一工具链，`-j6`）**
+
+| 项 | 全量基线 `kbuild-clean` | 裁剪后 `kbuild-trim` |
+|---|---|---|
+| `.config` 行数 | 10390 | 8922 |
+| `=y` / `=m` | 2631 / 2896 | **2069 / 153** |
+| `arch/arm64/boot/Image` | 42 220 032 B | **32 178 688 B**（−23.8%） |
+| `.ko` 个数 / 总大小 | 5816 / 205.6 MB | **140 / 8.3 MB** |
+| amlogic dtb | — | 102 个（全留） |
+| 编译时间 | 8 分 15 秒 | 约 8 分钟（17:5x→18:11） |
+
+**复现**
+
+```bash
+BASE=/x96-build/kbuild-clean/.config OUT=/x96-build/trim2-20261115.fragment \
+  ./x96max/kernel/gen-trim2.sh                       # 生成 fragment（自带板载驱动误砍自检）
+cp /x96-build/kbuild-clean/.config /x96-build/kbuild-trim/.config
+cat /x96-build/trim2-20261115.fragment >> /x96-build/kbuild-trim/.config
+make -C /x96-build/src-clean O=/x96-build/kbuild-trim ARCH=arm64 \
+     CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+# Wi-Fi/BT 模块（§0.3 的缺口，本轮补上）
+for s in WLAN CFG80211 MAC80211 RFKILL RTW88 RTW88_SDIO RTW88_8822B RTW88_8822BS \
+         BT BT_HCIUART BT_HCIUART_RTL; do
+  /x96-build/src-clean/scripts/config --file /x96-build/kbuild-trim/.config -m "$s"
+done
+make -C /x96-build/src-clean O=/x96-build/kbuild-trim ARCH=arm64 \
+     CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+make -C /x96-build/src-clean O=/x96-build/kbuild-trim ARCH=arm64 \
+     CROSS_COMPILE=aarch64-linux-gnu- -j6 Image modules dtbs 2>&1 | tee /x96-build/build-trim.log
+```
+
+归档：`configs/config-7.2.12-x96-trim-20261115` = `x96max/kernel/config-7.2.12-x96-trim` = 实编 `.config`；
+fragment 在 `configs/trim2-20261115.fragment`。
+
+**板载全链复核（全部 `=y`，本轮逐个 grep 过）**
+
+```text
+ARCH_MESON MESON_SM ARM_PSCI_FW PM_GENERIC_DOMAINS(_OF) ARM_PSCI_CPUIDLE_DOMAIN DT_IDLE_GENPD
+MESON_EE_PM_DOMAINS MESON_CANVAS MESON_GX_SOCINFO COMMON_CLK_AXG/AXG_AUDIO/G12A PINCTRL_MESON_G12A
+STMMAC_ETH DWMAC_MESON REALTEK_PHY MDIO_BUS_MUX_MESON_G12A MMC_MESON_GX MMC_BLOCK
+USB_DWC2 USB_DWC3 USB_DWC3_MESON_G12A USB_XHCI_HCD USB_STORAGE USB_HID
+PHY_MESON_G12A_USB2 PHY_MESON_G12A_USB3_PCIE DRM_MESON DRM_MESON_DW_HDMI
+SERIAL_MESON(_CONSOLE) I2C_MESON AMLOGIC_THERMAL MESON_WATCHDOG PWM_MESON NVMEM_MESON_EFUSE
+RESET_MESON MESON_SARADC
+```
+
+`=y` 一共少了 598 个，但**没有一个 MESON/板载驱动**：丢的是其他 SoC（rockchip/sunxi 的 clk/pinctrl/phy/mmc/dwmac）、
+x86 专用的 ATA/触摸屏/USB gadget 旧机、以及 §5.7 恢复回来的 genpd/perf 这轮都还在。
+
+**注意（下一步必须做）**
+
+1. 模块从 5816 个变 140 个，**`--from initrd` 必须重做**（depmod + update-initramfs），否则 initramfs 里
+   引用的旧模块名在 rootfs 里已不存在。
+2. 打四件套要指到新树：`X96_KOUT=/x96-build/kbuild-trim X96_KSRC=/x96-build/src-clean ./x96max/pack-kernel.sh`。
+3. 本轮**只验证到"编译零错误 + 配置对得上"**，没上机；上机判据仍是 §10.3 的 dmesg 清单
+   （以太网 PHY、mmcblk、xhci、HDMI 声卡、掉盘）。
+
 ---
 
 ## 6. 生成 arm64 initrd / uInitrd
