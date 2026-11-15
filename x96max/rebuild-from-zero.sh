@@ -52,6 +52,8 @@ run_stage() { case $FROM in clean) return 0;; kernel) [[ $1 == kernel ]];; initr
 for v in CFG BASE; do [[ -e ${!v} ]] || { echo "缺: $v=${!v}" >&2; exit 1; }; done
 # 源码树：full 缺席就现解压（不要求常驻）；trim 的裁剪树必须有（src-trim/src-clean/$KV-trim 自动找）
 x96_ensure_src || exit 1
+# trim 套：裁剪审计闸（被剥空目录 / 被剥掉的 Makefile 行），非 0 立刻停
+x96_audit_trim || exit 1
 mkdir -p "$OUT" "$ROOT/logs" "$(dirname "$IMG")"
 for t in aarch64-linux-gnu-gcc qemu-aarch64-static mkimage zstd; do
   command -v $t >/dev/null || { echo "缺工具: $t" >&2; exit 1; }
@@ -88,6 +90,7 @@ if run_stage kernel; then
     cd "$KSRC"
     make O="$OUT" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
     make O="$OUT" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image modules
+    # 裁剪树已删非 amlogic 的 dts 目录，只能编单 dtb，不能 `make dtbs`
     make O="$OUT" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- amlogic/meson-g12a-x96-max.dtb
     make O="$OUT" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
       INSTALL_MOD_PATH="$OUT/modules" modules_install

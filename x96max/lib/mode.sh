@@ -102,6 +102,35 @@ x96_ensure_src() {
   echo "  解压完成 $(($(date +%s) - t0))s，$(du -sh "$KSRC" | cut -f1)"
 }
 
+# 裁剪树防回归闸：prune_src.py 删目录时会把 `obj-$(CONFIG_X) += dir/` 改成空
+# RHS，符号还 =y 就是静默丢代码，症状迟到大链接期（undefined reference）才爆。
+# 所以 MODE=trim 一律先跑 trim-tools/audit_stubs.py，非 0 直接中止。
+#   X96_SKIP_AUDIT=1  跳过（只在你明确知道在干什么时用）
+x96_audit_trim() {
+  [[ $MODE == trim ]] || return 0
+  [[ ${X96_SKIP_AUDIT:-0} == 1 ]] && { echo "  跳过裁剪审计（X96_SKIP_AUDIT=1）"; return 0; }
+  local tool=$HOME/kernel/tools/trim/audit_stubs.py
+  if [[ ! -f $tool ]]; then
+    echo "  警告：缺裁剪审计脚本 $tool，跳过" >&2
+    return 0
+  fi
+  command -v python3 >/dev/null || { echo "  警告：缺 python3，跳过裁剪审计" >&2; return 0; }
+  # 用 CFG 本尊（每次开跑都会 cp 到 $OUT/.config，语义一致）；CFG 缺才退回旧 .config
+  local kcfg=$CFG
+  [[ -f $kcfg ]] || kcfg=$OUT/.config
+  local out rc
+  out=$(KTREE=$KSRC KCFG=$kcfg python3 "$tool" 2>&1); rc=$?
+  if [[ $rc -eq 0 ]]; then
+    echo "  裁剪审计通过（$KSRC）"
+  else
+    echo "$out" >&2
+    echo "X 裁剪审计失败：上面这些目录/行还住着 =y/=m 的符号，直接编会缺功能或链接失败" >&2
+    echo "  补回：KTREE=$KSRC KCFG=$kcfg python3 $tool --restore" >&2
+    echo "  或确知无害：X96_SKIP_AUDIT=1 重跑" >&2
+    return 1
+  fi
+}
+
 # 编完释放全量树（只对 full 且确实是解压出来的树生效）。
 x96_drop_src() {
   [[ ${1:-} == 1 || ${X96_CLEAN_SRC:-0} == 1 ]] || return 0

@@ -20,6 +20,7 @@
 #   trim  config-7.2.12-x96-trim                 src-trim             kbuild-trim
 # KNAME：full=7.2.12-x96  trim=7.2.12-x96-trim（与 CONFIG_LOCALVERSION 对应）
 # 可用 X96_KOUT / X96_KSRC / X96_CFG 覆盖路径。
+# trim 套开跑前先过裁剪审计（tools/trim/audit_stubs.py）；确知无害可 X96_SKIP_AUDIT=1 跳过。
 #
 # 产物：$OUT/{arch/arm64/boot/Image, .../meson-g12a-x96-max.dtb, modules/, System.map}
 # 结果：$ROOT/logs/build-<MODE>-<ts>.log，以及 $OUT/.build-rc / .build-sec（退出码/耗时秒）
@@ -74,6 +75,8 @@ fi
 
 # 全量套：源码树不存在就地解压（不再要求常驻一份 src-linux）
 x96_ensure_src || exit 2
+# trim 套：先审计「被剥空的目录 / 被剥掉的 Makefile 行」，非 0 立刻停（X96_SKIP_AUDIT=1 跳过）
+x96_audit_trim || exit 2
 
 mkdir -p "$OUT" "$(dirname "$LOG")"
 cp "$CFG" "$OUT/.config"
@@ -84,6 +87,8 @@ set +e
   cd "$KSRC"
   make O="$OUT" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
   make O="$OUT" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$JOBS" Image modules
+  # 注意：裁剪树已删 arch/arm/boot/dts、arch/riscv/boot/dts（省 29M），
+  #       所以只能按「单 dtb 目标」编，绝不能 `make dtbs`（全量会直接报错）。
   make O="$OUT" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- amlogic/meson-g12a-x96-max.dtb
   make O="$OUT" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
     INSTALL_MOD_PATH="$OUT/modules" modules_install

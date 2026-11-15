@@ -60,6 +60,12 @@ ck "FAT/MSDOS/VFAT 三连 =y"         "[ \$(grep -cE '^CONFIG_(FAT_FS|MSDOS_FS|V
 ck "归档存在 $CFG2"                 "test -f $CFG2"
 ck "两份配置同源（diff -q）"        "diff -q $CFG $CFG2"
 
+# --- 裁剪审计（trim 套；build-kernel/rebuild-from-zero 开跑前也拦一次）---
+if [[ $MODE == trim && -d $S ]]; then
+  ck "裁剪审计 audit_stubs.py（无活符号住空壳目录）" \
+     "KTREE=$S KCFG=$CFG python3 $HOME/kernel/tools/trim/audit_stubs.py"
+fi
+
 # --- 素材与工具链 ---
 for t in aarch64-linux-gnu-gcc qemu-aarch64-static mkimage zstd sudo; do
   ck "工具 $t"                      "command -v $t"

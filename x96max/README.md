@@ -106,6 +106,12 @@ sudo ./x96max/patch-bootargs.sh --usb-fix 346d:5678   # U 盘读一半掉线时�
   取第一个带 `Makefile` 的（旧文档写的 `src-clean` 这台机器上从没落盘，trim 模式因此一直报「缺源码树」）。
   删了用 `kernel/gen-trim.sh` 重生成，或解压后跑 `trim-tools/prune_src.py --apply`（会写 `<树>/.trimmed` 标记）。
 
+**裁剪审计闸**：`prune_src.py` 删目录时会把 `obj-$(CONFIG_X) += dir/` 改成空 RHS，
+若符号还 `=y` 就是静默丢代码，症状迟到大链接期（undefined reference）才爆。
+所以 `MODE=trim` 的 `build-kernel.sh` / `rebuild-from-zero.sh` 在解包后**先跑**
+`tools/trim/audit_stubs.py`（`KTREE=$KSRC KCFG=$CFG`），非 0 直接中止，不会白编一轮。
+补回：`python3 tools/trim/audit_stubs.py --restore`；确知无害时 `X96_SKIP_AUDIT=1` 跳过。
+
 ## 4. 公共环境变量（各脚本都认，默认值都在 `lib/mode.sh`）
 
 | 变量 | 默认 | 说明 |
