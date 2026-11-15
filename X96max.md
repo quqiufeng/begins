@@ -6,8 +6,137 @@
 > 最近一次整车重建（2026-11-15 09:18→09:28，`sudo x96max/rebuild-from-zero.sh --from image`）：交付镜像 `/x96-build/recovery/x96src-autoinstall.img.gz` 272M，sha256 `13ece9df…b5b1ad1`。
 > 本文目标：记录硬件、现有系统打包方式，以及**从 Linux 7.2.12 源码编译内核 → 源码构建 rootfs → ophub 打包 → SD/U 盘验证 → eMMC 安装 → 体积裁剪** 的完整过程。
 > 状态：**已成功从 eMMC 启动裁剪后的源码系统**（155 包，rootfs ~568M；主线 U-Boot）。
-> 无线策略（2026-11 更新）：**保留 Wi-Fi/蓝牙驱动与固件**（RTL8822BS → `rtw88_8822bs` + `btrtl`），内核里不再 `-d` 关闭；有线 RTL8211F 仍是主用网络。
+> 无线策略（2026-11 更新）：**目标是保留 Wi-Fi/蓝牙驱动与固件**（RTL8822BS → `rtw88_8822bs` + `btrtl`），内核里不再 `-d` 关闭；有线 RTL8211F 仍是主用网络。
+> ⚠️ **当前构建尚未达成**：裁剪树里 `net/wireless`、`net/mac80211`、`drivers/net/wireless/` 已整目录删除，配置里也没有 `RTW88*`，所以 7.2.12-x96 的内核**没有 Wi-Fi 驱动**（蓝牙源码 48 项还在，但 `CONFIG_BT*` 未开）。补法见 §0.3。
 > 仓库脚本：**本仓库 `x96max/`**（`build-image.sh` 一键镜像、`write-card.sh` 安全写卡 + 校验、`config-x96-source.conf` rootfs 配置、`x96-autoinstall.*` 首启自动安装、`x96max/kernel/config-7.2.12-x96` 最终内核配置、`mkbase.sh` 自造 rebuild 基础镜像）。
+
+---
+
+## 0. 当前任务单（2026-11-15 14:35）
+
+**要做的事**：打包一个 X96 Max 安装镜像，走 ophub 打包流程，但内核必须用**裁剪过的源码树自编译**（不是 ophub 现成内核）。
+
+固定输入（不许换成别的）：
+
+| 项 | 路径 |
+|---|---|
+| 裁剪源码树 | `/x96-build/src-linux`（7.2.12，549M） |
+| 内核 `O=` 输出 | `/x96-build/kbuild-7.2.12` |
+| 内核配置 | `/home/quqiufeng/kernel/x96max/kernel/config-7.2.12-x96`（`LOCALVERSION=-x96`，**必须含 FAT**；与 `configs/config-7.2.12-x96-20261115` 逐字节相同） |
+| 脚本 | `/home/quqiufeng/kernel/x96max/*.sh` |
+| 目标产物 | 可刷 `img.gz`（ophub 布局，首启自动装 eMMC） |
+
+**进度（卡在这里）**：
+
+1. ✅ 补回被裁掉的 FAT 支持：源码 `fs/fat/` 已回，钩子 `fs/Kconfig:136`、`fs/Makefile:55` 已接，配置加 `FAT_FS/MSDOS_FS/VFAT_FS=y` + `FAT_DEFAULT_UTF8/codepage=437/iocharset=utf8`。原因：p1 是 FAT32，缺 FAT 则 `/boot` 挂不上。
+   - 合并后的配置已落到**两个权威路径**（与 `kbuild-7.2.12/.config` 逐字节相同，即编出当前 Image 的那份）：`x96max/kernel/config-7.2.12-x96`（`build-kernel.sh` / `rebuild-from-zero.sh` 的默认 CFG）和 `configs/config-7.2.12-x96-20261115`。`/x96-build/config-x96-20261115-fat` 只是同一份的临时副本，不再作为入口。
+2. ✅ 内核已编出：`/x96-build/kbuild-7.2.12/arch/arm64/boot/Image`，14:23，35.9MB；`.config` 三项 `=y`，`strings Image | grep -x vfat` 命中。
+3. ⬜ **重打包四件套**：`./x96max/pack-kernel.sh` —— 现有 `/x96-build/pkgs/*` 是 09:20 的旧内核（无 FAT），必须覆盖。
+4. ⬜ **重出镜像**：`./x96max/rebuild-from-zero.sh --from image` —— 现有 `Armbian_26.11.0_amlogic_s905x2_trixie_7.2.12_server_2026.11.15.img.gz`（09:27）也是旧内核。
+5. ⬜ 写卡验证：`sudo ./x96max/write-card.sh <新img.gz> /dev/sdX`。
+6. ⬜ **无线缺口**：当前树/配置里没有 `net/wireless`、`net/mac80211`、`drivers/net/wireless`，`CONFIG_RTW88*`、`CONFIG_BT*` 全未开 → 内核无 Wi-Fi/蓝牙驱动（有线正常）。补法与证据见 §0.3；这一项不动也不影响 FAT 这条主线。
+
+### 0.1 源码缺失时的补齐来源（唯一权威包）
+
+裁剪树 `/x96-build/src-linux` 删过整目录，编译报「找不到某文件/某目录」时**不要手写、不要从别处抄**，一律从完整源码包解回来：
+
+```bash
+# 完整源码包（160M，顶层目录 linux-7.2.12/，10 月 25 日归档，只读别改）
+SRC=/opt/linux/src/linux-7.2.12.tar.xz
+
+# ① 先确认包里有、树里没有（以 fs/fat 为例）
+tar -tf $SRC | grep '^linux-7.2.12/fs/fat/'          # 包里 14 个
+ls /x96-build/src-linux/fs/fat                        # 树里实际有的
+
+# ② 只解某几个文件（推荐：不动 mtime 之外的任何东西）
+cd /tmp && tar -xf $SRC linux-7.2.12/fs/fat/Kconfig
+cp /tmp/linux-7.2.12/fs/fat/Kconfig /x96-build/src-linux/fs/fat/
+
+# ③ 或整目录解回（覆盖同目录，先确认没有本地改动）
+cd /tmp && tar -xf $SRC linux-7.2.12/fs/fat
+cp -a /tmp/linux-7.2.12/fs/fat /x96-build/src-linux/fs/
+
+# ④ 解完补钩子：Kconfig 的 source、Makefile 的 obj-$(CONFIG_xxx) += 目录/
+#    （裁剪脚本容易把 menu 段和 obj 行一起删掉，光有目录编不进去）
+```
+
+规矩：
+
+- `.kunitconfig`、`Documentation/`、`*.rst`、`Kconfig` 里的 `if FOO_TEST` 段解不解都行，不影响 `Image`；**`Kconfig` / `Makefile` / `*.c` / `*.h` 必须齐**。
+- 补完要重新 `olddefconfig`（或直接 `build-kernel.sh`，它自带），让新 symbol 进 `.config`，然后 `strings Image | grep -x <名字>` 验证真进内核。
+- 本轮已这样补回 `fs/fat/`（12 个文件，缺 `.kunitconfig`，无影响）。
+
+### 0.2 复现纪律（照此顺序，不许跳步）
+
+**四段有硬依赖，顺序不能换**：配置 → 内核 → 四包 → 镜像。每段都有独立的"产物断言"，断言不过就别往下走。
+
+```bash
+cd /home/quqiufeng/kernel
+ROOT=/x96-build; OUT=$ROOT/kbuild-7.2.12
+CFG1=x96max/kernel/config-7.2.12-x96
+CFG2=configs/config-7.2.12-x96-20261115
+K=$ROOT/amlogic-s9xxx-armbian/build-armbian/kernel/stable/7.2.12
+KNAME=7.2.12-x96
+```
+
+| # | 段 | 命令 | 必须过的断言 |
+|---|---|---|---|
+| 0 | 配置同源 | `diff -q $CFG1 $CFG2` | 两份配置一致；`grep -cE '^CONFIG_(FAT_FS\|MSDOS_FS\|VFAT_FS)=y' $CFG1` = 3 |
+| 1 | 编内核 | `sudo ./x96max/rebuild-from-zero.sh --from kernel` | `$OUT/.config` 与 `$CFG1` 相同（`olddefconfig` 不许"优化"掉新符号）；`strings $OUT/arch/arm64/boot/Image \| grep -x vfat` 命中；`grep -x CONFIG_VFAT_FS=y $OUT/.config` |
+| 2 | initrd/uInitrd | `--from initrd` | `$ROOT/initrd.img-$KNAME`、`$ROOT/uInitrd-$KNAME` 的 mtime 晚于 Image |
+| 3 | 四包 | `./x96max/pack-kernel.sh` | 四个 tar 的 mtime 晚于 Image；`tar -xzOf $K/boot-$KNAME.tar.gz ./vmlinuz-$KNAME \| strings \| grep -qx vfat` 命中 |
+| 4 | 镜像 | `./x96max/rebuild-from-zero.sh --from image` | `done.log` 里 sha256 与 `x96-build/pkgs/*` 的新内核时间同一天；`--from image` 的日志里有本次 boot 包大小 |
+| 5 | 写卡 | `sudo ./x96max/write-card.sh <img.gz> /dev/sdX` | 逐文件 sha256 全 OK；盒子起来后 `dmesg \| grep -i vfat`、`mount \| grep /boot` |
+
+**两个已踩过的坑（写进纪律，别再犯）**：
+
+1. **配置入口只有一个**：`rebuild-from-zero.sh` / `build-kernel.sh` 的 `CFG=$SELF_DIR/kernel/config-$KNAME`。改配置要改**这里**（并同步 `configs/`），只改 `/x96-build/*` 下的副本等于没改——本轮就因此差点用无 FAT 的配置重编。
+2. **`--from pkgs` / `--from image` 不重做内核**：它们只吃 `$OUT/Image` 和 `$K/*.tar.gz`。所以"改了配置/源码 → 必须至少 `--from kernel`（或先手工重编 + `pack-kernel.sh`）"，顺序反了就是拿旧内核再出一遍镜像。
+   - 反过来：`--from pkgs` 不会重做 initrd。当前配置下所有驱动 `=y`，`modules-*` 只有 `test_bpf.ko`，所以**只改配置重编 Image 时 initrd 可复用**；哪天开了 `=m`（尤其 usb/storage、ext4、meson 相关），必须 `--from initrd` 重做，否则首启找不到根盘。
+
+### 0.3 已知缺口：Wi-Fi 驱动没进内核（下一轮要补）
+
+2026-11-15 核对结果（三条硬证据）：
+
+```bash
+ls /x96-build/src-linux/net/wireless /x96-build/src-linux/net/mac80211    # 都不存在
+ls /x96-build/src-linux/drivers/net/wireless                             # 空（0 项，含 realtek/rtw88）
+grep -c 'RTW88' /x96-build/kbuild-7.2.12/.config                         # 0
+strings /x96-build/kbuild-7.2.12/arch/arm64/boot/Image | grep -c rtw88    # 0
+tar -tf /opt/linux/src/linux-7.2.12.tar.xz | grep -c 'realtek/rtw88/'    # 99（完整包里有）
+```
+
+结论：硬件在（`024c:b822`），固件在（rootfs 里 `rtw88/rtw8822b_fw.bin` 保留着），但**内核里没有驱动**，所以 Wi-Fi 现在是不可用的；蓝牙同理（`drivers/bluetooth` 48 项还在，但 `CONFIG_BT*` 没开）。有线不受影响。
+
+补法（严格按 §0.1 的解包规矩，别手写）：
+
+```bash
+SRC=/opt/linux/src/linux-7.2.12.tar.xz
+cd /tmp && tar -xf $SRC \
+  linux-7.2.12/net/wireless linux-7.2.12/net/mac80211 \
+  linux-7.2.12/drivers/net/wireless
+cp -a /tmp/linux-7.2.12/net/wireless /tmp/linux-7.2.12/net/mac80211 /x96-build/src-linux/net/
+cp -a /tmp/linux-7.2.12/drivers/net/wireless /x96-build/src-linux/drivers/net/
+
+# 钩子必须补回（裁剪脚本会连 obj/Makefile 行一起删，光有目录编不进去）
+grep -n 'wireless' /tmp/linux-7.2.12/drivers/net/Makefile /tmp/linux-7.2.12/drivers/net/Kconfig
+grep -n 'wireless\|mac80211' /tmp/linux-7.2.12/net/Makefile /tmp/linux-7.2.12/net/Kconfig
+# 按完整包里的原样把这几行加回裁剪树的同名文件
+
+# 打开符号（父项先于子项，最后 olddefconfig 复查）
+cd /x96-build/src-linux
+for s in WLAN CFG80211 MAC80211 RFKILL RTW88 RTW88_SDIO RTW88_8822B RTW88_8822BS \
+         BT BT_HCIUART BT_HCIUART_RTL; do
+  ./scripts/config --file /x96-build/kbuild-7.2.12/.config -e "$s"
+done
+make O=/x96-build/kbuild-7.2.12 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+grep -E 'CONFIG_(WLAN|CFG80211|MAC80211|RTW88|BT|RFKILL)' /x96-build/kbuild-7.2.12/.config | sort
+```
+
+注意两点：
+
+- 一开 `=m` 就破坏"零模块"前提，**必须 `--from initrd` 重做 initrd**（§0.2 坑 2）。
+- 补完记得把新配置同步回 `x96max/kernel/config-7.2.12-x96` 和 `configs/config-7.2.12-x96-20261115`，否则下一轮又回到无 Wi-Fi。
 
 ---
 
@@ -168,6 +297,8 @@ APPEND=root=UUID=<uuid> rootflags=data=writeback rw rootfstype=ext4 \
 
 ## 3. 驱动映射（有线为主，无线驱动保留）
 
+> ⚠️ 下表的无线/BT 行是**目标配置**，不是当前 7.2.12-x96 的实况：裁剪树已删掉无线源码、配置里 `RTW88*`/`BT*` 全未开，`modules-*` 只有 `test_bpf.ko`。实况与补齐步骤见 §0.3。
+
 | 硬件 | Linux 驱动 | 内核配置 |
 |---|---|---|
 | SoC / 时钟 | `meson-g12a` | `CONFIG_COMMON_CLK_MESON_*`、`CONFIG_PINCTRL_MESON_G12A` |
@@ -283,6 +414,9 @@ done
 
 依赖关系：`RTW88_8822BS` 依赖 `RTW88_SDIO`，`BT_HCIUART_RTL` 依赖 `BT_HCIUART`。父项若是 `n`，子项 `-e` 也不生效，
 随后的 `olddefconfig` 会把它们补成 `=m` 或 `n`——所以必须复查下面的 grep 结果。
+
+> ⚠️ 在**当前裁剪树**上这段是空转：`net/wireless`、`net/mac80211`、`drivers/net/wireless` 已删，`./scripts/config -e RTW88*` 不会报错但
+> `olddefconfig` 之后仍然是 `# CONFIG_RTW88 is not set`。要真正开启，先按 §0.3 把目录和 `net/Makefile`、`drivers/net/Makefile` 的钩子解回来。
 
 设置本内核签名：
 
@@ -1265,7 +1399,7 @@ apt-get install -y sudo u-boot-tools parted btrfs-progs   # 以后要 armbian-in
 |---|---|
 | 构建机 | x86_64 Ubuntu 24.04，6 核 / 23GiB（实测） |
 | 工作目录 | `/x96-build` |
-| 内核源码（原版参照） | `/opt/linux/src/linux-7.2.12`（1.8G，未动） |
+| 内核源码（原版参照） | `/opt/linux/src/linux-7.2.12.tar.xz`（160M，**原版解压树已删除**，需要补文件才从包里解，见 §0.1） |
 | 内核源码（实际编译） | `/x96-build/src-linux`（裁剪树，`X96_KSRC` 指向它，见 §5.3） |
 | 内核构建 | `/x96-build/kbuild-7.2.12`（out-of-tree，`O=`） |
 | 内核 4 包 | 产出 `/x96-build/pkgs/`；`rebuild` 读 `.../build-armbian/kernel/stable/7.2.12/` |
@@ -1298,7 +1432,8 @@ sudo apt-get install -y \
 # Armbian build framework（源码 rootfs）
 git clone https://github.com/armbian/build /x96-build/armbian-build
 
-# 内核源码：本次使用 /opt/linux/src/linux-7.2.12
+# 内核源码：实际编译用裁剪树 /x96-build/src-linux（§5.3）；原版解压树已删除，
+# 只在补文件时从 /opt/linux/src/linux-7.2.12.tar.xz 里解（§0.1）
 # 基础镜像：放到上面的默认路径，或通过 X96_BASE_IMAGE 指定
 # （不想下 2.5G 官方镜像可以自造：sudo x96max/mkbase.sh → $ROOT/base-own.img，
 #   再 X96_BASE_IMAGE=$ROOT/base-own.img；ophub 的 extract_armbian() 只从基础镜像里
@@ -1318,6 +1453,10 @@ OUT=/x96-build/kbuild-7.2.12
 mkdir -p "$OUT"
 cp "$REPO/x96max/kernel/config-7.2.12-x96" "$OUT/.config"
 
+# 配置前置断言：p1 是 FAT32，缺 FAT 就挂不上 /boot（§0.2 #0）
+diff -q "$REPO/x96max/kernel/config-7.2.12-x96" "$REPO/configs/config-7.2.12-x96-20261115"
+grep -cE '^CONFIG_(FAT_FS|MSDOS_FS|VFAT_FS)=y' "$OUT/.config"     # 必须 3
+
 cd "$KSRC"
 make O="$OUT" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 make O="$OUT" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)" Image modules
@@ -1335,10 +1474,12 @@ $OUT/arch/arm64/boot/dts/amlogic/meson-g12a-x96-max.dtb
 $OUT/modules/lib/modules/7.2.12-x96/
 ```
 
-检查：
+检查（三条都要过，第一条防 `olddefconfig` 悄悄改配置）：
 
 ```bash
-grep '^CONFIG_LOCALVERSION=' "$OUT/.config"   # "-x96"
+grep '^CONFIG_LOCALVERSION=' "$OUT/.config"                     # "-x96"
+diff <(sort "$OUT/.config") <(sort x96max/kernel/config-7.2.12-x96)   # 无输出
+strings "$OUT/arch/arm64/boot/Image" | grep -x vfat             # 命中 vfat
 ```
 
 ### 19.4 生成 arm64 initrd / uInitrd
@@ -1456,9 +1597,22 @@ modules-7.2.12-x96.tar.gz      226K  b113fef3d0dbef60ae1f56e981d3ba7dfa7a09c04cf
 >
 > `rebuild` 检查 `boot-*`、`dtb-amlogic-*`、`modules-*`、`header-*` 四件套，缺一不可。
 
+打完必验（§0.2 #3）——**包里的 Image 才是 rebuild 真正吃的东西**，只看 `$OUT/Image` 不算：
+
+```bash
+K=/x96-build/amlogic-s9xxx-armbian/build-armbian/kernel/stable/7.2.12
+KNAME=7.2.12-x96
+ls -l --time-style=+%m-%d_%H:%M "$K"/{boot,dtb}-*"$KNAME".tar.gz "$K"/{modules,header}-*"$KNAME".tar.gz
+tar -xzOf "$K/boot-$KNAME.tar.gz" ./vmlinuz-$KNAME | strings | grep -qx vfat && echo "包内 Image 有 vfat ✔"
+tar -xzOf "$K/boot-$KNAME.tar.gz" ./config-$KNAME | grep -E '^CONFIG_(VFAT|FAT|MSDOS)_FS=y'
+```
+
+四包 mtime 必须晚于 `$OUT/arch/arm64/boot/Image`；不晚就是旧包，`--from image` 会把旧内核再打一遍镜像。
+
 ### 19.6 构建可刷镜像
 
-> 前提：19.3–19.5 已产出 `boot/dtb-amlogic/modules/header` 四个内核包。
+> 前提：19.3–19.5 已产出 `boot/dtb-amlogic/modules/header` 四个内核包，且 **mtime 晚于本次 Image**（§19.5 的必验）。
+> `build-image.sh` **不检查内核新旧**：四包是旧的它照样出镜像，只是镜像里是旧内核。改过内核就必须先 19.5。
 
 ```bash
 cd /home/quqiufeng/kernel
@@ -1504,8 +1658,9 @@ sudo ./x96max/rebuild-from-zero.sh --from initrd    # 复用 kbuild-*/Image
 sudo ./x96max/rebuild-from-zero.sh --from pkgs      # 只重打四包
 sudo ./x96max/rebuild-from-zero.sh --from image     # 只重做镜像（本次就是这么跑的）
 
-# 用裁剪树编内核（8 分钟那一档）；不加就落到未裁剪的原版树
-sudo X96_KSRC=/x96-build/src-linux ./x96max/rebuild-from-zero.sh
+# 用裁剪树编内核（8 分钟那一档）：X96_KSRC 默认就是 $X96_BUILD_ROOT/src-linux，
+# 原版解压树 /opt/linux/src/linux-7.2.12 已删除（只剩 tar.xz），不要再往那儿指
+sudo ./x96max/rebuild-from-zero.sh --from kernel
 ```
 
 | 变量 | 默认值 | 说明 |

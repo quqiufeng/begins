@@ -17,7 +17,7 @@ set -euo pipefail
 SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(dirname "$SELF_DIR")                       # kernel 仓库根
 ROOT=${X96_BUILD_ROOT:-/x96-build}
-KSRC=${X96_KSRC:-/opt/linux/src/linux-7.2.12}
+KSRC=${X96_KSRC:-$ROOT/src-linux}                 # 裁剪树（/opt/linux/src/linux-7.2.12 已删除，只剩 tar.xz）
 KNAME=${X96_KNAME:-7.2.12-x96}
 OUT=$ROOT/kbuild-${KNAME%-x96}
 K=$ROOT/amlogic-s9xxx-armbian/build-armbian/kernel/stable/${KNAME%-x96}
