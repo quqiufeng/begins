@@ -9,6 +9,7 @@
 > 无线策略（2026-11 更新）：**目标是保留 Wi-Fi/蓝牙驱动与固件**（RTL8822BS → `rtw88_8822bs` + `btrtl`），内核里不再 `-d` 关闭；有线 RTL8211F 仍是主用网络。
 > ⚠️ **当前构建尚未达成**：裁剪树里 `net/wireless`、`net/mac80211`、`drivers/net/wireless/` 已整目录删除，配置里也没有 `RTW88*`，所以 7.2.12-x96 的内核**没有 Wi-Fi 驱动**（蓝牙源码 48 项还在，但 `CONFIG_BT*` 未开）。补法见 §0.3。
 > 仓库脚本：**本仓库 `x96max/`**（`build-image.sh` 一键镜像、`write-card.sh` 安全写卡 + 校验、`config-x96-source.conf` rootfs 配置、`x96-autoinstall.*` 首启自动安装、`x96max/kernel/config-7.2.12-x96` 最终内核配置、`mkbase.sh` 自造 rebuild 基础镜像）。
+> 📌 **最新（2026-11-15 17:08）**：裁掉目录会连带删掉 `Kconfig` → 符号静默消失。同配置下裁剪树比全量树少 **1789 个符号**（含 genpd/`HW_PERF_EVENTS`/`USB_GADGET`），`Image` 35.9→42.2MB。全量树已编好（`/x96-build/kbuild-clean`），尚未打包上机。详见 **§5.7**。
 
 ---
 
@@ -52,6 +53,12 @@
    - **16:34 那次开机仍未验证到它**：根盘被第 8 条的掉盘打死在 `e2fsck`，根本没走到「等 root 设备」那一步。
      「`slumber=90` 有效」目前只有源码推理，**没有真机证据**——要等根盘能正常挂上那天才算验过。
    - 判据表 + 可复现步骤见 **§5.5**；`rebuild-from-zero.sh --from initrd` 已内置该补丁，重打镜像不会回退。
+10. ⚠️ **`/x96-build/boot-good` 与 `boot-bad` 名字是反的**（16:53 复盘）：`boot-good` 里是**未修**的 `slumber=30`，`boot-bad` 里才是修好的 `90`。
+   16:48 按目录名回写卡，等于把修好的换回坏的，`Gave up waiting` 重现。判据一律用 `patch-initrd-wait.sh --check`，不看目录名/时间戳。见 §5.6。
+11. ✅ **裁剪树的隐性代价已量化**（16:58→17:08 对照实验）：同一份起始配置下，全量树编出的 `.config` 比裁剪树多 **1789 个符号**（345 个 `=y`、1433 个 `=m`），其中含 `PM_GENERIC_DOMAINS(_OF)`、`ARM_PSCI_CPUIDLE_DOMAIN`、`HW_PERF_EVENTS`、`USB_GADGET` 全家、`USB_SERIAL_*`。
+   `Image` 35.9MB（裁剪）→ **42.2MB**（全量）。裁剪不是"少编几个驱动"，是**连带删 Kconfig 让符号静默消失**。见 §5.7。
+   - 产物就绪：`/x96-build/src-clean`（全量树 1.8G）+ `/x96-build/kbuild-clean`（800M，`arch/arm64/boot/Image` 17:08，42220032 B），日志 `/x96-build/build-clean.log`（6204 行，无 error）。
+   - **下一步（未做）**：用 `kbuild-clean/Image` 走 `pack-kernel.sh` → `--from initrd` → `--from image`，替换卡上的 35.9MB 内核，真机复验第 8 条掉盘是否与 genpd 缺失有关。
 
 ### 0.1 源码缺失时的补齐来源（唯一权威包）
 
@@ -591,6 +598,9 @@ $OUT/modules/lib/modules/7.2.12-x96/
 
 ### 5.3 源码树裁剪（2026-11-15：两轮裁到 545M，全量 8 分 15 秒）
 
+> ⚠️ **先读 §5.7**：删目录会连带删掉目录里的 `Kconfig`，导致父 `Kconfig` 的 `source` 悬空、符号被 `olddefconfig` **静默丢弃**。
+> 本节的裁剪树实测比全量树少 **1789 个符号**（含 genpd、`HW_PERF_EVENTS`、`USB_GADGET`）。裁完必须做逐符号 diff。
+
 口径和 `docs/trim.md`（主机 `begin` 内核）不同：**不动 config，只删代码**——把源码树从
 1.8G / 94777 文件两轮削到 **545M / 37911 文件（27%）**，用同一份 `.config` 换更短的全量编译。
 
@@ -905,6 +915,118 @@ APPEND=root=UUID=8e0a1be3-3e27-4733-9b1f-b5936d744996 rootflags=data=writeback r
 5. USB 兜底（可选但推荐，§10.2.2）：`patch-bootargs.sh --usb-fix 346d:5678`
 6. 再启动：initramfs 最长等 90 秒（`slumber=90`），正常应在 2~3 秒内挂上 root 直接到 `login:`；
    若仍卡到 90 秒，才回到 10.2.2 的掉盘分支（这是一次真超时，不是竞态）
+
+---
+
+### 5.6 事故复盘：`boot-good` / `boot-bad` 两个目录**名字是反的**（2026-11-15 16:53）
+
+`/x96-build/boot-good` 与 `boot-bad` 是 16:45–16:48 的快照，实测内容：
+
+| 目录 | uInitrd 的 slumber | zImage 大小 | 实际含义 |
+|---|---|---|---|
+| `boot-good` | **30**（未修） | 42220032 | 名字骗人，这份是**坏的** |
+| `boot-bad`  | **90**（已修） | 35949056 | 名字骗人，这份是**修好的** |
+
+16:48 按 `boot-good` 回写卡 → 把已修好的 `slumber=90` 换回了 `slumber=30`，
+于是 `Gave up waiting for root file system device` 重现。**不是内核问题，是我把目录名当成了事实。**
+
+**教训（照此执行）**：
+- 判断一个 uEnv/initrd 目录"能不能用"，唯一标准是 `patch-initrd-wait.sh <文件> --check` 的输出，
+  **不要看目录名、不要看时间戳**。`slumber=90` 才是可用态。
+- 两个 zImage 都含 `usb_stor_probe` 与 `RTL8211F Gigabit`（`grep -ac` 实测 2 / 1），
+  所以「USB 存储驱动缺失」在这两版上都不成立，别再往 §5.4 方向重编内核。
+
+**离线验收清单（卡挂上后一次性跑完，任一项不过就不算修好）**
+
+```bash
+M=/media/$USER/BOOT
+blkid -o value -s UUID /dev/sdb2                        # → 8e0a1be3-3e27-4733-9b1f-b5936d744996
+grep -oE 'root=UUID=[0-9a-f-]+' $M/uEnv.txt             # 必须与上一行完全相同
+sudo ./x96max/patch-initrd-wait.sh $M/uInitrd --check   # → ✔ slumber=90
+grep -^APPEND $M/uEnv.txt | tr ' ' '\n' | grep -c .      # → 21
+grep -c rootdelay $M/uEnv.txt                           # → 0
+```
+
+> 注意 `cut -d= -f2` 解析 `root=UUID=xxx` 会拿到 `UUID`（两个等号），要用
+> `sed 's/.*root=UUID=//'`，否则会误报"UUID 不一致"。
+
+---
+
+### 5.7 裁剪的隐性代价：1789 个符号静默消失，连 genpd 都没了（2026-11-15 17:08 对照实验）
+
+**动机**：§5.4、§5.5 修完仍是同一个报错，而 16:34 起掉盘又抢先，无法判断"裁剪树本身是不是也削掉了什么"。
+于是把完整源码包解开成**未裁剪的全量树**，用**同一份起始配置**重编一次，逐符号对比。
+
+**做法**（两份树、同配置、`olddefconfig` 后编到底）：
+
+```bash
+# 全量树：完整包解到 /x96-build/src-clean（1.8G，原样，不裁剪）
+cd /tmp && tar -xf /opt/linux/src/linux-7.2.12.tar.xz
+mv linux-7.2.12 /x96-build/src-clean
+
+# 树外输出，配置用与裁剪树同一份入口（CONFIG_LOCALVERSION="-x96"）
+CU=/x96-build/kbuild-clean
+ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -C /x96-build/src-clean O=$CU olddefconfig
+ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- make -C /x96-build/src-clean O=$CU -j6 Image \
+  2>&1 | tee /x96-build/build-clean.log     # 6204 行，无 error，17:08 出 Image
+```
+
+**结果（实测数字）**
+
+| 项 | 裁剪树 `src-linux` + `kbuild-7.2.12` | 全量树 `src-clean` + `kbuild-clean` |
+|---|---|---|
+| `.config` 行数 | 7356 | **10390** |
+| `=y` / `=m` | 2287 / 1465 | **2631 / 2896** |
+| `arch/arm64/boot/Image` | 35 949 056 B | **42 220 032 B** |
+| 编出时间 | 11-15 14:58 | 11-15 17:08 |
+
+差的 **1789 个符号**（345 个 `=y`、1433 个 `=m`）**没有一个是因为"不想要"**，全部是因为
+**目录被删 → 目录里的 `Kconfig` 一起没了 → 父 `Kconfig` 的 `source` 悬空 → `olddefconfig` 静默丢弃**。
+`kbuild-clean/.config` 与归档的完整配置（`/tmp/cfg-good.txt`，257801 B）**逐字节等价（diff 0 行）**，
+即全量树恢复的就是"应有"的配置。
+
+**被静默丢掉的、与本机真正相关的（部分）**
+
+| 符号 | 影响 |
+|---|---|
+| `PM_GENERIC_DOMAINS` / `PM_GENERIC_DOMAINS_OF` / `ARM_PSCI_CPUIDLE_DOMAIN` / `DT_IDLE_GENPD` | **genpd 整块没了**（`drivers/base/power/{Kconfig,domain.c}` 被裁走），meson 的电源域/PSCI idle 全不生效 |
+| `HW_PERF_EVENTS` / `HAVE_HARDLOCKUP_DETECTOR_PERF` | 无硬件性能计数（`perf` 只剩软件事件） |
+| `USB_GADGET` 全家、`USB_MUSB_*`、`USB_CHIPIDEA_*`、`USB_ISP1760*`、`USB_SERIAL_{CH341,CP210X,FTDI_SIO,PL2303}` | 无 USB gadget / 无 USB 转串口 |
+| `USB_NET_DRIVERS`、`TLS(=m)`、`XDP_SOCKETS`、`NET_SHAPER`、`NF_TABLES_BRIDGE`、`6LOWPAN`、`9P_FS` | 网络/文件系统能力缺口 |
+| `BLK_CGROUP_PUNT_BIO`、`SKB_DECRYPTED` | 块层/kTLS 细节 |
+
+> **这不是"体积裁剪的副作用可忽略"，而是主结论**：`disable.list` 划掉一个 `CONFIG_*` 是"不编它"，
+> 但 `prune_src.py` 顺手删目录会把**符号本身**从配置空间里抹掉，且**编译、链接、引导全程零告警**。
+> §5.4 的 `USB_STORAGE` 只是这次撞上的一个；同样的机制已经在 `drivers/base/power`（genpd）、
+> `USB_GADGET`、`HW_PERF_EVENTS` 上悄悄生效。
+
+**自查断言（任何裁剪树都该跑，5 秒）**
+
+```bash
+A=/x96-build/kbuild-clean/.config      # 全量树基准
+B=/x96-build/kbuild-7.2.12/.config     # 待查的裁剪树
+diff <(grep -E '^CONFIG_[A-Z0-9_]+=' $A) <(grep -E '^CONFIG_[A-Z0-9_]+=' $B) \
+  | sed -n 's/^< //p' | tee /tmp/lost.txt | wc -l          # 1789（本次实测）
+grep -cE '=y$' /tmp/lost.txt                                # 345
+grep -E '=y$' /tmp/lost.txt | grep -E 'GENPD|PM_GENERIC|PERF_EVENT|USB_GADGET|SERIAL'   # 该为 0
+# 或直接用内核自带工具（按符号语义分类，输出更可读）
+/usr/src/linux/scripts/diffconfig $A $B 2>/dev/null || $HOME/kernel/src/scripts/diffconfig $A $B
+```
+
+**与掉盘的关系（假设，未验证）**：`PM_GENERIC_DOMAINS_OF` 缺失后，meson-g12a 的 USB/PHY 电源域不再由 genpd 管理，
+`xhci`/dwc3 的上电时序与全量内核不同——**有可能**与 §10.2.2 的"只以 high-speed 枚举 + 中途 `reset`"有关，
+但也可能无关。判据只有一条：把 42.2MB 这份全量内核真的跑起来看 `dmesg | grep -E 'sd 0|reset|high-speed'`。
+在没跑到那一步之前，**不要**把它写成结论。
+
+**下一步（尚未执行）**
+
+```bash
+# 1) 全量内核进四包（脚本认 X96_KOUT / X96_KSRC，不是 O=）
+X96_KOUT=/x96-build/kbuild-clean X96_KSRC=/x96-build/src-clean ./x96max/pack-kernel.sh
+# 2) 重做 initrd → 重出镜像 → 写卡（写卡后仍要补 patch-initrd-wait + patch-bootargs，见 §0.2 第 6 步）
+sudo ./x96max/rebuild-from-zero.sh --from initrd
+./x96max/rebuild-from-zero.sh --from image
+```
 
 ---
 
@@ -1576,6 +1698,8 @@ ROOTFS_TYPE='ext4'
 | initramfs 等待窗口固修（`slumber` 30 → 90） | 已打进卡（`patch-initrd-wait.sh`），**待真机复验** |
 | 启动参数 `rootdelay=15` 废弃并删除 | 完成（`patch-bootargs.sh -r rootdelay=15`，APPEND 21 参数） |
 | 脚本归位 `x96max/`（build-kernel / pack-kernel / build-image / write-card / verify-card / flash-p1 / backup-card / rebuild-from-zero / patch-bootargs / patch-initrd-wait + README） | 完成（多数是本次从临时目录收进来的） |
+| 全量树对照编译（`src-clean` + `kbuild-clean`，同配置） | 完成（17:08，`Image` 42.2MB；量化出裁剪树静默丢 **1789** 个符号，见 §5.7） |
+| 用全量内核重出四包 / initrd / 镜像 | **未做**（下一步，§5.7 末） |
 
 **卡当前状态（2026-11-15 16:30 实测，`/dev/sdb`，只读取证）**
 
@@ -1585,7 +1709,7 @@ ROOTFS_TYPE='ext4'
 | `uEnv.txt` `APPEND` | 21 参数，`rootdelay` 已无；保留 `rootwait` / `usb-storage.quirks=346d:5678:u` / `usbcore.autosuspend=-1` | `patch-bootargs.sh -l` |
 | `/uInitrd`（u-boot 实载，`INITRD=/uInitrd`） | `slumber=90` | `patch-initrd-wait.sh … --check` |
 | `/uInitrd-7.2.12-x96`（ophub 产物，原名保留） | `slumber=90`（16:30 补打） | 同上 |
-| 待办 | 插盒子上真机复验：开机不出现 `Gave up waiting`，直接到 `login:` | — |
+| 待办 | 插盒子上真机复验：开机不出现 `Gave up waiting`，直接到 `login:`。**16:34 那次被掉盘（`hostbyte=0x07`/`cmd_age=0s`）打死在 `e2fsck`，`slumber=90` 仍未取到真机证据**（§10.2.2、§5.6） | — |
 
 > 最终 rootfs 是 **Armbian build framework + mmdebstrap 源码构建**；内核 7.2.12 是自编译。
 
@@ -1644,6 +1768,11 @@ NAS 备份目录  dav://192.168.1.53:5005/sata11-18072858035/x96-backup/
     就悬空了，`olddefconfig` 会把这个开关**静默丢成 `n`**：`Image` 照编照引导，直到挂根盘才报
     `Gave up waiting for root file system device`。这次的代价是 `drivers/usb/storage/` 整目录被裁，
     完整复盘与三级验证见 §5.4。
+15. **裁剪的真正代价是"符号从配置空间里消失"，不是"少编几个驱动"**（2026-11-15 17:08 实测）：
+    全量树与裁剪树用同一份起始配置编译，`.config` 差 **1789 个符号**（345 个 `=y`、1433 个 `=m`），
+    `Image` 35.9MB → 42.2MB。丢掉的 `=y` 里有 `PM_GENERIC_DOMAINS(_OF)`、`ARM_PSCI_CPUIDLE_DOMAIN`（genpd 整块）、
+    `HW_PERF_EVENTS`、`USB_GADGET` 全家。**所以"裁剪树能编能启动"不能作为"裁剪无害"的证据**；
+    判据是逐符号 diff（`diff <(grep '=' 全量.config) <(grep '=' 裁剪.config)`）或 `scripts/diffconfig`，见 §5.7。
 
 ---
 
