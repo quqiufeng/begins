@@ -29,7 +29,7 @@
 | 备份 | `backup-card.sh` | 把已验证可启动的卡备份成可还原镜像 |
 | 安装 | `x96-autoinstall.sh` + `x96-autoinstall.service` | 首启自动 `armbian-install` 装到 eMMC（防 apt 吃 stdin、done 标记只在成功后写） |
 | 配置 | `kernel/config-7.2.12-x96-full` | **全量套配置**（未裁剪），`LOCALVERSION=-x96` → `7.2.12-x96`，sha `e137d0d5…`，编 35.8MB Image |
-| 配置 | `kernel/config-7.2.12-x96-trim` | **裁剪套配置**（全量树 + 硬件裁剪），`LOCALVERSION=-x96-trim` → `7.2.12-x96-trim`，与 `configs/config-7.2.12-x96-trim-20261115` 同源 |
+| 配置 | `kernel/config-7.2.12-x96-trim` | **裁剪套配置**（全量树 + 硬件裁剪），`LOCALVERSION=-x96-trim` → `7.2.12-x96-trim`，与 `configs/config-7.2.12-x96-trim-final-20261115` 同源 |
 | **参数源** | `lib/mode.sh` | 两套参数（配置/源码树/产物树/KNAME/initrd/包仓/成品名）**唯一出处置**；`x96_mode full|trim` + `x96_stage_pkgs` + `x96_cfg_same` |
 | 配置 | `config-x96-source.conf` | armbian-build 的 rootfs 构建参数（BLOCK 列表在此） |
 

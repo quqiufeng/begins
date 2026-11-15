@@ -37,12 +37,12 @@
 | 文件 | sha256 | 行 / `=y` / `=m` | 对应内核 |
 |---|---|---|---|
 | `configs/config-7.2.12-x96-full-20261115` = `x96max/kernel/config-7.2.12-x96-full` | `e137d0d5…08c94` | 6706 / 2506 / 1 | **裁剪前**全量配置，编 `kbuild-7.2.12/Image`（35.8MB，§5） |
-| `configs/config-7.2.12-x96-trim-20261115` = `x96max/kernel/config-7.2.12-x96-trim` | `92c79a3d…5577e` | 8227 / 2069 / 153 | **当前运行内核**，编 `kbuild-trim/Image`（32.1MB），fragment 见 `configs/trim2-20261115.fragment` |
+| `configs/config-7.2.12-x96-trim-final-20261115` = `x96max/kernel/config-7.2.12-x96-trim` | `c4c802d5…6482a` | 8258 / 2084 / 167 | **当前运行内核**，编 `kbuild-trim/Image`（32.1MB），fragment 见 `configs/trim2-20261115.fragment`（`-final` 在其上补回 btrfs/CIFS/VXLAN、netfilter 匹配等，旧归档 `-trim-20261115` 已删） |
 
-判据（已实测）：`kbuild-trim/.config`、两份 trim 归档、盒子 `/proc/config.gz` 四者 sha256 **完全相同**；
+判据（已实测）：`kbuild-trim/.config`、唯一 trim 归档、`x96max/kernel/config-7.2.12-x96-trim`、盒子 `/proc/config.gz` 四者 sha256 **完全相同**；
 `/boot/vmlinuz-7.2.12-x96` 与 `kbuild-trim/arch/arm64/boot/Image` 同为 `69124869…8ae8f7`。
 相对全量版共关闭 **690** 个 `=y`（`ARCH_SUNXI/ROCKCHIP`、整套 `KVM`、大半 `ACPI_*`、`BINFMT_MISC` 等），
-反向新开 BPF 组（`BPF_SYSCALL/BPF_JIT`）。trim 版 `=m` 有 153 条但只落 140 个 `.ko`：差的是
+反向新开 BPF 组（`BPF_SYSCALL/BPF_JIT`）。trim 版 `=m` 有 167 条但只落 154 个 `.ko`：差的是
 `CONFIG_IP6_NF_FILTER→ip6table_filter.ko` 这类改名，抽查 `nf_tables`/`panfrost`/`snd-soc-meson-aiu` 全在，非缺失。
 
 **进度（卡在这里）**：
@@ -490,7 +490,7 @@ CONFIG_RFKILL=m
 | 内核源码（原版，只做参照） | `/opt/linux/src/linux-7.2.12.tar.xz`（完整树 2026-11-15 已删；要用先解到 `/tmp/linux-7.2.12`，见 §0.1） |
 | **内核源码（实际编译，全量树）** | `/x96-build/src-clean`（1.8G，未裁剪，`kbuild-trim/source` 指向它） |
 | 内核构建目录（out-of-tree） | `/x96-build/kbuild-trim`（736M，`Image` 32.2MB + 280 个 `.ko`） |
-| 已删除（2026-11-15 19:15） | `src-linux`（第一轮裁剪树 553M）+ `kbuild-7.2.12`（739M）；配置分别归档为 `configs/config-7.2.12-x96-trim-20261115`、`configs/config-7.2.12-x96-round1-kbuild7.2.12-20261115` |
+| 已删除（2026-11-15 19:15） | `src-linux`（第一轮裁剪树 553M）+ `kbuild-7.2.12`（739M）；配置分别归档为 `configs/config-7.2.12-x96-trim-final-20261115`（当时名 `…-trim-20261115`，后被覆盖，最终名见 §2）、`configs/config-7.2.12-x96-round1-kbuild7.2.12-20261115` |
 | 内核 4 包 | 产出 `/x96-build/pkgs/`；`rebuild` 实际读取 `.../build-armbian/kernel/stable/7.2.12/` |
 | Armbian build（源码 rootfs） | `/x96-build/armbian-build`，缓存 `cache/rootfs/rootfs-arm64-trixie-minimal_*.tar.zst` |
 | 成品镜像 | `/x96-build/recovery/x96src-autoinstall.img.gz` |
@@ -1105,9 +1105,9 @@ make -C /x96-build/src-clean O=/x96-build/kbuild-trim ARCH=arm64 \
      CROSS_COMPILE=aarch64-linux-gnu- -j6 Image modules dtbs 2>&1 | tee /x96-build/build-trim.log
 ```
 
-归档：`configs/config-7.2.12-x96-trim-20261115` = `x96max/kernel/config-7.2.12-x96-trim` = 实编 `.config`
-= 盒子 `/proc/config.gz`，四者 sha256 同为 `92c79a3d40b23b9612d5cc55c56dc81da3b1db7d21bcd4e4efee7d20bbc5577e`
-（8227 行 / 2069 `=y` / 153 `=m`）；fragment 在 `configs/trim2-20261115.fragment`。
+归档：`configs/config-7.2.12-x96-trim-final-20261115` = `x96max/kernel/config-7.2.12-x96-trim` = 实编 `.config`
+= 盒子 `/proc/config.gz`，四者 sha256 同为 `c4c802d5d9a3f68b7a07636cc9a863f81962aabd6f17fb06d1fe2dbd0996482a`
+（8258 行 / 2084 `=y` / 167 `=m`）；fragment 在 `configs/trim2-20261115.fragment`。
 与裁剪前的 `configs/config-7.2.12-x96-full-20261115`（`e137d0d5…`）**不是同一份**，见文首"两份配置别混用"。
 
 **板载全链复核（全部 `=y`，本轮逐个 grep 过）**
@@ -1127,7 +1127,7 @@ x86 专用的 ATA/触摸屏/USB gadget 旧机、以及 §5.7 恢复回来的 gen
 
 **注意（下一步必须做）**
 
-1. 模块从 5816 个变 140 个，**`--from initrd` 必须重做**（depmod + update-initramfs），否则 initramfs 里
+1. 模块从 5816 个变 154 个，**`--from initrd` 必须重做**（depmod + update-initramfs），否则 initramfs 里
    引用的旧模块名在 rootfs 里已不存在。
 2. 打四件套要指到新树：`./x96max/pack-kernel.sh --trim`（等价 `X96_KOUT=/x96-build/kbuild-trim
    X96_KSRC=/x96-build/src-clean`，并会先校验 `kbuild-trim/.config` 的 sha 在 `configs/` 归档里）。
@@ -2329,9 +2329,9 @@ header-7.2.12-x96-trim.tar.gz        13M  1012760f4f2d59a2c4a1e9dafe54be90477f3e
 modules-7.2.12-x96-trim.tar.gz      2.4M  79da87b8a6805d598762601b654300d57ec1a9d32af3d0f4716da52f0100d41a
 ```
 
-- 打前自检那行必须出现：`配置溯源 OK：config-7.2.12-x96-trim-20261115（52763fda73ce 字节一致）`——
+- 打前自检那行必须出现：`配置溯源 OK：config-7.2.12-x96-trim-final-20261115（c4c802d5d9a3 字节一致）`——
   这说明 `$OUT/.config` 与归档配置逐字节同源，包可溯源；不一致脚本会 rc=1 拒绝（`--force` 越权）。
-- trim 套 `Image` = **32,178,688 B（30.7M）**、dtb 51,123 B、模块 **140 个**（全量树是 35.9M / 5816 个，§5.8）。
+- trim 套 `Image` = **32,246,272 B（30.7M）**、dtb 51,123 B、模块 **154 个**（全量树是 35.9M / 5816 个，§5.8）。
 
 > 该 header 配方已在本次构建中校验：生成结果与已有 `header-7.2.12-x96.tar.gz` 的 13800 个文件一致。
 >
