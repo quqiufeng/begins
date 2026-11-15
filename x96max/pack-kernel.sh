@@ -53,7 +53,8 @@ x96_mode "$M"
 # （打完的包无法溯源），默认拒绝，--force 才继续。
 S1=$(sha256sum "$OUT/.config" | cut -c1-12)
 HIT=0
-for f in "$X96_REPO"/configs/config-$KV-x96-$MODE-[0-9]*; do
+# 归档名可能是 …-trim-20261115 或 …-trim-final-20261115；full 侧已不归档（只留 trim 一份）
+for f in "$X96_REPO"/configs/config-$KV-x96-$MODE*-[0-9]*; do
   [[ -f $f ]] || continue
   if [[ $(sha256sum "$f" | cut -c1-12) == "$S1" ]]; then
     echo "  配置溯源 OK：$(basename "$f")（$S1 字节一致）"; HIT=1
@@ -61,9 +62,11 @@ for f in "$X96_REPO"/configs/config-$KV-x96-$MODE-[0-9]*; do
     echo "  配置溯源 OK：$(basename "$f")（语义一致，olddefconfig 噪声已忽略）"; HIT=1
   fi
 done
-if [[ $HIT -eq 0 ]]; then
+if [[ $HIT -eq 0 && $MODE == full ]]; then
+  echo "  full 不归档（configs/ 只留 trim 一份），溯源看入口 $(basename "$CFG")（$S1）"
+elif [[ $HIT -eq 0 ]]; then
   echo "警告：$OUT/.config（$S1）不在 configs/ 归档里，打出的包无法溯源" >&2
-  ls -l "$X96_REPO"/configs/config-"$KV"-x96-"$MODE"-[0-9]* 2>/dev/null | sed 's/^/  /' >&2 || true
+  ls -l "$X96_REPO"/configs/config-"$KV"-x96-"$MODE"*-[0-9]* 2>/dev/null | sed 's/^/  /' >&2 || true
   if [[ $FORCE -eq 0 ]]; then echo "  加 --force 仍要打包" >&2; exit 1; fi
   echo "  --force：继续打包" >&2
 fi

@@ -70,7 +70,8 @@ x96_mode() {
   UINITRD=$ROOT/uInitrd-$KNAME
   IMG=${X96_IMG:-$ROOT/recovery/x96-$MODE-autoinstall.img}
   IMG_GZ=$IMG.gz
-  CFG_ARCHIVE=$(ls -1 "$X96_REPO"/configs/config-$KV-x96-$MODE-[0-9]* 2>/dev/null | tail -1 || true)
+  # 归档名可能是 …-trim-20261115 或 …-trim-final-20261115（`-final` 是后续补丁版）
+  CFG_ARCHIVE=$(ls -1 "$X96_REPO"/configs/config-$KV-x96-$MODE*-[0-9]* 2>/dev/null | grep -v '\.fragment$' | tail -1 || true)
   SRC_XZ=${X96_SRC_XZ:-/opt/linux/src/linux-$KV.tar.xz}   # 完整源码包
   export MODE ROOT KV KNAME CFG KSRC OUT PKGS KERNDIR INITRD UINITRD IMG IMG_GZ \
          CFG_ARCHIVE SRC_XZ X96_DIR X96_REPO

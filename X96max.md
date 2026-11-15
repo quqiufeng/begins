@@ -24,7 +24,7 @@
 |---|---|
 | 源码树 | 全量套 `/x96-build/src-clean`（1.8G，未裁剪，必须留）；另有 `src-full`（**按需解压，可删**，见 §21.5） |
 | 内核 `O=` 输出 | `/x96-build/kbuild-trim`（现役；旧的 `kbuild-7.2.12` 2026-11-15 19:15 已删） |
-| 内核配置 | `/home/quqiufeng/kernel/x96max/kernel/config-7.2.12-x96-full`（`LOCALVERSION=-x96`，**必须含 FAT**；与 `configs/config-7.2.12-x96-full-20261115` 逐字节相同） |
+| 内核配置 | `/home/quqiufeng/kernel/x96max/kernel/config-7.2.12-x96-full`（`LOCALVERSION=-x96`，**必须含 FAT**） |
 | 脚本 | `/home/quqiufeng/kernel/x96max/*.sh` |
 | 目标产物 | 可刷 `img.gz`（ophub 布局，首启自动装 eMMC） |
 
@@ -36,7 +36,7 @@
 
 | 文件 | sha256 | 行 / `=y` / `=m` | 对应内核 |
 |---|---|---|---|
-| `configs/config-7.2.12-x96-full-20261115` = `x96max/kernel/config-7.2.12-x96-full` | `e137d0d5…08c94` | 6706 / 2506 / 1 | **裁剪前**全量配置，编 `kbuild-7.2.12/Image`（35.8MB，§5） |
+| `x96max/kernel/config-7.2.12-x96-full`（`configs/` 归档副本已删，2026-11-15） | `e137d0d5…08c94` | 6706 / 2506 / 1 | **裁剪前**全量配置，编 `kbuild-7.2.12/Image`（35.8MB，§5） |
 | `configs/config-7.2.12-x96-trim-final-20261115` = `x96max/kernel/config-7.2.12-x96-trim` | `c4c802d5…6482a` | 8258 / 2084 / 167 | **当前运行内核**，编 `kbuild-trim/Image`（32.1MB），fragment 见 `configs/trim2-20261115.fragment`（`-final` 在其上补回 btrfs/CIFS/VXLAN、netfilter 匹配等，旧归档 `-trim-20261115` 已删） |
 
 判据（已实测）：`kbuild-trim/.config`、唯一 trim 归档、`x96max/kernel/config-7.2.12-x96-trim`、盒子 `/proc/config.gz` 四者 sha256 **完全相同**；
@@ -48,7 +48,7 @@
 **进度（卡在这里）**：
 
 1. ✅ 补回被裁掉的 FAT 支持：源码 `fs/fat/` 已回，钩子 `fs/Kconfig:136`、`fs/Makefile:55` 已接，配置加 `FAT_FS/MSDOS_FS/VFAT_FS=y` + `FAT_DEFAULT_UTF8/codepage=437/iocharset=utf8`。原因：p1 是 FAT32，缺 FAT 则 `/boot` 挂不上。
-   - 合并后的配置已落到**两个权威路径**（14:43 编写 `Image` 时与 `kbuild-7.2.12/.config` 逐字节相同；该树 `.config` 后来在 16:58 被另一轮 `olddefconfig` 改成了 `b71c4f6c…`，**归档的 `e137d0d5…` 才是编出 35.8MB Image 的那份**）：`x96max/kernel/config-7.2.12-x96-full`（`build-kernel.sh` / `rebuild-from-zero.sh` 的默认 CFG）和 `configs/config-7.2.12-x96-full-20261115`。`/x96-build/config-x96-20261115-fat` 只是同一份的临时副本，不再作为入口。
+   - 合并后的配置已落到**唯一权威路径**（14:43 编写 `Image` 时与 `kbuild-7.2.12/.config` 逐字节相同；该树 `.config` 后来在 16:58 被另一轮 `olddefconfig` 改成了 `b71c4f6c…`，**归档的 `e137d0d5…` 才是编出 35.8MB Image 的那份**）：`x96max/kernel/config-7.2.12-x96-full`（`build-kernel.sh` / `rebuild-from-zero.sh` 的默认 CFG，**唯一留存的 full 配置**；`configs/` 里那份归档已于 2026-11-15 删，需要时 `git show` 从 `1edfd41` 取回）。`/x96-build/config-x96-20261115-fat` 只是同一份的临时副本，不再作为入口。
 2. ✅ 内核已编出：`/x96-build/kbuild-7.2.12/arch/arm64/boot/Image`，14:23，35.9MB；`.config` 三项 `=y`，`strings Image | grep -x vfat` 命中。
 3. ✅ **重打包四件套**：`./x96max/pack-kernel.sh` 已在 14:59 跑完，`/x96-build/pkgs/` 全是新时间戳（boot 36.9M / dtb 10.7K / header 13.4M / modules 239K + `sha256sums`）。
 4. ✅ **重出镜像**：`./x96max/rebuild-from-zero.sh --from image` 已在 15:07 出图 `/x96-build/recovery/x96src-autoinstall.img.gz`（284662631 B），时间晚于 14:58 的 `Image`，即含 FAT 的新内核。
@@ -119,7 +119,7 @@ cp -a /tmp/linux-7.2.12/fs/fat /x96-build/src-linux/fs/
 cd /home/quqiufeng/kernel
 ROOT=/x96-build; OUT=$ROOT/kbuild-7.2.12
 CFG1=x96max/kernel/config-7.2.12-x96-full
-CFG2=configs/config-7.2.12-x96-full-20261115
+CFG2=x96max/kernel/config-7.2.12-x96-full
 K=$ROOT/amlogic-s9xxx-armbian/build-armbian/kernel/stable/7.2.12
 KNAME=7.2.12-x96
 ```
@@ -132,7 +132,7 @@ KNAME=7.2.12-x96
 
 | # | 段 | 命令 | 必须过的断言 |
 |---|---|---|---|
-| 0 | 配置同源 | `diff -q $CFG1 $CFG2` | 两份配置一致；`grep -cE '^CONFIG_(FAT_FS\|MSDOS_FS\|VFAT_FS)=y' $CFG1` = 3 |
+| 0 | 配置同源 | `diff -q $CFG1 <(git show 1edfd41:x96max/kernel/config-7.2.12-x96-full)` | 与 e137d0d5 版一致（configs/ 归档已删，只剩这一个入口）；`grep -cE '^CONFIG_(FAT_FS\|MSDOS_FS\|VFAT_FS)=y' $CFG1` = 3 |
 | 1 | 编内核 | `sudo ./x96max/rebuild-from-zero.sh --from kernel` | `$OUT/.config` 与 `$CFG1` 相同（`olddefconfig` 不许"优化"掉新符号）；`strings $OUT/arch/arm64/boot/Image \| grep -x vfat` 命中；`grep -x CONFIG_VFAT_FS=y $OUT/.config` |
 | 2 | initrd/uInitrd | `--from initrd` | `$ROOT/initrd.img-$KNAME`、`$ROOT/uInitrd-$KNAME` 的 mtime 晚于 Image |
 | 3 | 四包 | `./x96max/pack-kernel.sh` | 四个 tar 的 mtime 晚于 Image；`tar -xzOf $K/boot-$KNAME.tar.gz ./vmlinuz-$KNAME \| strings \| grep -qx vfat` 命中 |
@@ -189,7 +189,7 @@ grep -E 'CONFIG_(WLAN|CFG80211|MAC80211|RTW88|BT|RFKILL)' /x96-build/kbuild-7.2.
 注意两点：
 
 - 一开 `=m` 就破坏"零模块"前提，**必须 `--from initrd` 重做 initrd**（§0.2 坑 2）。
-- 补完记得把新配置同步回 `x96max/kernel/config-7.2.12-x96-full` 和 `configs/config-7.2.12-x96-full-20261115`，否则下一轮又回到无 Wi-Fi。
+- 补完记得把新配置同步回 `x96max/kernel/config-7.2.12-x96-full`，否则下一轮又回到无 Wi-Fi。
 
 ---
 
@@ -490,7 +490,7 @@ CONFIG_RFKILL=m
 | 内核源码（原版，只做参照） | `/opt/linux/src/linux-7.2.12.tar.xz`（完整树 2026-11-15 已删；要用先解到 `/tmp/linux-7.2.12`，见 §0.1） |
 | **内核源码（实际编译，全量树）** | `/x96-build/src-clean`（1.8G，未裁剪，`kbuild-trim/source` 指向它） |
 | 内核构建目录（out-of-tree） | `/x96-build/kbuild-trim`（736M，`Image` 32.2MB + 280 个 `.ko`） |
-| 已删除（2026-11-15 19:15） | `src-linux`（第一轮裁剪树 553M）+ `kbuild-7.2.12`（739M）；配置分别归档为 `configs/config-7.2.12-x96-trim-final-20261115`（当时名 `…-trim-20261115`，后被覆盖，最终名见 §2）、`configs/config-7.2.12-x96-round1-kbuild7.2.12-20261115` |
+| 已删除（2026-11-15 19:15） | `src-linux`（第一轮裁剪树 553M）+ `kbuild-7.2.12`（739M）；配置分别归档为 `configs/config-7.2.12-x96-trim-final-20261115`（当时名 `…-trim-20261115`，后被覆盖，最终名见 §2）；round1 与 full 的归档（`configs/config-7.2.12-x96-round1-kbuild7.2.12-20261115`、`configs/config-7.2.12-x96-full-20261115`）已于 2026-11-15 23:25 删，`configs/` 只留 trim 一份 |
 | 内核 4 包 | 产出 `/x96-build/pkgs/`；`rebuild` 实际读取 `.../build-armbian/kernel/stable/7.2.12/` |
 | Armbian build（源码 rootfs） | `/x96-build/armbian-build`，缓存 `cache/rootfs/rootfs-arm64-trixie-minimal_*.tar.zst` |
 | 成品镜像 | `/x96-build/recovery/x96src-autoinstall.img.gz` |
@@ -631,7 +631,7 @@ $OUT/modules/lib/modules/7.2.12-x96/
 | 裁剪树 | `/x96-build/src-linux`（原版完整树 2026-11-15 已删，仅存 `/opt/linux/src/linux-7.2.12.tar.xz`） |
 | 用的 config | `/x96-build/config-x96-20261115` 生成，`make olddefconfig` 后落 `kbuild-7.2.12/.config`
 （含 `CONFIG_DEBUG_INFO_NONE=y`，关 debug info 是最大的那一刀）；
-**归档副本 `configs/config-7.2.12-x96-full-20261115`**（与 `kbuild/.config` 字节一致，6672 行；
+**归档副本已删（2026-11-15），现只存 `x96max/kernel/config-7.2.12-x96-full`**（与当时的 `kbuild/.config` 字节一致，6672 行；
 2026-11-15 12:43 已刷新为 usbfix 版，补回 `USB_STORAGE=y`/`USB_UAS=y`，见 §5.4） |
 | 第一轮裁剪后 | 1.8G/94777 → **821M / 69673 文件**；干净全量 `-j6` **rc=0，526 s = 8m46s** |
 | 第二轮裁剪后 | 821M/69673 → **545M / 37911 文件**；干净全量 `-j6` **rc=0，495 s = 8m15s**（目标 ≤10 分钟） |
@@ -793,7 +793,7 @@ sync && udisksctl unmount -b /dev/sdb1 && udisksctl unmount -b /dev/sdb2
 |---|---|
 | 新 `Image` 快照 | `/x96-build/Image-usbfix-20261115-1240`（sha256 `3d0e2a6d…`） |
 | 旧 U 盘内核备份 | `/x96-build/U-backup-{zImage,vmlinuz,config}-20261115-124215` |
-| config 归档 | `configs/config-7.2.12-x96-full-20261115`（已刷新，与 `kbuild/.config` 字节一致） |
+| config | `x96max/kernel/config-7.2.12-x96-full`（与 `kbuild/.config` 字节一致；`configs/` 归档已删） |
 
 **真机启动断言结果（2026-11-15 16:00，三条全过）**：
 
@@ -1108,7 +1108,7 @@ make -C /x96-build/src-clean O=/x96-build/kbuild-trim ARCH=arm64 \
 归档：`configs/config-7.2.12-x96-trim-final-20261115` = `x96max/kernel/config-7.2.12-x96-trim` = 实编 `.config`
 = 盒子 `/proc/config.gz`，四者 sha256 同为 `c4c802d5d9a3f68b7a07636cc9a863f81962aabd6f17fb06d1fe2dbd0996482a`
 （8258 行 / 2084 `=y` / 167 `=m`）；fragment 在 `configs/trim2-20261115.fragment`。
-与裁剪前的 `configs/config-7.2.12-x96-full-20261115`（`e137d0d5…`）**不是同一份**，见文首"两份配置别混用"。
+与裁剪前的 `x96max/kernel/config-7.2.12-x96-full`（`e137d0d5…`）**不是同一份**，见文首"两份配置别混用"。
 
 **板载全链复核（全部 `=y`，本轮逐个 grep 过）**
 
@@ -2148,7 +2148,7 @@ mkdir -p "$OUT"
 cp "$REPO/x96max/kernel/config-7.2.12-x96-full" "$OUT/.config"
 
 # 配置前置断言：p1 是 FAT32，缺 FAT 就挂不上 /boot（§0.2 #0）
-diff -q "$REPO/x96max/kernel/config-7.2.12-x96-full" "$REPO/configs/config-7.2.12-x96-full-20261115"
+diff -q "$REPO/x96max/kernel/config-7.2.12-x96-full" <(git -C "$REPO" show 1edfd41:x96max/kernel/config-7.2.12-x96-full)
 grep -cE '^CONFIG_(FAT_FS|MSDOS_FS|VFAT_FS)=y' "$OUT/.config"     # 必须 3
 
 cd "$KSRC"

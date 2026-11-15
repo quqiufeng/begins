@@ -65,7 +65,7 @@ S1=$(sha256sum "$CFG" | cut -c1-12)
   if [[ $S1 == "$S3" ]]; then echo "  归档 $(basename "$CFG_ARCHIVE") 一致（$S3）"
   elif x96_cfg_same "$CFG" "$CFG_ARCHIVE"; then echo "  归档 $(basename "$CFG_ARCHIVE") 字节不同但语义一致（$S3 vs $S1）"
   else echo "  归档 $(basename "$CFG_ARCHIVE") 不一致（$S3 ≠ $S1）"; fi
-} || echo "  警告：configs/ 里没有 $MODE 的归档"
+} || { [[ $MODE == trim ]] && echo "  警告：configs/ 里没有 trim 归档（唯一该留的那份）" || echo "  full 不归档（configs/ 只留 trim）；入口 $CFG"; }
 echo "MODE=$MODE  CFG=$CFG ($S1)  KSRC=$KSRC  OUT=$OUT  JOBS=$JOBS  LOG=$LOG"
 if [[ -f $OUT/.config ]]; then
   S2=$(sha256sum "$OUT/.config" | cut -c1-12)

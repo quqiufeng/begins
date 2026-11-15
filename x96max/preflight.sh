@@ -57,8 +57,15 @@ LV=$(printf 'CONFIG_LOCALVERSION="-%s"' "${KNAME#$KV-}")
 ck "CONFIG_LOCALVERSION=$LV 对得上 KNAME=$KNAME" "grep -qxF '$LV' '$CFG'"
 ck "CONFIG_USB_STORAGE=y"           "grep -qx CONFIG_USB_STORAGE=y $CFG"
 ck "FAT/MSDOS/VFAT 三连 =y"         "[ \$(grep -cE '^CONFIG_(FAT_FS|MSDOS_FS|VFAT_FS)=y' $CFG) = 3 ]"
-ck "归档存在 $CFG2"                 "test -f $CFG2"
-ck "两份配置同源（diff -q）"        "diff -q $CFG $CFG2"
+# full 不再进 configs/ 归档（只留 trim 一份）：入口就是 kernel/config-*.sh 用的 $CFG
+if [[ -n $CFG2 ]]; then
+  ck "归档存在 $CFG2"               "test -f $CFG2"
+  ck "归档与入口同源（diff -q）"     "diff -q $CFG $CFG2"
+elif [[ $MODE == trim ]]; then
+  printf '  FAIL 缺 trim 归档（configs/config-%s-x96-trim-<日期>）\n' "$KV"; F=$((F+1))
+else
+  printf '  ok   full 不归档，入口 %s（构建时现解压源码包）\n' "$(basename "$CFG")"; P=$((P+1))
+fi
 
 # --- 裁剪审计（trim 套；build-kernel/rebuild-from-zero 开跑前也拦一次）---
 if [[ $MODE == trim && -d $S ]]; then
