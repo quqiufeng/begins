@@ -40,12 +40,17 @@
    开机耗时 `~30s` 到 login，曲线与旧系统一致，无 `I/O error` / `reset`，USB 掉盘问题不再出现（走的是 eMMC，本就不涉及）。
 6. ⬜ **无线缺口**：当前树/配置里没有 `net/wireless`、`net/mac80211`、`drivers/net/wireless`，`CONFIG_RTW88*`、`CONFIG_BT*` 全未开 → 内核无 Wi-Fi/蓝牙驱动（有线正常）。补法与证据见 §0.3；这一项不动也不影响 FAT 这条主线。
 7. ⬜ **U 盘在盒子上读一半掉线**（`sda` sector 1427360 / 697MiB，`cmd_age=30s` + xhci `reset`）：卡本身没问题（PC 上 `verify-card.sh` 全绿），是盒子 USB3 口只以 `high-speed`(480M) 枚举 USB3 盘所致。eMMC 未被写入。排查顺序与 `patch-bootargs.sh --usb-fix` 见 §10.2.2。
-8. 🔧 **initramfs 抢跑：U 盘根盘枚举晚 1.3 秒，先被判「UUID 不存在」**（`t=39.64s` 放弃 / `t=40.94s` 才出 `[sda]`）。
+8. ⬜ **(16:34 复发，变体更狠)** `hostbyte=0x07` + `cmd_age=0s`，复位呈 ~30s 周期、始终不恢复，开机卡死在 initramfs 的 `e2fsck`。
+   `quirks` + `autosuspend` 已在 `APPEND` 里且无效；结合 15:31「PC 上也掉过」→ **盘/接口在衰减**。
+   处置：**换 microSD 走内部 MMC 控制器**（§10.2.2 补充二，已列为第 1 选项）。
+9. 🔧 **initramfs 抢跑：U 盘根盘枚举晚 1.3 秒，先被判「UUID 不存在」**（`t=39.64s` 放弃 / `t=40.94s` 才出 `[sda]`）。
    **与第 1~3 条无关**：`CONFIG_USB_STORAGE` 早已 `=y`、`[sda]` 也确实出现了——同一句 `Gave up waiting` 的第二种成因，§5.4 的三条断言全过仍会撞上。
    - 应急：`(initramfs)` 里敲 `exit`，会重跑一轮 `mountroot` 并挂上，不用重启。
    - **`rootdelay=15` 是无效解，已弃用**（2026-11-15 读 `init`/`scripts/local` 源码证伪，见 §5.5「为什么 rootdelay 没用」）：`init` 先记 `starttime` 再 `sleep rootdelay`，而 `slumber=max(30, rootdelay)` → 15 秒只是从 30 秒预算里挖掉 15 秒，放弃时刻只提前、不推迟。
    - 固修（已写入卡 p1，**待真机复验**）：`x96max/patch-initrd-wait.sh` 把 initramfs 里 `scripts/local` 的 `slumber` 由 `30` 改成 `90`，重打包成 `uInitrd`；`uEnv.txt` 的 `rootdelay=15` 已用 `-r` 删除（`APPEND` 21 参数，`usb-storage.quirks=346d:5678:u` / `usbcore.autosuspend=-1` 保留）。
    - 卡上**两份** uInitrd 都已打（16:27 `/uInitrd`、16:30 `/uInitrd-7.2.12-x96`），`--check` 均回读 `slumber=90`（判据见 §10.1.1 第 6 步）。
+   - **16:34 那次开机仍未验证到它**：根盘被第 8 条的掉盘打死在 `e2fsck`，根本没走到「等 root 设备」那一步。
+     「`slumber=90` 有效」目前只有源码推理，**没有真机证据**——要等根盘能正常挂上那天才算验过。
    - 判据表 + 可复现步骤见 **§5.5**；`rebuild-from-zero.sh --from initrd` 已内置该补丁，重打镜像不会回退。
 
 ### 0.1 源码缺失时的补齐来源（唯一权威包）
@@ -804,7 +809,8 @@ U 盘走的是 `usb-storage` 异步探测 + 30s 级 `scan`，比 eMMC/SSD 慢一
 | 超时时刻 < `[sda]` 枚举时刻（差几秒内） | 竞态 | 抬 initramfs 等待窗口（`patch-initrd-wait.sh`），**别用 `rootdelay`**，见下方「永久修复」 |
 | `[sda]` 从没出现 | 真缺驱动（§5.4） | 查 `nm vmlinux \| grep usb_stor_probe`、`CONFIG_USB_STORAGE=y` |
 | `[sda]` 出现了但 `EXT4-fs` 没挂上 | 不是驱动也不是时序 | 查 `root=UUID=` 是否与实际 UUID 一致、`rootfstype=ext4` |
-| `I/O error` + `cmd_age=30s` + `reset` | 链路掉盘 | §10.2.2 |
+| `I/O error` + `reset` + `hostbyte=0x03` `cmd_age=30s` | 链路掉盘（**超时**变体） | §10.2.2 |
+| `I/O error` + `reset` + `hostbyte=0x07` `cmd_age=0s` | 链路掉盘（**立即打死**变体，同 §10.2.2 补充二） | §10.2.2 |
 
 **现场应急（不用重启、不用改盘）**：在 `(initramfs)` 提示符直接敲
 
@@ -1326,6 +1332,7 @@ Amlogic 官方救砖流程，绕开 eMMC 上一切 U-Boot 配置，不依赖 `bo
 |---|---|
 | `tag#0 UNKNOWN(0x2003)` + `hostbyte=0x03` | 命令没拿到结果就被链路断开，不是数据错/校验错 |
 | `cmd_age=30s` | SCSI 层等到超时上限才报错（默认 `eh_timeout` 30s） |
+| `hostbyte=0x07` + `cmd_age=0s` | `DID_ERROR`：命令刚下发就被 `reset` 打断，**不用等 30s**，是同一故障的更狠变体（见下方 16:34 补充） |
 | `reset ... device number 2` | xHCI 在超时后复位设备；日志里只有 USB 2.0 的 `high-speed` |
 
 **位置**：sector 1427360 × 512 = 697MiB。p1 只占 0–511MiB，所以断的是 **rootfs 内约 185MiB 处**——系统读根盘时就断，卡在挂 root，后面全无输出。
@@ -1400,6 +1407,58 @@ for d in /sys/bus/usb/devices/*/; do
   [ -r "$d/speed" ] && echo "$(basename $d) $(cat $d/speed) $(cat $d/product 2>/dev/null)"
 done | grep -i -e 5000 -e teclast
 ```
+
+**2026-11-15 16:34 补充：打完 initrd 补丁后复发，且换了个变体。**
+
+插盒子开机（HDMI 拍照，t=12.4s 起）：
+
+```text
+12.441849 usb 3-1: reset high-speed USB device number 2 using xhci-hcd
+12.575937 sd 0:0:0:0: [sda] tag#0 UNKNOWN(0x2003) Result: hostbyte=0x07 driverbyte=DRIVER_OK cmd_age=0s
+12.579922 CDB: opcode=0x28 28 00 00 15 ee 70 00 00 f0 00
+12.587454 I/O error, dev sda, sector 1437296 op 0x0:(READ) flags 0x84700 phys_seg 27 prio class 2
+12.718533 usb 3-1: reset high-speed USB device number 2 using xhci-hcd
+12.859290 sd 0:0:0:0: [sda] tag#0 UNKNOWN(0x2003) Result: hostbyte=0x07 driverbyte=DRIVER_OK cmd_age=0s
+12.870816 I/O error, dev sda, sector 1426104 op 0x0:(READ) flags 0x80700 phys_seg 17 prio class 2
+13.966007 Console: switching to colour frame buffer device 240x67
+44.145170 usb 3-1: reset high-speed USB device number 2 using xhci-hcd
+44.294348 I/O error, dev sda, sector 1324564 op 0x0:(READ) flags 0x800700 phys_seg 2…
+74.871827 usb 3-1: reset high-speed USB device number 2 using xhci-hcd
+105.585128 usb 3-1: reset high-speed USB device number 2 using xhci-hcd
+```
+
+四条新信息，按重要性：
+
+1. **这是 §10.2.2 的掉盘，不是 §5.5 的竞态。** 竞态的症状是 `Gave up waiting` 后**一句 `I/O error` 都没有**；
+   这里是根盘每读必错、而且 `reset` 一直重试。抬 `slumber` 对它**无效**（它治的是「等不等得到」，不治「读得动读不动」）。
+2. **变体更狠：`hostbyte=0x07`(`DID_ERROR`) + `cmd_age=0s`**，不是原来的 `0x03`(`DID_TIME_OUT`) + `cmd_age=30s`。
+   含义是命令刚下发就被 `reset` 打断（错误处理链立刻放弃），连 30s 超时预算都用不上。
+   判据表已补这一行——**别看到 `cmd_age=0s` 就以为不是掉盘**。
+3. **复位呈 ~30s 周期**（44.1 / 74.9 / 105.6），一直不恢复 ⇒ 这一轮开机**卡死在 initramfs 里**，没到 `login:`。
+   12.5s 就在读 `p2` 内 646–702MiB 区域，是 initramfs 的 `e2fsck`（`fsck.fix=yes`）在扫根盘，扫到坏链路上。
+4. **失败扇区稳定在同一片**：1426104 / 1437296 / 1324564（≈646–702MiB），与 15:31 那次 1427360 同区。
+   这和 §15 第 9 条的「同一位置重读给出相同错字节」对得上：坏的不是随机 flash，而是**这条链路在固定负载下必断**。
+
+**由此推出的结论（重要）**：
+
+- `usb-storage.quirks=346d:5678:u` + `usbcore.autosuspend=-1` **已在 `APPEND` 里生效，但没治好**。
+  与本节自己那句「在 `high-speed` 下 UAS 本就没参与，这两行属保险」一致——**别再在这两个参数上加码**。
+- **`patch-initrd-wait.sh`（`slumber=90`）至今未被真正验证过一次**：每次都在它生效之前就被掉盘打死。
+  §0 第 8 条的「待真机复验」要一直挂着，直到有一天能看到 rootfs 挂上。
+- 结合 15:31 补充（同一根盘在 PC 上 `capacity change → 0`、重插只剩 `high-speed` + `error -71`）：
+  **这根 Teclast 盘/它的接口已经在衰减**，把它当根盘等于拿一次开机赌一次链路。
+
+**处置（按推荐顺序，第 1 条优先）**：
+
+| 序 | 做法 | 理由 |
+|---|---|---|
+| 1 | **换 microSD 卡，同一个 `img.gz` 走 `write-card.sh`** | 盒子 SD 槽走内部 MMC 控制器，整条 USB 链路从根盘路径上消失；掉盘与竞态两个故障同时绕过 |
+| 2 | USB-SATA SSD + **有源 HUB** | 供电与主控都换掉，比再换一个廉价 U 盘可靠 |
+| 3 | 换全新 U 盘（USB2 盘也行，480M 本就够） | 只有手边没有 SD/SSD 时才走这条 |
+| — | ~~继续调内核参数~~ | 已排除：参数在、故障照旧 |
+
+> 目标没变（§19：装到 eMMC）。USB 只是**用来跑一次 `x96-autoinstall` 的临时载体**，
+> 它在半路掉链子属于载体问题，不该让内核树陪跑。
 
 ### 10.3 验证
 
@@ -1569,7 +1628,7 @@ NAS 备份目录  dav://192.168.1.53:5005/sata11-18072858035/x96-backup/
 6. **Amlogic Maskrom 的 `update` 工具在本机控制传输不稳定**：T95 的 Allwinner FEL 经验不能直接套用；能 SD 启动就不要再纠结 Maskrom。
 7. **备份先行**：原厂启动区 117MiB、p1、p2 都在 `dav://192.168.1.53:5005/sata11-18072858035/x96-backup/emmc-original-backup/`；写主线 U-Boot 前必须保留。
 8. **写卡前关桌面自动挂载**：udisks2 会在 dd 结束后把卡以 **rw** 挂上 → ext4 日志回放 → 经不稳的读路径读到错字节再写回，垃圾被固化成真损坏（症状：文件字符错位、**长度不变**、`e2fsck -fn` 干净，只有逐文件 sha256 抓得到）。一条命令避开：`sudo x96max/write-card.sh <img.gz> /dev/sdX`，详见 §10.1.3。
-9. **U 盘掉盘先看 `speed`，别急着换卡**：`reset ... high-speed` + `cmd_age=30s` + `hostbyte=0x03` 是链路层超时，不是数据损坏；同一根盘在 PC 上 sha256 全绿就说明卡没问题。USB3 盘在盒子上只以 480M 枚举基本等于掉到了 USB2 链路，先换口/上有源 HUB。详见 §10.2.2。
+9. **U 盘掉盘先看 `speed`，别急着换卡**：`reset ... high-speed` + `I/O error` + `hostbyte=0x03`/`0x07` 是链路层故障，不是数据损坏（`0x03`+`cmd_age=30s` 是超时；`0x07`+`cmd_age=0s` 是刚下发就被打断，同一故障两种形态）；同一根盘在 PC 上 sha256 全绿就说明卡没问题。USB3 盘在盒子上只以 480M 枚举基本等于掉到了 USB2 链路，先换口/上有源 HUB。详见 §10.2.2。
 10. **别用整盘 `cmp` 判写卡成败**：USB 读卡器大块读会返回错字节，且同一位置重读给出**相同的错字节**，裸盘比对必然出现几百字节假差异，会把好卡判成坏卡、逼你反复重写（每次重写又在放大第 8 条的风险）。判据是逐文件 sha256 + `e2fsck -fn`，见 §10.1.4。
 11. **卡 p1 上有两份 uInitrd，改错白改**：`uEnv.txt` 的 `INITRD=/uInitrd` 才是 u-boot 真加载的那份，
     但同一目录还躺着 `uInitrd-7.2.12-x96`（ophub `rebuild` 产物，37MB，`slumber=30`）。
