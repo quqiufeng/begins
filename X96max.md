@@ -1843,7 +1843,13 @@ NAS 备份目录  dav://192.168.1.53:5005/sata11-18072858035/x96-backup/
               http://192.168.1.53:5005/sata11-18072858035/x96-backup/
               含 x96src-autoinstall.img.gz、x96src-fixed.img.gz、
               x96src-small.img.gz、emmc-original-backup/、SHA256SUMS
-本地暂存      ~/x96-backup/
+NAS 镜像备份  dav://192.168.1.53:5005/sata11-18072858035/x96max/
+              http://192.168.1.53:5005/sata11-18072858035/x96max/
+              含 x96-trim-autoinstall.img.gz、Armbian_26.11.0-trunk_trixie_arm64_6.18.60.img
+              及各自 .sha256（见 §19.6.3）
+ 本地暂存      /x96-build/recovery/（两个成品 gz、orig/、u-boot 等）
+               基础镜像只在 amlogic-s9xxx-armbian/build/output/images/ 一处
+               （`~` 下无副本；`~/x96-backup/` 只剩 usb-stick 快照，见 §19.6.3）
 设备          root@192.168.1.121（DHCP，可能变化；ssh 用 IP）
 ```
 
@@ -2466,6 +2472,104 @@ sudo ./x96max/trim/rebuild-from-zero.sh --from image     # 21:32 → 21:39 rootf
 
 镜像体积参考：裁剪套 271M（gz）/ 全量套 271M→272M 一档，两者差在 `boot` 包与 `Image`（30.7M vs 35.9M），
 rootfs 部分相同——想再瘦要动 §18 的包清单，而不是内核。
+
+### 19.6.3 成品与基础镜像现状（2026-11-15 23:44 核对 NAS）
+
+**两条旧记录都错了，以此节为准。**
+
+**错记录 1**：此前写“本地 `~` 留一份（`~/x96-trim-autoinstall.img.gz`、`~/Armbian_...img`）”——
+23:39 实测这两个路径**都不存在**，全盘 `find` 无第二份。
+
+**错记录 2**：23:38 我把 `/tmp/x96-trim-autoinstall.img`（3.0GiB，root，mtime **21:52**）压成 311M 的 gz
+放进 `recovery/`，并写下“与旧 `98d4803b…` 内容一致”。**这是错的**：两者解压体虽同为 3225419776 字节，
+但 sha256 分别是 `4480c312…` 与 `09f7662f…`，`cmp` 显示 489,891,314 字节不同；
+按 64M 分块比对，**chunk 0/1（boot 区）与 8、10–19、22、26、28（rootfs 元数据区）不同**，其余一致。
+即 21:52 那份是**上一轮构建（§19.6.2 的 21:39 基线）**的残留解压体，NAS 上的才是 **22:21 最终成品**。
+311M 那份已删，`recovery/` 现用 NAS 版本覆盖。
+
+| 文件 | 本地位置 | 大小 | sha256 / 状态 |
+|---|---|---|---|
+| `x96-trim-autoinstall.img.gz` | `/x96-build/recovery/` | 275M | `98d4803bdbfe1671e543c569b7c2a23411b1cc1668ae681e2647341a322b3cc6`（从 NAS 取回，`gzip -t` 通过）——**现役成品** |
+| （本地已删，见下） | — | — | `x96src-autoinstall.img.gz` 271M/18:25 的全量套，23:51 已验证归档 NAS 后从本地删除 |
+| `Armbian_26.11.0-trunk_trixie_arm64_6.18.60.img` | `/x96-build/amlogic-s9xxx-armbian/build/output/images/` | 2.5G | `1cbca554455ac57855f960bea4873431df01ef870b1c0a4cb01e5a42330996a8` |
+| eMMC 原始备份 | `/x96-build/recovery/orig/` | 876M | 见下表 |
+
+**NAS 已复核（`~/.env` 里的 `WEBDAV_*` 可用，`curl -u … -X PROPFIND` 能列目录）**：
+`http://192.168.1.53:5005/sata11-18072858035/x96max/`
+
+| NAS 文件 | 字节 | 核对结果 |
+|---|---|---|
+| `emmc-original-backup/emmc-bootarea-117MiB.img.gz` | 34633290 | 与本地同名文件 sha256 一致 `c4f37419…` |
+| `emmc-original-backup/emmc-p1-boot.img.gz` | 98297115 | 一致 `fa0774ff…` |
+| `emmc-original-backup/emmc-p2-rootfs.tar.gz` | 784828180 | 一致 `2b77baf7…` |
+| `emmc-original-backup/mmcblk1.sfdisk` | 212 | 一致 `341a843f…` |
+| `SHA256SUMS` | 441 | 上述四行全对上 |
+| `x96-trim-autoinstall.img.gz` + `.sha256` | 288757378 | `98d4803b…`，即 22:21 成品 |
+| `x96src-autoinstall-2026-11-15-1825.img.gz` + `.sha256` | 284040362 | **18:25 全量套**，sha256 `18cc4a846db1f78866aefed7b1aa19196ab959a6c8b98a9053ef074412bfb7ba`；23:51 上传并回读校验一致 |
+| ~~`x96src-autoinstall-2026-11-15.img.gz`~~ | ~~329277929~~ | **17:39 的另一轮构建，≠ 18:25 版**（见下方勘误）；23:53 已从 NAS 删除（HTTP 204，复 HEAD 404） |
+| `Armbian_…6.18.60.img` + `.sha256` | 2684354560 | `1cbca554…`，与本地一致 |
+
+→ **结论：eMMC 原始备份（唯一一份不可再生的东西）已安全落在 NAS，本地+NAS 双份且校验一致**；
+基础镜像同样双份一致。出图请认 `98d4803b…`，别再拿 `/tmp` 里的东西当成品。
+
+**勘误（2026-11-15 23:51）：NAS 那份 `x96src-autoinstall-2026-11-15.img.gz` 不是本地 271M 的换压缩级别副本。**
+解压体同为 3225419776B 但 sha256 不同（NAS `3fca0ccb…` vs 本地 `ef58a733…`），
+64M 分块差异在 chunk 0/1/2（boot 区）与 8、10–22、26、28（rootfs 元数据），
+首个差异字节 4194372（= p1 起始 8192×512 + 68）。挂载 p1 对比可确认是两轮不同构建：
+
+| p1 文件 | 本地 18:25 | NAS 17:39 |
+|---|---|---|
+| `vmlinuz-7.2.12-x96` / `zImage` | 32178688 | 42220032 |
+| `uInitrd` | 11081587 | 15752192 |
+| `initrd.img-…` | 11081523 | 15752128 |
+| `config-7.2.12-x96` | 223168 | 257801 |
+| `System.map-…` | 6401799 | 8131676 |
+
+即 NAS 旧名那份 = **17:39 的 fat 内核构建**，本地 18:25 是裁剪版内核构建。
+所以“NAS 已备份，可以删本地”这个假设对 18:25 版**不成立**；
+已按 `18cc4a84…` 上传为 `x96src-autoinstall-2026-11-15-1825.img.gz`（带 .sha256）并回读校验，
+之后才删掉本地 271M。
+
+23:53 该过期文件（17:39 版，329M）已从 NAS 删除，NAS `x96max/` 现只剩：
+`x96-trim-autoinstall.img.gz` 275M（+ .sha256）、`x96src-autoinstall-2026-11-15-1825.img.gz` 271M（+ .sha256）、
+`Armbian_…_6.18.60.img`、`SHA256SUMS`、`emmc-original-backup/`（原始 eMMC 备份，不动）。
+注：NAS 顶层 `SHA256SUMS` 只覆盖 `emmc-original-backup/` 四项，不含镜像本体；镜像各自带 `.sha256` 旁文件。
+
+**`recovery/` 曾被整个丢进回收站**（23:29–23:37 之间，`~/.local/share/Trash/files/recovery`，4.9G，
+含 u-boot / bootarea / eMMC 备份 / 两个成品 gz）——23:37 已原样还原。凡是 `recovery/` 突然消失，先查回收站再谈重建。
+
+### 19.6.4 磁盘清理记录（2026-11-15 23:38 / 23:44，15G → 8.8G）
+
+日志 `/x96-build/logs/cleanup-20261115-2338.log`。只删可再生成/重复的，共释放约 6.3G：
+
+| 删掉 | 大小 | 为什么可以删 |
+|---|---|---|
+| `recovery/stale/x96src-autoinstall-2114.gz` | 334M | 21:14 旧中间产物，已被 18:25 成品取代 |
+| `recovery/x96src-autoinstall.img.gz.bak-hexdump-missing` | 299M | 同镜像的另一份压缩（解压同为 3225419776B），`gzip -t` 通过但冗余 |
+| `recovery/x96s905x2.img` | 3.1G | 全量套解压态中间图，内容= `x96src-autoinstall.img.gz` |
+| `src-pristine` | 1.8G | 全量源码树，`/opt/linux/src/linux-7.2.12.tar.xz` 可重解 |
+| `kbuild-odc` | 729M | olddefconfig 试验树，无脚本引用 |
+| `armbian-build/cache` | 396M | ophub apt/pip 缓存（root 属主部分需 `sudo rm`） |
+| `initrd/uInitrd/uEnv.txt.bak.*` | 66M | 打补丁前的临时回滚副本，可重建 |
+
+**保留**：`7.2.12-trim`（裁剪源码树，解压不出来）、`kbuild-trim`、`pkgs/`、`recovery/orig/`、
+`recovery/*.img.gz` 两个成品、`amlogic-s9xxx-armbian`（基础镜像唯一副本）、`base-own.img`、`boot-good/bad`。
+还能再砍：`amlogic-s9xxx-armbian` 里的 ophub 源码 3.3G（先把基础镜像挪出来）、`base-own.img` 1.2G（`mkbase.sh` 可重造）。
+
+**第二轮（23:44，`/tmp` 3.0G×2 与错压的旧构建）**：删 `/tmp/x96-trim-autoinstall.img`（3.0G，21:52 旧构建解压体，
+已成 NAS 版取代）、`/tmp/Armbian_...2026.11.15.img`（3.0G，基础镜像解压中间体；`build-image.sh:55` 的 `$BASE`
+指向 `output/images/` 那份，脚本不引用 `/tmp`）、`/tmp/local-trim.img` 与分块比对临时件。
+`recovery/x96-trim-autoinstall.img.gz` 由错压的 311M 换回 NAS 的 275M / `98d4803b…`。
+
+**为什么要单独备份基础镜像**：`build-image.sh:68` 硬校验 `$BASE`，缺了直接 `missing base image` 退出；
+它的 rootfs 会被整体清空（§19.6 步骤 1），但那个 ext4 分区容器本身不能凭空造出来，
+`mkbase.sh` 虽能自造（§19.6.1），仍需源码 rootfs 与 `base-boot-backup` 都在位。留着最省事。
+
+**校验方式**：`gzip -t` 已过；`sha256sum` 源/目标分别计算，基础镜像两侧一致。
+
+**注意 sha256 与 §19.6.2 不同**：19.6.2 记的是 21:39 的裁剪套基线（271M / `ce37a41e…`），
+22:21 又重跑过一次 image 阶段，把 `recovery/x96-trim-autoinstall.img.gz` 覆盖成 276M / `98d4803b…`；
+旧的 271M 文件已不存在，重新出图请以本次记录为准。
 
 ### 19.7 写盘、首启与 eMMC 安装
 

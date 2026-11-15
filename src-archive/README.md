@@ -6,7 +6,8 @@
 |---|---|---|---|
 | `linux-7.2.12-hwreal-src-20261111.tar.zst` | 68.9 MB | `7.2.12-20261111-hwreal` | 本机装机内核的裁剪树，32195 文件，解包 510 MB |
 | `linux-7.2.12-sandy-dbg2-src-20261112.tar.zst` | 77.2 MB | `7.2.12-sandy-dbg2-20261111` | 小机箱追踪/调试内核，33007 文件，解包 516 MB |
-| `SHA256SUMS` | 173 B | — | 两个包的校验值 |
+| `linux-7.2.12-trim-src-20261115.tar.zst` | 91.3 MB | `7.2.12-x96-trim` | **后续裁减的基础备份**，50437 文件，解包 750 MB |
+| `SHA256SUMS` | 260 B | — | 三个包的校验值 |
 
 ```bash
 sha256sum -c SHA256SUMS
@@ -70,6 +71,49 @@ make -j6 olddefconfig  # rc=0
 make -j6 prepare       # rc=0，objtool / resolve_btfids 正常编出
 make -j6 fs/ext4/namei.o kernel/sched/core.o drivers/net/ethernet/realtek/r8169_main.o   # rc=0
 ```
+
+## 来路（trim 包 — 后续裁减的基础）
+
+`/x96-build/7.2.12-trim` 的快照，`CONFIG_LOCALVERSION="-x96-trim"`，留作下一轮裁剪的起点。
+它本身是 x96 出树构建（`O=/x96-build/kbuild-trim`）的源码树，树内**没有** `.config`；
+构建产物只剩 3 个就地生成的残留（`scripts/module.lds`、`scripts/mod/devicetable-offsets.h`、
+`scripts/mod/elfconfig.h`），`make` 会覆盖重建，无需手工清。
+
+| 项 | 值 |
+|---|---|
+| 打包命令 | `tar -C /x96-build --transform 's,^7\.2\.12-trim,linux-7.2.12,' --sort=name --owner=0 --group=0 --numeric-owner --mtime='2026-11-15 00:00:00' -cf - 7.2.12-trim \| zstd -19 -T6` |
+| 压缩比 | 750 MB → 91.3 MB（8.2×，zstd -19 -T6，91 s） |
+| 内容 | 50437 条目 = 47248 常规文件 + 3167 目录 + 22 符号链接（其中 11 个是 `scripts/dtc/include-prefixes/*` 的悬空链接，上游本身如此） |
+| 配置 | 包内无 `.config`（与另两个包不同）。权威副本在仓库 `configs/config-7.2.12-x96-trim-final-20261115`（223939 B，git `f0a7fd9`），与本包对应的 `/x96-build/kbuild-trim/.config` 逐字节一致（SHA256 `c4c802d5d9a3f68b7a07636cc9a863f81962aabd6f17fb06d1fe2dbd0996482a`）。解包后 `cp ../../configs/config-7.2.12-x96-trim-final-20261115 .config` 即可 |
+| 裁剪标记 | `.trimmed`（`pruned 2026-11-15 21:02:58  dirs=15`）与 `.trim-drivers-removed-20261115.txt` 一并保留 |
+
+与上游全量源码树（`/x96-build/src-pristine`，101078 条目 / 1783 MB）的**实测**差异：
+
+| 顶层目录 | 条目 pristine → trim | |
+|---|---|---|
+| `Documentation` | 12037 → 6 | 只留 `Kconfig` 相关骨架 |
+| `tools` | 10403 → 335 | 仅留构建必需的 `objtool`/`bpf`/`build` 等 |
+| `arch` | 19456 → 4221 | 非 x86/arm64 架构分支 |
+| `drivers` | 39971 → 27528 | 大量二/三级目录被削到只剩 `Kconfig`+`Makefile` 骨架（`xen` 79→2、`vdpa` 57→2、`thunderbolt` 41→2），另有 4 个顶层目录整体删除（`dio` `nubus` `ps3` `tc`，共 4 MB） |
+| `fs` | 2468 → 1846 | 未用文件系统 |
+| `net` | 1994 → 1764 | |
+| `sound` | 3169 → 3152 | |
+| `scripts` | 770 → 773 | 多出的 3 个是就地残留的生成物 `mod/devicetable-offsets.h`、`mod/elfconfig.h`、`module.lds`，`make` 会重建 |
+
+注：`.trimmed` 记的 `dirs=15` 是当时 `prune_src.py` 那一次运行写下的数，与上面逐目录实测对不上，**以实测为准**。
+`.trim-drivers-removed-20261115.txt` 列了 58 个候选 drivers 子树，实际只剩 4 个未在树里，其余 54 个仍在（说明该文件是候选清单而非执行结果）。
+
+**验证**（打包后直接做，未抽检）：
+
+```bash
+zstd -t linux-7.2.12-trim-src-20261115.tar.zst          # frame OK
+tar --zstd -xf ... -C /tmp/x                              # 50437 条目，0.99 s
+diff -rq /tmp/x/linux-7.2.12 /x96-build/7.2.12-trim       # 无差异
+rsync -rlpc --dry-run /x96-build/7.2.12-trim/ /tmp/x/linux-7.2.12/
+# Number of regular files transferred: 0   ← 47248 个常规文件逐字节一致
+```
+
+SHA256：`0a358c87077b8259a95879ca7563958ae184ab8b2f9c7f8db8bce3f6b5f8d938`
 
 ## 已知坑：`make clean` / `mrproper` 会报错
 
