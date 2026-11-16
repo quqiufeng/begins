@@ -46,6 +46,11 @@ void glout_reset(void);
 #define OUT_T V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
 
 static volatile sig_atomic_t g_reinit;	/* 定义在下方，xioctl 要先看到 */
+/* 驱动 abort 会话（POLLERR）后的连续自愈次数。meson-vdec 偶发
+ * "Aborting decoding session"，重开设备就能继续；超过上限才认输退出，
+ * 否则交给上层整链重启会闪屏。
+ */
+static int g_err_rec;
 
 static int xioctl(int fd, unsigned long req, void *arg)
 {
@@ -106,10 +111,21 @@ static int g_gl_ready;
 #endif
 static unsigned g_w = 640, g_h = 360;
 static int got, resets, g_refeed;
+/* 重建会话后必须从 IRAP 重新起解：续喂到 GOP 中间，驱动 ref list 是空的，
+ * 每一帧都 "Couldn't find ref. frame 0"，硬件把 ref 地址当地址 0 读，
+ * 通常几帧内再次静默挂死（soak 实测重开后 8 帧就死）。
+ */
+static int g_need_irap;
+/* 本次重建是否要连 VDEO 整块一起掉电复位（只有固件 hang 才需要，
+ * seek 那种正常重建走一遍掉电太贵、还会多闪一次） */
+static int g_hard_reset_on_reinit;
+static double t_irap_wait;	/* 本会话开始等 IRAP 的时刻 */
+static int g_force_reinit_at;	/* 0=未启用 */
 static int g_mark_first;	/* reinit 后等待首帧，打一行供脚本同步 */
 /* 计时：把"纯解码吞吐"从启动/收尾/写盘里剥出来 */
 static int got_queued;
 static double t_first_q, t_last_q, t_first_rx, t_last_rx, t_write_acc, t_tm_acc;
+static double t_loop;	/* 上一轮主循环的时刻，用来识别"进程被冻住过" */
 
 static int nal_type(const unsigned char *p)
 {
@@ -412,6 +428,39 @@ static int handle_event(void)
 		eos_seen = 1;
 	}
 	return 0;
+}
+
+/* VDEC 固件单帧 hang 之后，STREAMOFF/ON 这一层软复位救不回来（实测重开后
+ * seq_o 停在 8、每 5s 中断只 +0/+1）。真正能把 HEVC 子块拉回"刚 probe"状态
+ * 的是驱动导出的 hard_reset 参数：隔离 + MEM_PD + 掉电 + 重新上电。
+ * 只会在会话已经 close 掉之后写（驱动 cur_sess 为空才接受，否则 -EBUSY，
+ * 因为驱动收尾是 workqueue 异步做的，所以带重试）。
+ */
+static void vdec_block_reset(void)
+{
+	const char *p = "/sys/module/meson_vdec/parameters/hard_reset";
+	const char *e = getenv("HARDRESET");
+	int f, i;
+
+	if (e && atoi(e) == 0)
+		return;
+	for (i = 0; i < 25; i++) {
+		ssize_t w;
+
+		f = open(p, O_WRONLY);
+		if (f >= 0) {
+			w = write(f, "1", 1);
+			close(f);
+			if (w == 1) {
+				printf("HARDRESET: VDEC 整块掉电复位 OK（第 %d 次尝试）\n", i + 1);
+				fflush(stdout);
+				return;
+			}
+		}
+		usleep(20000);
+	}
+	printf("HARDRESET: 失败（%s 不可写或驱动未收尾）\n", p);
+	fflush(stdout);
 }
 
 static unsigned capw, caph;
@@ -1204,12 +1253,13 @@ static int play_setup(unsigned sw, unsigned sh)
 		}
 		map = mmap(NULL, dd.size, PROT_READ | PROT_WRITE, MAP_SHARED, pc.dfd, dm.offset);
 		if (map != MAP_FAILED) {
-			/* 不透明黑：黑边（letterbox）靠它兜底，同时避免
-			 * 透明 plane 合成到未定义底色上出现彩边 */
+			/* 必须全透明（alpha=0）：primary plane 在 meson 上
+			 * zpos 高于 overlay，填不透明色会把视频层整个盖黑。
+			 * 黑边交给 overlay 的 dst 矩形外区域（CRTC 未覆盖处）。*/
 			uint32_t *px = map;
 			size_t n = dd.size / 4, i;
 
-			for (i = 0; i < n; i++) px[i] = 0xff000000u;
+			for (i = 0; i < n; i++) px[i] = 0x00000000u;
 			munmap(map, dd.size);
 		}
 		else printf("PLAY: mmap ARGB: %s (可能残留脏像素)\n", strerror(errno));
@@ -1566,6 +1616,36 @@ int main(int argc, char **argv)
 		struct pollfd pf = { .fd = fd, .events = POLLIN };
 		int pr;
 
+		/* 进程被冻住过的识别：tvplay 的"暂停"就是 pkill -STOP 整条链，
+		 * 冻住的这段时间 CLOCK_MONOTONIC 照走，而循环一轮都没转。
+		 * 不扣掉它，resume 后第一次 poll 超时就会算出 quiet=暂停时长，
+		 * 直接误判成硬件 STALL 去重建会话（闪一下黑屏 + 掉 buffer）。
+		 * 一轮正常最多卡一个 poll 周期（2s），超过 4s 只可能是被冻过；
+		 * 恢复后按"刚过一个 poll 周期"重算基准，既不误判也不会算出负数。
+		 */
+		{
+			double tl = now_s();
+
+			if (t_loop > 0 && tl - t_loop > 4.0)
+				t_last_rx = tl - 2.0;
+			t_loop = tl;
+		}
+
+		/* 心跳：长跑时才知道"什么时候"停的画。没有这行，画面冻住
+		 * 只能靠外部 rchar 采样反推，前端时间全是黑的。
+		 */
+		{
+			static double t_hb;
+
+			if (now_s() - t_hb >= 10.0) {
+				t_hb = now_s();
+				printf("HB t=%.0f au=%d got=%d out_nfree=%d/%d quiet=%.1f rec=%d\n",
+				       t_hb - t0, au_idx, got, out_nfree, n_out,
+				       t_hb - t_last_rx, g_err_rec);
+				fflush(stdout);
+			}
+		}
+
 		/* 收到 SIGUSR1：换新码流。meson-vdec 不接受在旧会话上接新流
 		 * （整份新 SPS/DPB 撞进老状态，驱动直接 Aborting decoding session），
 		 * 所以关掉 /dev/video0 重开一遍；DRM master、crtc/plane 和
@@ -1640,6 +1720,12 @@ int main(int argc, char **argv)
 #endif
 			cap_release();
 			close(fd);
+			/* 软复位救不回的固件 hang，这里做整块掉电复位；
+			 * 必须排在 close 之后（驱动要求 cur_sess 为空）。 */
+			if (g_hard_reset_on_reinit) {
+				vdec_block_reset();
+				g_hard_reset_on_reinit = 0;
+			}
 			/* 驱动是异步收尾的：close 后它才在 workqueue 里打完
 			 * "Aborting decoding session!"。紧接着 open 会把新会话
 			 * 开在还没收干净的旧状态上，于是 seek 偶发连试两次都
@@ -1672,8 +1758,10 @@ int main(int argc, char **argv)
 			au_idx = 0;
 			t_last_rx = now_s();
 			g_mark_first = 1;
+			g_need_irap = 1;	/* 新会话：必须等 IRAP 再喂 */
+			t_irap_wait = now_s();
 			pf.fd = fd;
-			printf("REINIT: ready\n");
+			printf("REINIT: ready (waiting IRAP)\n");
 			continue;
 		}
 
@@ -1731,6 +1819,15 @@ int main(int argc, char **argv)
 			if (r < 0)
 				break;		/* seek 打断：回主循环处理重建 */
 			if (r == 0) { stream_done = 1; break; }
+			if (g_need_irap && r != 2) {
+				/* 等下一个关键帧，中间的 P/B 直接丢 */
+				idle_ticks = 0;
+				continue;
+			}
+			if (r == 2) {
+				g_need_irap = 0;
+				t_last_rx = now_s();
+			}
 			qbuf_au(ap, al, r == 2);
 			au_idx++;
 			idle_ticks = 0;
@@ -1763,13 +1860,61 @@ int main(int argc, char **argv)
 				drained = 0;
 				g_refeed = 0;
 			}
+			/* 看门狗：硬件偶尔静默挂死——vdec IRQ 完全停、DQBUF 永不
+			 * 返回，poll 只是无限超时，进程活着但画面冻住（Soak 实测：
+			 * 127 分钟后 poll(/dev/video0) 空转，vdec irq 计数不动）。
+			 * 距上一帧超过 STALLSEC 秒就判死并重建会话自愈。
+			 */
+			if (!drained) {
+				double limit, base;
+
+				/* 等 IRAP 期间本来就没有帧，不能按"无新帧"判死，
+				 * 否则 GOP 比 STALLSEC 长就死循环重建；给个独立的
+				 * 更长预算（默认 60s），超了才算真没关键帧。
+				 */
+				if (g_need_irap) {
+					limit = getenv("IRAPWAIT") ? atof(getenv("IRAPWAIT")) : 60.0;
+					base = t_irap_wait;
+				} else {
+					limit = getenv("STALLSEC") ? atof(getenv("STALLSEC")) : 12.0;
+					base = t_last_rx;
+				}
+				{
+				double quiet2 = now_s() - base;
+
+				if (limit > 0 && base > 0 && quiet2 > limit) {
+					printf("STALL: %.1fs 无新帧 au=%d out_nfree=%d/%d got=%d → 重建会话\n",
+					       quiet2, au_idx, out_nfree, n_out, got);
+					fflush(stdout);
+					if (++g_err_rec <= (getenv("ERRREC") ? atoi(getenv("ERRREC")) : 4)) {
+						g_reinit = 1;
+						g_hard_reset_on_reinit = 1;
+					} else {
+						printf("STALL: 连续 %d 次自愈失败，退出\n", g_err_rec);
+						break;
+					}
+				}
+				}
+			}
 			continue;
 		}
 		idle_ticks = 0;
 		if (g_verbose)
 			printf("poll ready revents=%x\n", pf.revents);
 		if (pf.revents & POLLERR) {
-			printf("POLLERR\n");
+			printf("POLLERR（驱动 abort 会话）rec=%d\n", g_err_rec + 1);
+			/* 不退出：驱动只是把这个会话 abort 掉了，重开设备即可
+			 * 继续；退出会让上层整链重启（黑一下屏）。只有连续多次
+			 * 重建后仍拿不到帧才真正放弃。
+			 */
+			if (++g_err_rec <= (getenv("ERRREC") ? atoi(getenv("ERRREC")) : 4)) {
+				g_reinit = 1;
+				g_hard_reset_on_reinit = 1;
+				stream_done = 0;
+				drained = 0;
+				continue;
+			}
+			printf("POLLERR: 连续 %d 次自愈失败，退出\n", g_err_rec);
 			break;
 		}
 
@@ -1796,6 +1941,7 @@ int main(int argc, char **argv)
 			t_rx = now_s();
 			if (g_mark_first) {
 				g_mark_first = 0;
+				g_err_rec = 0;	/* 真的出帧了，自愈计数归零 */
 				printf("REINIT: first frame\n");
 			}
 			if (!got)
@@ -1853,6 +1999,21 @@ int main(int argc, char **argv)
 						capbuf[b.index].dmabuf[1], capw, caph);
 #endif
 			got++;
+			/* 自愈路径的确定性验证开关：FORCEREINIT=300 在第 300 帧
+			 * 主动走一遍"固件 hang → 整块复位 → 等 IRAP"流程，
+			 * 用来确认重建后能真的接着解，而不是干等（正常播放时
+			 * 不该出现这段）。
+			 */
+			if (!g_force_reinit_at && getenv("FORCEREINIT"))
+				g_force_reinit_at = atoi(getenv("FORCEREINIT"));
+			if (g_force_reinit_at > 0 && got == g_force_reinit_at) {
+				printf("FORCEREINIT: 第 %d 帧主动重建\n", got);
+				fflush(stdout);
+				g_force_reinit_at = -1;
+				g_reinit = 1;
+				g_hard_reset_on_reinit = 1;
+				break;
+			}
 			if (xioctl(fd, VIDIOC_QBUF, &b) < 0) {
 				perror("QBUF recycle");
 				break;

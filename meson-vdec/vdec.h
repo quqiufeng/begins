@@ -91,6 +91,9 @@ struct amvdec_core {
 
 	struct amvdec_session *cur_sess;
 	struct mutex lock;
+
+	/* Periodic VDECDBG dump (dbg_ms) */
+	struct delayed_work dbg_work;
 };
 
 /**
@@ -140,6 +143,8 @@ struct amvdec_codec_ops {
 	const u8 * (*eos_sequence)(u32 *len);
 	irqreturn_t (*isr)(struct amvdec_session *sess);
 	irqreturn_t (*threaded_isr)(struct amvdec_session *sess);
+	/* Optional periodic state dump (VDECDBG), see dbg_ms module param */
+	void (*dbg_dump)(struct amvdec_session *sess);
 };
 
 /**

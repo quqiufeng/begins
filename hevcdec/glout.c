@@ -510,7 +510,12 @@ static struct {
 	struct gbm_bo *fly[4];
 	int fhead, ftail, nfly;
 	double t_sum, t_max, tsum;
-	struct { int fy, fc; GLuint ty, tc; } tc[40];	/* 每块 dmabuf 一纹理 */
+	/* 每块 dmabuf 一纹理。EGLImage 必须一起存：Mali 上 img 拿着
+	 * dma_buf 的引用，只 glDeleteTextures 不销毁 img，旧 buffer 就
+	 * 释放不掉，会话重建后新 dmabuf 分配/复用会 EBUSY
+	 * （表现为 FAIL glout_frame: Device or resource busy）。
+	 */
+	struct { int fy, fc; GLuint ty, tc; void *ey, *ec; } tc[40];
 	int ntc;
 	int first, flip_done, ready;
 	int inited, scaled, twopass;
@@ -701,7 +706,7 @@ static int glout_gl_init(void)
 
 /* dmabuf → EGLImage → 纹理 */
 static GLuint import_tex(int fd, unsigned w, unsigned h, unsigned pitch,
-			 uint32_t fourcc)
+			 uint32_t fourcc, void **oimg)
 {
 	PFNEGLCREATEIMAGEKHRPROC create_image =
 		(PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
@@ -711,7 +716,11 @@ static GLuint import_tex(int fd, unsigned w, unsigned h, unsigned pitch,
 	EGLImageKHR img;
 	GLuint tex;
 
-	if (!create_image || !target_tex) return 0;
+	if (!create_image || !target_tex) {
+		printf("GLOUT: eglGetProcAddress 缺函数 create_image=%p target_tex=%p\n",
+		       (void *)create_image, (void *)target_tex);
+		return 0;
+	}
 	attr[n++] = EGL_WIDTH; attr[n++] = (EGLint)w;
 	attr[n++] = EGL_HEIGHT; attr[n++] = (EGLint)h;
 	attr[n++] = EGL_LINUX_DRM_FOURCC_EXT; attr[n++] = (EGLint)fourcc;
@@ -733,6 +742,7 @@ static GLuint import_tex(int fd, unsigned w, unsigned h, unsigned pitch,
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	if (oimg) *oimg = (void *)img;
 	return tex;
 }
 
@@ -741,9 +751,18 @@ static void drop_tex(void)
 {
 	int i;
 
+	PFNEGLDESTROYIMAGEKHRPROC destroy_image =
+		(PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+
 	for (i = 0; i < g.ntc; i++) {
 		if (g.tc[i].ty) glDeleteTextures(1, &g.tc[i].ty);
 		if (g.tc[i].tc) glDeleteTextures(1, &g.tc[i].tc);
+		/* 关键：先删纹理再销毁 img，dma_buf 引用才会真正释放 */
+		if (destroy_image) {
+			if (g.tc[i].ey) destroy_image(g.dpy, (EGLImageKHR)g.tc[i].ey);
+			if (g.tc[i].ec) destroy_image(g.dpy, (EGLImageKHR)g.tc[i].ec);
+		}
+		g.tc[i].ey = g.tc[i].ec = NULL;
 	}
 	g.ntc = 0;
 	g.tex_y = g.tex_c = 0;
@@ -791,7 +810,7 @@ static void flip_handler(int fd, unsigned seq, unsigned sec, unsigned usec, void
 	*(int *)data = 1;
 }
 
-static void wait_flip(void)
+static void wait_flip_to(int ms)
 {
 	drmEventContext ev;
 
@@ -799,12 +818,32 @@ static void wait_flip(void)
 	ev.version = DRM_EVENT_CONTEXT_VERSION;
 	ev.page_flip_handler = flip_handler;
 	g.flip_done = 0;
-	while (!g.flip_done) {
-		struct pollfd p = {g.dfd, POLLIN, 0};
+	/* 硬截止：原来只看 poll 的返回值，一旦 DRM fd 永久可读（事件被暂停/
+	 * 冻住时丢掉、或 CRTC 上挂着一条不属于本进程的 flip），poll 立刻返回
+	 * >0、drmHandleEvent 又拿不到 flip 事件，这里就死转不出来了 ——
+	 * 实测 resume 后卡死在这，画面冻住而进程 CPU 才 3%。
+	 * 现在按墙钟限总等待，出错立即返回，由调用方走 SetCrtc 兜底。
+	 */
+	{
+		double t0 = now_s();
 
-		if (poll(&p, 1, 200) <= 0) break;
-		drmHandleEvent(g.dfd, &ev);
+		while (!g.flip_done) {
+			struct pollfd p = {g.dfd, POLLIN, 0};
+			double left = ms - (now_s() - t0) * 1000.0;
+			int pr;
+
+			if (left <= 0) break;
+			pr = poll(&p, 1, (int)left);
+			if (pr <= 0) break;
+			if (p.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+			if (drmHandleEvent(g.dfd, &ev) != 0) break;
+		}
 	}
+}
+
+static void wait_flip(void)
+{
+	wait_flip_to(200);
 }
 
 /* GBM 前缓冲 → fb_id（每种 bo 复用） */
@@ -945,8 +984,19 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 	int dx, dy;
 	double ar_s, ar_d;
 
-	if (!g.inited) return -1;
-	if (!g.prog) glout_gl_init();
+	if (!g.inited) {
+		printf("GLOUT: glout_frame 但未 inited (errno=%d %s)\n",
+		       errno, strerror(errno));
+		return -1;
+	}
+	if (!g.prog) {
+		glout_gl_init();
+		if (!g.prog) {
+			printf("GLOUT: glout_gl_init 未产出 prog (errno=%d %s)\n",
+			       errno, strerror(errno));
+			return -1;
+		}
+	}
 	if (w != g.sw || h != g.sh) {
 		drop_tex();
 		g.sw = w;
@@ -964,14 +1014,35 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 			GLuint ty, tc;
 
 			if (g.ntc >= (int)(sizeof(g.tc) / sizeof(g.tc[0]))) drop_tex();
-			ty = import_tex(fd_y, w, h, ypitch, DRM_FORMAT_R8);
-			tc = import_tex(fd_c, w / 2, h / 2, cpitch, DRM_FORMAT_GR88);
-			if (!ty || !tc) return -1;
+			void *iy = NULL, *ic = NULL;
+
+			ty = import_tex(fd_y, w, h, ypitch, DRM_FORMAT_R8, &iy);
+			tc = import_tex(fd_c, w / 2, h / 2, cpitch, DRM_FORMAT_GR88, &ic);
+			if (!ty || !tc) {
+				printf("GLOUT: import_tex 返回空 ty=%u tc=%u (errno=%d %s)\n",
+				       ty, tc, errno, strerror(errno));
+				/* 导入失败的那半张也销毁，别漏 dma_buf 引用 */
+				glDeleteTextures(1, &ty);
+				glDeleteTextures(1, &tc);
+				if (iy) {
+					PFNEGLDESTROYIMAGEKHRPROC di =
+						(PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+					if (di) di(g.dpy, (EGLImageKHR)iy);
+				}
+				if (ic) {
+					PFNEGLDESTROYIMAGEKHRPROC di =
+						(PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+					if (di) di(g.dpy, (EGLImageKHR)ic);
+				}
+				return -1;
+			}
 			k = g.ntc++;
 			g.tc[k].fy = fd_y;
 			g.tc[k].fc = fd_c;
 			g.tc[k].ty = ty;
 			g.tc[k].tc = tc;
+			g.tc[k].ey = iy;
+			g.tc[k].ec = ic;
 		}
 		g.tex_y = g.tc[k].ty;
 		g.tex_c = g.tc[k].tc;
@@ -1047,19 +1118,51 @@ swap:
 		gbm_bo_set_user_data(bo, slot, NULL);
 	}
 	if (g.first) {
-		if (drmModeSetCrtc(g.dfd, g.crtc_id, fbr, 0, 0, &g.conn_id, 1,
-				   &g.mode)) {
-			printf("GLOUT: SetCrtc 失败: %s\n", strerror(errno));
-			return -1;
+		int tries = 0;
+
+		while (drmModeSetCrtc(g.dfd, g.crtc_id, fbr, 0, 0, &g.conn_id, 1,
+				      &g.mode)) {
+			if (errno != EBUSY || ++tries > 20) {
+				printf("GLOUT: SetCrtc 失败: %s\n", strerror(errno));
+				return -1;
+			}
+			wait_flip_to(20);
+			usleep(1000);
 		}
 		g.first = 0;
 	} else {
-		if (drmModePageFlip(g.dfd, g.crtc_id, fbr,
-				    DRM_MODE_PAGE_FLIP_EVENT, &g.flip_done)) {
-			printf("GLOUT: PageFlip 失败: %s\n", strerror(errno));
-			return -1;
+		int tries = 0, ok = 0;
+
+		/* EBUSY = 上一个 flip 还挂在 CRTC 上没完成（内核同一时刻
+		 * 只允许一个 pending flip）。以前这里直接放弃 → 进程 die →
+		 * 上层整链重启闪屏。现在先把挂起的事件收掉再重试。
+		 */
+		while (tries++ < 60) {
+			if (!drmModePageFlip(g.dfd, g.crtc_id, fbr,
+					     DRM_MODE_PAGE_FLIP_EVENT,
+					     &g.flip_done)) {
+				ok = 1;
+				break;
+			}
+			if (errno != EBUSY) break;
+			wait_flip_to(20);	/* 收掉旧的 flip 完成事件 */
+			usleep(1000);
 		}
-		wait_flip();
+		if (ok) {
+			wait_flip();
+		} else {
+			/* 兜底：SetCrtc 会同步等旧 flip 收尾，代价是一次
+			 * 直切（可能轻微闪），但比整链重启强得多。
+			 */
+			printf("GLOUT: PageFlip 重试 %d 次仍失败(%s)，改用 SetCrtc\n",
+			       tries - 1, strerror(errno));
+			if (drmModeSetCrtc(g.dfd, g.crtc_id, fbr, 0, 0,
+					   &g.conn_id, 1, &g.mode)) {
+				printf("GLOUT: SetCrtc 兜底也失败: %s\n",
+				       strerror(errno));
+				return -1;
+			}
+		}
 	}
 	if (g.prev_bo && g.prev_bo != bo) {
 		gbm_surface_release_buffer(g.gs, g.prev_bo);

@@ -27,6 +27,9 @@
 
 static int dump;
 static const char *last_act;
+/* MSC_SCAN：接收器发的硬件扫描码。有些键内核映射不出 KEY 码（报 code=0），
+ * 只能靠扫描码认人 —— 日志里带上它，标定时照着补 COMBO_SCAN 表。*/
+static int last_scan;
 
 static void logmsg(const char *fmt, ...)
 {
@@ -117,6 +120,11 @@ static const struct { int mods; int code; const char *act; } COMBO[] = {
 	{ 0,      KEY_LEFT,   "back"     },
 };
 
+/* 扫描码 → 动作（内核给不出 KEY 码的键走这里）。按 docs/remote.md 标定后填。 */
+static const struct { int scan; const char *act; } COMBO_SCAN[] = {
+	{ 0, NULL }
+};
+
 /* 按键 → 动作名（空 = 不处理）。tvplay-node.sh key 里对同名动作实现。
  * 长按（value==2）只对 FASTFWD/BACK 生效，且节流到 1 秒一次。
  */
@@ -190,6 +198,12 @@ int main(int argc, char **argv)
 		if (strncmp(de->d_name, "event", 5)) continue;
 		snprintf(p, sizeof p, "/dev/input/%s", de->d_name);
 		fd = open_dev(p, match);        /* 名字不匹配的在这里关掉 */
+		/* 必须 CLOEXEC：rcinputd 每按一次键都 fork+exec 播放助手，
+		 * 播放链（ffmpeg / hevcplay）会继承设备 fd，从而一直持有
+		 * EVIOCGRAB。守护进程重启后新实例 grab 全部 EBUSY，
+		 * 而真正持锁的播放进程从不 read → 按键全被丢进没人读的
+		 * 缓冲区，表现就是"遥控按键无用"。*/
+		if (fd >= 0) fcntl(fd, F_SETFD, FD_CLOEXEC);
 		if (fd < 0) continue;
 		fds[n++] = fd;
 		if (!dump) logmsg("open %s", p);
@@ -231,6 +245,11 @@ int main(int argc, char **argv)
 					fflush(stdout);
 					continue;
 				}
+				if (ev[k].type == EV_MSC && ev[k].code == MSC_SCAN) {
+					last_scan = ev[k].value;
+					continue;
+				}
+				if (ev[k].type != EV_KEY) continue;
 				if (ev[k].value == 0) continue;
 				{
 					int m = mod_of(ev[k].code);
@@ -246,9 +265,16 @@ int main(int argc, char **argv)
 				if (ev[k].value > 2) continue;
 				act = action_of(ev[k].code);
 				if (!act) {
-					logmsg("key %s(%d) mods=%d val=%d → 忽略",
+					size_t si;
+
+					for (si = 0; si < sizeof COMBO_SCAN / sizeof COMBO_SCAN[0]; si++)
+						if (COMBO_SCAN[si].act && COMBO_SCAN[si].scan == last_scan)
+							{ act = COMBO_SCAN[si].act; break; }
+				}
+				if (!act) {
+					logmsg("key %s(%d) mods=%d scan=0x%x val=%d → 忽略",
 					       kname(ev[k].code), ev[k].code,
-					       mods, ev[k].value);
+					       mods, last_scan, ev[k].value);
 					continue;
 				}
 				/* OK 只认按下那一下：长按连发会把 toggle 来回
@@ -260,16 +286,20 @@ int main(int argc, char **argv)
 				if (ev[k].value == 2 && act == last_act &&
 				    time(NULL) == last)
 					continue;
-				logmsg("key %s(%d) mods=%d val=%d → %s",
+				logmsg("key %s(%d) mods=%d scan=0x%x val=%d → %s",
 				       kname(ev[k].code), ev[k].code, mods,
-				       ev[k].value, act);
+				       last_scan, ev[k].value, act);
 				last = time(NULL);
 				last_act = act;
 				if (!fork()) {
 					char a[32];
+					int j;
 
 					snprintf(a, sizeof a, "%s", act);
 					setsid();
+					/* 双保险：CLOEXEC 之外再显式关掉，别让
+					 * 播放链继承设备 fd 把 grab 带走 */
+					for (j = 3; j < 256; j++) close(j);
 					execl(NODE, NODE, "key", a, (char *)NULL);
 					_exit(127);
 				}

@@ -1493,6 +1493,78 @@ unlock:
 	return IRQ_HANDLED;
 }
 
+#define AO_RTI_GEN_PWR_SLEEP0	0xe8
+#define AO_RTI_GEN_PWR_ISO0	0xec
+
+/*
+ * VDECDBG：周期性转储固件/硬件状态。dbg_ms 由 vdec.c 的定时 work 驱动。
+ * 只在要定位卡死时才用，正常内核不会调用（无 dbg_dump 定时器）。
+ *
+ * 关心的量：MPSR/CPSR 说明固件 CPU 是否还在跑；WPTR 与 vififo 说明上游
+ * 供料是否被吃；MPRED_CURR_LCU / MPRED_INT_STATUS 说明硬件是否卡在某个
+ * LCU/中断上；AO SLEEP0/ISO0 说明电源门控位当前状态（复位到底有没有生效）。
+ */
+void codec_hevc_dbg_dump(struct amvdec_session *sess)
+{
+	struct amvdec_core *core = sess->core;
+	u32 age_ms = jiffies_to_msecs(get_jiffies_64() - sess->last_irq_jiffies);
+	u32 vififo = 0, ao_sleep = 0, ao_iso = 0;
+	u32 q = 0, pend = 0, dst_ready = 0;
+	u32 fnum = 0, flist = 0, fref = 0, fshow = 0;
+
+	if (sess->priv) {
+		struct codec_hevc *h = sess->priv;
+		struct hevc_frame *f;
+
+		fnum = h->frames_num;
+		list_for_each_entry(f, &h->ref_frames_list, list) {
+			flist++;
+			if (f->referenced)
+				fref++;
+			if (f->show)
+				fshow++;
+		}
+	}
+
+	if (sess->m2m_ctx) {
+		q = v4l2_m2m_num_src_bufs_ready(sess->m2m_ctx);
+		dst_ready = v4l2_m2m_num_dst_bufs_ready(sess->m2m_ctx);
+	}
+	if (sess->priv && codec_hevc_ops.num_pending_bufs)
+		pend = codec_hevc_num_pending_bufs(sess);
+	if (sess->fmt_out->vdec_ops->vififo_level)
+		vififo = sess->fmt_out->vdec_ops->vififo_level(sess);
+	regmap_read(core->regmap_ao, AO_RTI_GEN_PWR_SLEEP0, &ao_sleep);
+	regmap_read(core->regmap_ao, AO_RTI_GEN_PWR_ISO0, &ao_iso);
+
+	dev_info(core->dev,
+		 "VDECDBG st=%d mpsr=%08x cpsr=%08x mbox1m=%08x mbox1c=%08x streamctl=%08x start=%08x end=%08x wptr=%08x rdptr=%08x level=%08x shift_st=%08x cmd_st=%08x int_st=%08x sao_wait=%u/%u/%u mpred_int=%08x lcu=%08x pocs=%08x/%08x seq_o=%u seq_c=%u dsr=%u q=%u pend=%u frames=%u list=%u ref=%u show=%u vififo=%u age=%ums ao=%08x/%08x\n",
+		 sess->status,
+		 amvdec_read_dos(core, HEVC_MPSR),
+		 amvdec_read_dos(core, HEVC_CPSR),
+		 amvdec_read_dos(core, HEVC_ASSIST_MBOX1_MASK),
+		 amvdec_read_dos(core, HEVC_ASSIST_MBOX1_CLR_REG),
+		 amvdec_read_dos(core, HEVC_STREAM_CONTROL),
+		 amvdec_read_dos(core, HEVC_STREAM_START_ADDR),
+		 amvdec_read_dos(core, HEVC_STREAM_END_ADDR),
+		 amvdec_read_dos(core, HEVC_STREAM_WR_PTR),
+		 amvdec_read_dos(core, HEVC_STREAM_RD_PTR),
+		 amvdec_read_dos(core, HEVC_STREAM_LEVEL),
+		 amvdec_read_dos(core, HEVC_SHIFT_STATUS),
+		 amvdec_read_dos(core, HEVC_PARSER_CMD_STATUS),
+		 amvdec_read_dos(core, HEVC_PARSER_INT_STATUS),
+		 amvdec_read_dos(core, HEVC_IQIT_IF_WAIT_CNT),
+		 amvdec_read_dos(core, HEVC_MPRED_IF_WAIT_CNT),
+		 amvdec_read_dos(core, HEVC_SAO_IF_WAIT_CNT),
+		 amvdec_read_dos(core, HEVC_MPRED_INT_STATUS),
+		 amvdec_read_dos(core, HEVC_MPRED_CURR_LCU),
+		 amvdec_read_dos(core, HEVC_MPRED_CUR_POC),
+		 amvdec_read_dos(core, HEVC_MPRED_COL_POC),
+		 sess->sequence_out, sess->sequence_cap, dst_ready,
+		 q, pend, fnum, flist, fref, fshow, vififo, age_ms,
+		 ao_sleep, ao_iso);
+}
+
 static irqreturn_t codec_hevc_isr(struct amvdec_session *sess)
 {
 	return IRQ_WAKE_THREAD;
@@ -1506,4 +1578,5 @@ struct amvdec_codec_ops codec_hevc_ops = {
 	.num_pending_bufs = codec_hevc_num_pending_bufs,
 	.drain = codec_hevc_flush_output,
 	.resume = codec_hevc_resume,
+	.dbg_dump = codec_hevc_dbg_dump,
 };

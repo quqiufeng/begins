@@ -43,3 +43,6 @@ x96max/trim-tools/disable.list
 
 # 调试截图（遥控按键抓图，本地临时产物）
 .rc-photo*.jpg
+
+# VDECDBG 抓现场样本（几十万行，用 meson-vdec/tools/vdecdbg-analyze.sh 重出图表）
+meson-vdec/logs/
