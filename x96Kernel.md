@@ -28,6 +28,7 @@
 | netconsole 日志 | `/x96-build/logs/netconsole.log` | 92636 B / 1164 行 |
 | **盒子 /boot** | `/boot/zImage`、`/boot/uEnv.txt`、`/boot/dtb/` | 启动三件套 |
 | **盒子 模块目录** | `/lib/modules/7.2.12-x96-trim/` | 必须与 `CONFIG_LOCALVERSION="-x96-trim"` 对上 |
+| **vdec 驱动备份** | `meson-vdec/` | HEVC 8bit 修复后的整套 vdec 目录副本（源码 + `.ko`），见 §3.5 |
 
 关键约束：**`CONFIG_LOCALVERSION` 与模块目录名、`uname -r` 三者必须一致**。
 trim 套是 `-x96-trim` → `7.2.12-x96-trim`；full 套是 `-x96` → `7.2.12-x96`。串了模块就加载不上。
@@ -206,6 +207,66 @@ APPEND=root=UUID=6deadcc9-47f7-4648-9d78-d365caaaf1e4 rootflags=data=writeback r
 改之前先备份：`cp -p /boot/uEnv.txt /boot/uEnv.txt.bak-$(date +%Y%m%d)`。
 **坑**：本内核 `netconsole_parser_cmdline` 要求 target IP 后面必须跟 `/`，否则报
 `couldn't parse config` 静默不生效。
+
+### 3.5 驱动副本 `meson-vdec/`（HEVC 8bit 修复版）
+
+`/home/quqiufeng/kernel/meson-vdec/` 是源码树驱动目录的原样副本：
+
+```bash
+# 46 个文件 / 780K，与源码树 diff -r 零差异（含 .o 时间戳）
+diff -r /home/quqiufeng/kernel/meson-vdec \
+        /x96-build/7.2.12-trim/drivers/staging/media/meson/vdec
+```
+
+内容：
+
+| 项 | 说明 |
+|---|---|
+| `codec_hevc.c` 42K、`codec_hevc_common.c`、`hevc_regs.h` | HEVC 8bit 修复的主体 |
+| `vdec.c` / `vdec_hevc.c` / `esparser.c` / `vdec_helpers.c` | V4L2 M2M 框架 + 平台层 |
+| `codec_h264.c` / `codec_vp9.c` / `codec_mpeg12.c` | 其余三路解码器 |
+| `Makefile` / `Kconfig` / `TODO` / `README-8BIT-FIX.md` | 构建与修复说明 |
+| `meson-vdec.ko` 130248 B | **就是盒子上现役的那份**，md5 `d82bf348816b774e881863571562bf55` |
+| 13 个 `.o` | 与该 `.ko` 同一次编译的中间产物 |
+
+> ⚠️ **别和 `/x96-build/kbuild-trim/.../meson-vdec.ko` 搞混**：那是 `O=` 输出树里
+> **另一次**编译的产物（md5 `894b4996db719746753020448aba6845`），不是盒子上跑的那份。
+> 要复原「盒子上现在跑的驱动」，认准 `meson-vdec/` 这份 `d82bf348...`。
+
+三种用法：
+
+**a) 只换驱动（调驱动时最常用，秒级，不用重编内核）**
+
+```bash
+scp /home/quqiufeng/kernel/meson-vdec/meson-vdec.ko \
+    root@192.168.1.121:/lib/modules/7.2.12-x96-trim/kernel/drivers/staging/media/meson/vdec/
+ssh root@192.168.1.121 'rmmod meson_vdec 2>/dev/null; modprobe meson-vdec; \
+     lsmod | grep vdec; dmesg | tail -30; v4l2-ctl --list-devices'
+```
+
+`/dev/video0` 的 `name` 应出现 `meson-video-decoder`。
+
+**b) 源码树丢了 / 被 trim 脚本改坏 → 拷回去复原**
+
+```bash
+cp -a /home/quqiufeng/kernel/meson-vdec/. \
+      /x96-build/7.2.12-trim/drivers/staging/media/meson/vdec/
+```
+
+**c) 改完代码重新出 `.ko`**（在源码树里编，别在这个副本里编）
+
+```bash
+make O=/x96-build/kbuild-trim ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+     M=drivers/staging/media/meson/vdec modules
+# 产物在 /x96-build/kbuild-trim/drivers/staging/media/meson/vdec/meson-vdec.ko
+```
+
+驱动本身对不对，用 `hevcdec/`（§仓库根）的用户态工具验，见 `hevcdec/README.md`：
+
+```bash
+scp hevcdec/v4l2hevc-aarch64 root@192.168.1.121:/tmp/
+ssh root@192.168.1.121 /tmp/v4l2hevc-aarch64 /tmp/test720.265
+```
 
 ---
 
