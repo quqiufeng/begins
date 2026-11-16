@@ -260,6 +260,13 @@ static int codec_hevc_alloc_fbc_buffers(struct amvdec_session *sess,
 				      is_10bit, use_mmu);
 
 
+	/*
+	 * Set before allocating: if an allocation fails halfway through,
+	 * codec_hevc_free_fbc_buffers() must free with this exact size.
+	 */
+	comm->alloc_10bit = is_10bit;
+	comm->alloc_size = am21_size;
+
 	v4l2_m2m_for_each_dst_buf(sess->m2m_ctx, buf) {
 		u32 idx = buf->vb.vb2_buf.index;
 		dma_addr_t paddr;
@@ -280,10 +287,6 @@ static int codec_hevc_alloc_fbc_buffers(struct amvdec_session *sess,
 		comm->fbc_buffer_paddr[idx] = paddr;
 		n++;
 	}
-
-	/*Remembered so that free() always matches what we allocated here */
-	comm->alloc_10bit = is_10bit;
-	comm->alloc_size = am21_size;
 
 	if (codec_hevc_use_mmu(revision, sess->pixfmt_cap, is_10bit) &&
 	    codec_hevc_use_downsample(sess->pixfmt_cap, is_10bit)) {

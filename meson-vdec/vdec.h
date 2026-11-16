@@ -209,6 +209,8 @@ enum amvdec_status {
  *		 or empty buffer
  * @draining: set while the DEC_CMD_STOP tail flush is in progress
  * @drain_retries: how many times the tail flush has been retried
+ * @drain_disabled: set once the session starts tearing down, so no new
+ *	DEC_CMD_STOP tail flush can be armed against a freed priv
  * @keyframe_found: flag set once a keyframe has been parsed
  * @num_dst_bufs: number of destination buffers
  * @changed_format: the format changed
@@ -262,6 +264,7 @@ struct amvdec_session {
 	unsigned int should_stop;
 	unsigned int draining;
 	unsigned int drain_retries;
+	unsigned int drain_disabled;
 	unsigned int keyframe_found;
 	unsigned int num_dst_bufs;
 	unsigned int changed_format;

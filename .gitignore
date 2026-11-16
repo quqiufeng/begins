@@ -10,6 +10,9 @@ build/initrd/root/
 *.o
 *.ko
 *.so
+# kbuild 的依赖缓存，内含绝对路径，每次编译都重新生成
+.*.cmd
+..module-common.o.cmd
 
 # Python
 __pycache__/

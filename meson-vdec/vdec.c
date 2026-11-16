@@ -393,6 +393,8 @@ static void vdec_reset_bufs_recycle(struct amvdec_session *sess)
 	}
 }
 
+static void vdec_drain_abort_locked(struct amvdec_session *sess);
+
 static void vdec_stop_streaming(struct vb2_queue *q)
 {
 	struct amvdec_session *sess = vb2_get_drv_priv(q);
@@ -401,13 +403,16 @@ static void vdec_stop_streaming(struct vb2_queue *q)
 	struct vb2_v4l2_buffer *buf;
 
 	/*
-	 * A DEC_CMD_STOP tail flush may still be pending. Clear the flag so
-	 * esparser_flush_src() refuses to feed a decoder we are about to
-	 * power off, then drop the work. Non-sync cancel: this callback runs
-	 * with sess->lock held and the work itself takes that lock.
+	 * A DEC_CMD_STOP tail flush may still be pending. Disarm it here:
+	 * src_vq->lock/dst_vq->lock 就是 sess->lock, so vb2 调用本回调时
+	 * 已经持有 sess->lock —— 这里绝对不能锁它，也绝对不能
+	 * cancel_delayed_work_sync()（work 一进 esparser_flush_src() 就要
+	 * 这把锁，同步取消必然互等，这正是之前卡在 flush_work 的根因）。
+	 *
+	 * 只需在锁内清掉 draining：残留的 work 醒来后先过 esparser_flush_src()
+	 * 的 draining 检查就会返回，永远不会碰下面被 kfree 的 sess->priv。
 	 */
-	sess->draining = 0;
-	cancel_delayed_work(&sess->esparser_drain_work);
+	vdec_drain_abort_locked(sess);
 
 	if (sess->status == STATUS_RUNNING ||
 	    sess->status == STATUS_INIT ||
@@ -725,6 +730,19 @@ static int vdec_enum_framesizes(struct file *file, void *fh,
  * from a delayed work lets the client drain concurrently and the buffers
  * do come back.
  */
+/*
+ * vdec_drain_abort_locked() - 作废 DEC_CMD_STOP 的尾部 flush
+ *
+ * 调用者必须持有 sess->lock（vb2 的 stop_streaming 回调天然持有）。
+ * draining 的置位与清零因此天然互斥，不存在"cancel 之后又挂上"的窗口。
+ */
+static void vdec_drain_abort_locked(struct amvdec_session *sess)
+{
+	sess->drain_disabled = 1;
+	sess->draining = 0;
+	sess->drain_retries = 0;
+}
+
 static void esparser_drain_work(struct work_struct *work)
 {
 	struct amvdec_session *sess = container_of(work, struct amvdec_session,
@@ -737,28 +755,46 @@ static void esparser_drain_work(struct work_struct *work)
 	if (src_ready == UINT_MAX)
 		return;		/* stream torn down underneath us */
 
-	if (src_ready && ++sess->drain_retries < 200) {
+	/*
+	 * 重排必须在 sess->lock 里判定并提交，才能和 vdec_drain_abort_locked()
+	 * 互斥：否则 stop_streaming() 可能刚好在 unlock 与 schedule 之间
+	 * 取消掉 work，随后这里又把它挂回去，等下次执行时 sess->priv 已释放。
+	 */
+	mutex_lock(&sess->lock);
+	if (src_ready && sess->draining && ++sess->drain_retries < 200) {
 		schedule_delayed_work(&sess->esparser_drain_work,
 				      msecs_to_jiffies(5));
+		mutex_unlock(&sess->lock);
 		return;
 	}
+	mutex_unlock(&sess->lock);
 
-	dev_info(dev, "STOP flush: iters=%u src_ready=%u dst_ready=%u pending=%u queued=%d\n",
+	dev_dbg(dev, "STOP flush: iters=%u src_ready=%u dst_ready=%u pending=%u queued=%d\n",
 		 sess->drain_retries,
 		 v4l2_m2m_num_src_bufs_ready(sess->m2m_ctx),
 		 v4l2_m2m_num_dst_bufs_ready(sess->m2m_ctx),
 		 codec_ops->num_pending_bufs ? codec_ops->num_pending_bufs(sess) : 0,
 		 atomic_read(&sess->esparser_queued_bufs));
 
-	/* Claim the drain under the lock so stop_streaming() backs off. */
+	/*
+	 * Claim the drain *and keep sess->lock across it*.
+	 *
+	 * 这不是多余的锁：vb2 的 stop_streaming() 就是在 sess->lock 下
+	 * kfree(sess->priv) 的，只有在这里持同一把锁，priv 的生命周期才被
+	 * 真正封住 —— 会话拆解要么排在我们前面（draining/priv 检查失败，
+	 * 直接退出），要么排在我们后面（等这把锁）。
+	 *
+	 * 持锁 sleep 是安全的：没有任何路径会"等这个 work 结束后再拿锁"
+	 * （stop_streaming 里已经不做 cancel_delayed_work_sync），
+	 * vdec_wait_inactive() 也有 50ms 上界。
+	 */
 	mutex_lock(&sess->lock);
-	if (!sess->draining) {
+	if (!sess->draining || !sess->priv) {
 		mutex_unlock(&sess->lock);
 		return;
 	}
 	sess->draining = 0;
 	sess->drain_retries = 0;
-	mutex_unlock(&sess->lock);
 
 	v4l2_m2m_mark_stopped(sess->m2m_ctx);
 
@@ -772,6 +808,7 @@ static void esparser_drain_work(struct work_struct *work)
 		esparser_queue_eos(sess->core, data, len);
 		vdec_wait_inactive(sess);
 	}
+	mutex_unlock(&sess->lock);
 }
 
 static int
@@ -790,10 +827,12 @@ vdec_decoder_cmd(struct file *file, void *fh, struct v4l2_decoder_cmd *cmd)
 
 	if (cmd->cmd == V4L2_DEC_CMD_START) {
 		v4l2_m2m_clear_state(sess->m2m_ctx);
-		cancel_delayed_work(&sess->esparser_drain_work);
-		sess->draining = 0;
-		sess->drain_retries = 0;
+		mutex_lock(&sess->lock);
+		vdec_drain_abort_locked(sess);
+		/* 流重新开始，允许下一次 DEC_CMD_STOP 再挂 flush */
+		sess->drain_disabled = 0;
 		sess->should_stop = 0;
+		mutex_unlock(&sess->lock);
 		return 0;
 	}
 
@@ -809,13 +848,23 @@ vdec_decoder_cmd(struct file *file, void *fh, struct v4l2_decoder_cmd *cmd)
 	 * competing with us for the same output buffers.
 	 */
 
-	if (sess->draining)
+	/*
+	 * 置位必须和 vdec_drain_abort_locked() 的清零互斥，否则可能出现：
+	 * 这里刚通过 draining 检查 -> stop_streaming() 清旗标+同步取消
+	 * （此时无 work 可取消）-> 释放 sess->priv -> 这里才 schedule，
+	 * work 随后在 NULL priv 上跑 drain。
+	 */
+	mutex_lock(&sess->lock);
+	if (sess->drain_disabled || sess->draining) {
+		mutex_unlock(&sess->lock);
 		return 0;
+	}
 
 	sess->should_stop = 1;
 	sess->draining = 1;
 	sess->drain_retries = 0;
 	schedule_delayed_work(&sess->esparser_drain_work, 0);
+	mutex_unlock(&sess->lock);
 
 	return 0;
 }
@@ -997,6 +1046,14 @@ static int vdec_close(struct file *file)
 {
 	struct amvdec_session *sess = file_to_amvdec_session(file);
 
+	mutex_lock(&sess->lock);
+	vdec_drain_abort_locked(sess);
+	mutex_unlock(&sess->lock);
+
+	/*
+	 * 出锁之后才能同步取消：work 若要拿 sess->lock 也是此时才可能拿到，
+	 * 拿不到只是等我们 unlock，不会再互等。
+	 */
 	cancel_delayed_work_sync(&sess->esparser_drain_work);
 
 	v4l2_m2m_ctx_release(sess->m2m_ctx);

@@ -53,3 +53,41 @@ A/B 构建跑同一份流，卡点与中断数完全一致。
 
 4K / 1080p **10bit** HEVC 仍会 oops（`FSC=0x04 level 0 translation fault` on
 `0x0043800b5bb5db6c`，P5 sao 之后），寄存器序列本身已跑通，怀疑 10bit 分支字段未初始化。
+
+## 附加：HEVC 10bit 首帧死机根因（2026-11-16）
+
+现象：8bit 正常；10bit（1080p/4K）第一帧就整机冻死，串口/netconsole 无任何 oops
+（真·硬挂，20s 后 Meson 硬件看门狗复位）。日志里只能看到 8bit 那侧早就存在的
+`changed_format` 等旧问题，与 10bit 无关。
+
+根因（探针实证，非推测）：
+
+- 10bit 走 FBC + MMU 路径（`codec_hevc_use_mmu()` 在 SM1 上对 10bit 恒为真）。
+- MMU 相关寄存器只在 `codec_hevc_start()` → `codec_hevc_setup_workspace()` 里编程，
+  而 `start()` 在**首个 SPS 解析之前**执行，那时 `hevc->is_10bit == 0`，
+  于是 `codec_hevc_use_mmu()` 为假：
+  - `HEVC_SAO_MMU_VH0_ADDR` / `HEVC_SAO_MMU_VH1_ADDR` 从未写过（=0）
+  - `HEVC_ASSIST_MMU_MAP_ADDR` 从未写过（=0，页表地址为 0）
+  - 之后 resume 路径也不会补写 → 固件拿 0 号页表做地址翻译，AXI 直接挂死。
+  探针原样输出：`P5 workspace: rev=4 10b=0 use_mmu=0 mmu_map_paddr=0x0`
+- 8bit 不走 MMU，所以这个 bug 长期被掩盖。
+
+修复（`codec_hevc.c`）：新增 `codec_hevc_setup_mmu()`，在 `codec_hevc_resume()`
+里 `codec_hevc_setup_buffers()` 之后（此时 is_10bit 与 mmu_map_paddr 都已确定）
+补写 `MMU_VH0/VH1` 与 `ASSIST_MMU_MAP_ADDR`。
+
+顺带（`codec_hevc_common.c`）：`comm->alloc_size / alloc_10bit` 改为在分配循环
+**之前**赋值，保证循环中途失败时 `codec_hevc_free_fbc_buffers()` 用对的尺寸释放。
+
+验证（干净版，无探针）：
+
+```
+1080p10b : decoded=60/60  resets=0  16.9 fps
+real4k10 : decoded=272/272 resets=0 12.9 fps   (3840x1600)
+1080p8b  : decoded=60/60  resets=0  17.0 fps   (无回归)
+720p10b  : decoded=60/60  resets=0  23.4 fps
+```
+
+探针期间还确认了这几项**不是**根因，可排除：FBC 缓冲末尾 4K guard page 从未被
+越界写（无 P3 命中）；`mmu_map` 容量 4608 页 > 实际 1024 页，未截断；
+ANC2AXI 表 20 个 buffer 的 paddr 全部有效。

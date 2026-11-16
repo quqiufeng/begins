@@ -37,6 +37,14 @@ static void die(const char *m)
 	exit(1);
 }
 
+static double now_s(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec + t.tv_nsec / 1e9;
+}
+
 static struct {
 	void *mem[VIDEO_MAX_PLANES];
 	size_t len[VIDEO_MAX_PLANES];
@@ -54,6 +62,9 @@ static int n_au;
 static int fd;
 static unsigned g_w = 640, g_h = 360;
 static int got, resets, g_refeed;
+/* 计时：把"纯解码吞吐"从启动/收尾/写盘里剥出来 */
+static int got_queued;
+static double t_first_q, t_last_q, t_first_rx, t_last_rx, t_write_acc;
 
 static int nal_type(const unsigned char *p)
 {
@@ -280,6 +291,10 @@ static void qbuf_au(int idx)
 	b.timestamp.tv_sec = 0;
 	b.timestamp.tv_usec = idx * 40000;
 	if (xioctl(fd, VIDIOC_QBUF, &b) < 0) die("QBUF out");
+	if (!got_queued)
+		t_first_q = now_s();
+	t_last_q = now_s();
+	got_queued++;
 }
 
 static int eos_seen, g_verbose;
@@ -518,9 +533,8 @@ int main(int argc, char **argv)
 	struct v4l2_event_subscription sub = {0};
 	int sf, au_idx = 0, poll_timeouts = 0, drained = 0;
 	int verbose = g_verbose;
-	struct timespec t0, t1, tq;
-	int got_queued = 0, expect = getenv("FRAMES") ? atoi(getenv("FRAMES")) : 0;
-	double wall;
+	double t0, t1, tq = 0, wall;
+	int expect = getenv("FRAMES") ? atoi(getenv("FRAMES")) : 0;
 
 	if (argc > 3) { g_w = atoi(argv[2]); g_h = atoi(argv[3]); }
 
@@ -583,8 +597,9 @@ int main(int argc, char **argv)
 		die("SUBSCRIBE_EVENT");
 
 	start_stream();
-	out = getenv("NOWRITE") ? NULL : fopen("/tmp/out.yuv", "wb");
-	clock_gettime(CLOCK_MONOTONIC, &t0);
+	out = getenv("NOWRITE") ? NULL : fopen(getenv("OUTYUV") ? getenv("OUTYUV")
+					       : "/tmp/out.yuv", "wb");
+	t0 = now_s();
 	g_verbose = getenv("VERBOSE") != NULL;
 
 	for (;;) {
@@ -593,13 +608,15 @@ int main(int argc, char **argv)
 
 		/* 收尾阶段：等到预期帧数 / EOS / 长时间静默就停 */
 		if (drained) {
-			struct timespec tn;
-			double el;
+			double el = now_s() - tq;
+			double quiet = now_s() - t_last_rx;
 
-			clock_gettime(CLOCK_MONOTONIC, &tn);
-			el = (tn.tv_sec - tq.tv_sec) + (tn.tv_nsec - tq.tv_nsec) / 1e9;
+			/* 收尾别傻等 2s：EOS 事件该驱动经常不发，
+			 * OUTPUT 全回收 + 一轮 poll 无新帧就当收尾完成。
+			 */
 			if (eos_seen || (expect && got >= expect) ||
-			    (out_nfree == n_out && poll_timeouts >= 3) ||
+			    (out_nfree == n_out && (poll_timeouts >= 1 || quiet > 0.15)) ||
+			    quiet > (getenv("DRAINWAIT") ? atof(getenv("DRAINWAIT")) : 0.5) ||
 			    el > 2.0) {
 				if (g_verbose)
 					printf("drain exit: eos=%d timeouts=%d waited=%.3f got=%d\n",
@@ -653,8 +670,14 @@ int main(int argc, char **argv)
 			b.memory = V4L2_MEMORY_MMAP;
 			b.length = 2;
 			b.m.planes = pl;
+			double t_rx;
+
 			if (xioctl(fd, VIDIOC_DQBUF, &b) < 0)
 				break;
+			t_rx = now_s();
+			if (!got)
+				t_first_rx = t_rx;
+			t_last_rx = t_rx;
 			if (verbose)
 				printf("frame %d: idx=%u flags=%08x ts=%ld.%06ld\n", got,
 				       b.index, b.flags, (long)b.timestamp.tv_sec,
@@ -665,8 +688,12 @@ int main(int argc, char **argv)
 					pl[0].data_offset, pl[1].data_offset);
 			if (g_verbose || got == 0)
 				dump_frame(b.index, pl);
-			if (out && pl[0].bytesused)
+			if (out && pl[0].bytesused) {
+				double tw = now_s();
+
 				write_nv12(b.index, capw, caph);
+				t_write_acc += now_s() - tw;
+			}
 			got++;
 			if (xioctl(fd, VIDIOC_QBUF, &b) < 0) {
 				perror("QBUF recycle");
@@ -692,7 +719,7 @@ int main(int argc, char **argv)
 		if (au_idx >= n_au && got > 0 && !drained) {
 			struct v4l2_decoder_cmd cmd = {0};
 
-			clock_gettime(CLOCK_MONOTONIC, &tq);
+			tq = now_s();
 			cmd.cmd = V4L2_DEC_CMD_STOP;
 			if (xioctl(fd, VIDIOC_DECODER_CMD, &cmd) < 0)
 				perror("DEC_CMD_STOP");
@@ -703,21 +730,32 @@ int main(int argc, char **argv)
 		}
 	}
 
-	clock_gettime(CLOCK_MONOTONIC, &t1);
-	wall = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+	t1 = now_s();
+	wall = t1 - t0;
 	if (out) fclose(out);
 	printf("RESULT decoded=%d / %d AUs, resets=%d, %ux%u\n", got, n_au,
 	       resets, g_w, g_h);
 	{
-		double t_stream = tq.tv_sec - t0.tv_sec + tq.tv_nsec / 1e9;
+		/* 纯解码吞吐：只看首帧到末帧，排除启动、收尾(tail)和写盘 */
+		double active = t_last_rx - t_first_rx;
+		double feed = t_last_q - t_first_q;
+		double decode_busy = active - t_write_acc;
 
-		printf("PHASE feed=%.3fs (%.1f fps)  drain=%.3fs  eos=%d\n",
-		       t_stream, t_stream > 0 ? got_queued / t_stream : 0.0,
-		       wall - t_stream, eos_seen);
+		printf("PHASE feed=%.3fs  active=%.3fs  tail=%.3fs  write=%.3fs  eos=%d\n",
+		       feed, active, wall - active - (t_first_rx - t0),
+		       t_write_acc, eos_seen);
+		printf("PERF decode=%.2f fps (%d frames / %.3fs)", 
+		       active > 0 ? (got - 1) / active : 0.0, got - 1, active);
+		if (t_write_acc > 0.001)
+			printf("  decode-only=%.2f fps (minus write %.3fs)",
+			       decode_busy > 0 ? (got - 1) / decode_busy : 0.0,
+			       t_write_acc);
+		printf("\n");
+		printf("PERF feed=%.2f fps (%d AUs / %.3fs)  wall=%.3fs  e2e=%.2f fps  bitstream=%.2f MB/s\n",
+		       feed > 0 ? got_queued / feed : 0.0, got_queued, feed, wall,
+		       wall > 0 ? got / wall : 0.0,
+		       wall > 0 ? stream_size / wall / 1e6 : 0.0);
 	}
-	printf("PERF wall=%.3fs  fps=%.2f  bitstream=%.2f MB/s\n", wall,
-	       wall > 0 ? got / wall : 0.0,
-	       wall > 0 ? stream_size / wall / 1e6 : 0.0);
 	stop_stream();
 	close(fd);
 	return got > 0 ? 0 : 2;

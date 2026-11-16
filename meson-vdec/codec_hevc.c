@@ -1400,6 +1400,31 @@ static void codec_hevc_fetch_rpm(struct amvdec_session *sess)
 	}
 }
 
+/*
+ * The MMU registers are latched in codec_hevc_start(), which runs before the
+ * first SPS is parsed: at that point is_10bit is still 0, so neither the page
+ * table address nor the VBH workspace is ever programmed. Program them again
+ * once the bit depth (and thus the MMU decision) is final.
+ */
+static void codec_hevc_setup_mmu(struct amvdec_session *sess)
+{
+	struct codec_hevc *hevc = sess->priv;
+	struct amvdec_core *core = sess->core;
+	const u32 revision = core->platform->revision;
+
+	if (!codec_hevc_use_mmu(revision, sess->pixfmt_cap, hevc->is_10bit))
+		return;
+
+	amvdec_write_dos(core, HEVC_SAO_MMU_VH0_ADDR,
+			 hevc->workspace_paddr + MMU_VBH_OFFSET);
+	amvdec_write_dos(core, HEVC_SAO_MMU_VH1_ADDR,
+			 hevc->workspace_paddr + MMU_VBH_OFFSET +
+			 (MMU_VBH_SIZE / 2));
+
+	amvdec_write_dos(core, HEVC_ASSIST_MMU_MAP_ADDR,
+			 hevc->common.mmu_map_paddr);
+}
+
 static void codec_hevc_resume(struct amvdec_session *sess)
 {
 	struct codec_hevc *hevc = sess->priv;
@@ -1408,6 +1433,8 @@ static void codec_hevc_resume(struct amvdec_session *sess)
 		amvdec_abort(sess);
 		return;
 	}
+
+	codec_hevc_setup_mmu(sess);
 
 	codec_hevc_setup_decode_head(sess, hevc->is_10bit);
 	codec_hevc_process_segment_header(sess);
