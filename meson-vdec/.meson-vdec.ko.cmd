@@ -1,1 +1,0 @@
-savedcmd_meson-vdec.ko := aarch64-linux-gnu-ld -r -EL  -maarch64elf -z noexecstack --no-warn-rwx-segments --build-id=sha1  -T /x96-build/kbuild-trim/scripts/module.lds -o meson-vdec.ko meson-vdec.o meson-vdec.mod.o .module-common.o
