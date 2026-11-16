@@ -1,0 +1,11 @@
+./esparser.o
+./vdec.o
+./vdec_helpers.o
+./vdec_platform.o
+./vdec_1.o
+./vdec_hevc.o
+./codec_mpeg12.o
+./codec_h264.o
+./codec_hevc_common.o
+./codec_vp9.o
+./codec_hevc.o
