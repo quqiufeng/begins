@@ -24,6 +24,8 @@
 #include "vdec.h"
 #include "esparser.h"
 #include "vdec_helpers.h"
+#include "dos_regs.h"
+#include "hevc_regs.h"
 
 struct dummy_buf {
 	struct vb2_v4l2_buffer vb;
@@ -32,6 +34,178 @@ struct dummy_buf {
 
 /* 16 MiB for parsed bitstream swap exchange */
 #define SIZE_VIFIFO SZ_16M
+
+/*
+ * 周期性状态转储：dbg_ms=0 关闭，默认 0（只在调试内核上用 modprobe 参数打开）。
+ * 卡死复现时靠这条时间线区分「供料停 / 完成中断丢 / 固件卡帧」。
+ */
+static unsigned int dbg_ms;
+module_param(dbg_ms, uint, 0444);
+MODULE_PARM_DESC(dbg_ms, "Periodic VDECDBG state dump interval in ms (0=off)");
+
+/*
+ * 硬复位：把 VDEC_HEVC 整块从 AO 真掉电再上电。
+ *
+ * 卡死现场：固件停在「不取 input」的状态（rdptr 不动、vdec IRQ 归零、
+ * VIFIFO 涨满）。此时 streamoff/streamon（用户态 close+open）救不回来,
+ * vdec_poweroff() 只关时钟、硬件状态原样保留，新会话固件装进去照样不动。
+ * 只有把 AO 的 GEN_PWR_SLEEP0/ISO0 翻一遍才是真复位。
+ *
+ * !! 千万别在这条路上写 HEVC_ASSIST_MBOX1_MASK / HEVC_MPSR !!
+ * 无活动会话时固件早已停摆，访问 MC/ASSIST 寄存器会让 AXI 直接锁死：
+ * 整机当场挂起（无 oops、无 pstore，只有硬看门狗能把机器拉回来）。
+ * 实测 echo 6（停固件那步）两次都把盒子打死。整块掉电+上电已经足够
+ * 清掉固件状态，这几个寄存器交给下一个会话的 __vdec_hevc_start 去写。
+ */
+#define AO_RTI_GEN_PWR_SLEEP0	0xe8
+#define AO_RTI_GEN_PWR_ISO0	0xec
+#define GEN_PWR_VDEC_HEVC	(BIT(7) | BIT(6))
+#define GEN_PWR_VDEC_HEVC_SM1	BIT(2)
+
+#define VDEC_HR_FULL	6
+
+static struct amvdec_core *vdec_reset_core;
+
+/*
+ * 分步执行，hr=1..6 逐级二分定位（0 = 整个流程）：
+ *   2 dos 时钟 / 3 vdec_hevc 时钟 / 4 AO 上电+DOS 复位 / 5 掉电 /
+ *   6 再上电（= 完整一次 power cycle，也是 0/1 的行为）
+ */
+static int vdec_hr_run(struct amvdec_core *core, unsigned int n)
+{
+	u32 iso_mask = core->platform->revision == VDEC_REVISION_SM1 ?
+		       GEN_PWR_VDEC_HEVC_SM1 : 0xc00;
+	u32 pwr_mask = core->platform->revision == VDEC_REVISION_SM1 ?
+		       GEN_PWR_VDEC_HEVC_SM1 : GEN_PWR_VDEC_HEVC;
+	bool clk_dos = false, clk_dosp = false, clk_hevc = false;
+	int ret = 0;
+
+	if (!core || !core->dos_base || !core->regmap_ao)
+		return -ENODEV;
+	if (!n || n == 1 || n > VDEC_HR_FULL)
+		n = VDEC_HR_FULL;
+
+	if (clk_prepare_enable(core->dos_parser_clk))
+		return -EIO;
+	clk_dosp = true;
+	if (clk_prepare_enable(core->dos_clk)) {
+		ret = -EIO;
+		goto done;
+	}
+	clk_dos = true;
+	if (core->vdec_hevc_clk) {
+		clk_set_rate(core->vdec_hevc_clk, 666666666);
+		if (clk_prepare_enable(core->vdec_hevc_clk)) {
+			ret = -EIO;
+			goto done;
+		}
+		clk_hevc = true;
+	}
+	if (n < 4)
+		goto done;
+
+	/* 1. 上电（清掉上一会话留下的 power gate），再做 DOS 软复位 */
+	regmap_update_bits(core->regmap_ao, AO_RTI_GEN_PWR_SLEEP0,
+			   pwr_mask, 0);
+	udelay(100);
+	amvdec_write_dos(core, DOS_SW_RESET3, 0xffffffff);
+	amvdec_write_dos(core, DOS_SW_RESET3, 0);
+	amvdec_write_dos(core, DOS_GCLK_EN3, 0xffffffff);
+	amvdec_write_dos(core, DOS_MEM_PD_HEVC, 0);
+	regmap_update_bits(core->regmap_ao, AO_RTI_GEN_PWR_ISO0, iso_mask, 0);
+	amvdec_write_dos(core, DOS_SW_RESET3, 0xffffffff);
+	amvdec_write_dos(core, DOS_SW_RESET3, 0);
+	if (n < 5)
+		goto done;
+
+	/* 2. 隔离 + 关存储 + 掉电（与 __vdec_hevc_stop 同序） */
+	regmap_update_bits(core->regmap_ao, AO_RTI_GEN_PWR_ISO0,
+			   iso_mask, iso_mask);
+	amvdec_write_dos(core, DOS_MEM_PD_HEVC, 0xffffffff);
+	amvdec_write_dos(core, DOS_SW_RESET3, 0xffffffff);
+	amvdec_write_dos(core, DOS_GCLK_EN3, 0);
+	regmap_update_bits(core->regmap_ao, AO_RTI_GEN_PWR_SLEEP0,
+			   pwr_mask, pwr_mask);
+	if (n < 6)
+		goto done;
+	mdelay(10);
+
+	/* 3. 再上电：硬件回到「刚 probe 完」的干净状态 */
+	regmap_update_bits(core->regmap_ao, AO_RTI_GEN_PWR_SLEEP0,
+			   pwr_mask, 0);
+	udelay(100);
+	amvdec_write_dos(core, DOS_SW_RESET3, 0xffffffff);
+	amvdec_write_dos(core, DOS_SW_RESET3, 0);
+	amvdec_write_dos(core, DOS_GCLK_EN3, 0xffffffff);
+	amvdec_write_dos(core, DOS_MEM_PD_HEVC, 0);
+	regmap_update_bits(core->regmap_ao, AO_RTI_GEN_PWR_ISO0, iso_mask, 0);
+	amvdec_write_dos(core, DOS_SW_RESET3, 0xffffffff);
+	amvdec_write_dos(core, DOS_SW_RESET3, 0);
+
+done:
+	if (n >= 4)
+		pr_info("meson-vdec: hard reset n=%u ret=%d gclk=%08x mempd=%08x\n",
+			n, ret, amvdec_read_dos(core, DOS_GCLK_EN3),
+			amvdec_read_dos(core, DOS_MEM_PD_HEVC));
+	else
+		pr_info("meson-vdec: hard reset n=%u ret=%d\n", n, ret);
+	if (clk_hevc)
+		clk_disable_unprepare(core->vdec_hevc_clk);
+	if (clk_dos)
+		clk_disable_unprepare(core->dos_clk);
+	if (clk_dosp)
+		clk_disable_unprepare(core->dos_parser_clk);
+	return ret;
+}
+
+static int vdec_hard_reset_set(const char *val, const struct kernel_param *kp)
+{
+	struct amvdec_core *core = vdec_reset_core;
+	unsigned int n = 0;
+	int ret;
+
+	if (!core)
+		return -ENODEV;
+	if (READ_ONCE(core->cur_sess))
+		return -EBUSY;
+	ret = kstrtouint(val, 0, &n);
+	if (ret)
+		return ret;
+
+	return vdec_hr_run(core, n);
+}
+
+static const struct kernel_param_ops vdec_hard_reset_ops = {
+	.set = vdec_hard_reset_set,
+};
+
+static unsigned int hard_reset;
+module_param_cb(hard_reset, &vdec_hard_reset_ops, &hard_reset, 0200);
+MODULE_PARM_DESC(hard_reset,
+	"Write 1 (or 0) to power-cycle VDEC_HEVC; 2..6 runs a partial step (debug)");
+
+static void vdec_dbg_work(struct work_struct *work)
+{
+	struct delayed_work *dw = to_delayed_work(work);
+	struct amvdec_core *core = container_of(dw, struct amvdec_core, dbg_work);
+	struct amvdec_session *sess = core->cur_sess;
+
+	if (sess && sess->fmt_out && sess->fmt_out->codec_ops->dbg_dump)
+		sess->fmt_out->codec_ops->dbg_dump(sess);
+
+	if (dbg_ms)
+		schedule_delayed_work(&core->dbg_work,
+				      msecs_to_jiffies(dbg_ms));
+}
+
+static void vdec_dbg_start(struct amvdec_core *core)
+{
+	if (!dbg_ms)
+		return;
+
+	cancel_delayed_work(&core->dbg_work);
+	schedule_delayed_work(&core->dbg_work, msecs_to_jiffies(dbg_ms));
+}
 
 static u32 get_output_size(u32 width, u32 height)
 {
@@ -95,6 +269,8 @@ static int vdec_poweron(struct amvdec_session *sess)
 
 	esparser_power_up(sess);
 
+	vdec_dbg_start(sess->core);
+
 	return 0;
 
 disable_dos:
@@ -119,6 +295,7 @@ static void vdec_poweroff(struct amvdec_session *sess)
 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
 
 	sess->should_stop = 1;
+	cancel_delayed_work_sync(&sess->core->dbg_work);
 	vdec_wait_inactive(sess);
 	if (codec_ops->drain)
 		codec_ops->drain(sess);
@@ -1128,6 +1305,7 @@ static int vdec_probe(struct platform_device *pdev)
 
 	core->dev = dev;
 	platform_set_drvdata(pdev, core);
+	vdec_reset_core = core;
 
 	core->dos_base = devm_platform_ioremap_resource_byname(pdev, "dos");
 	if (IS_ERR(core->dos_base))
@@ -1204,6 +1382,7 @@ static int vdec_probe(struct platform_device *pdev)
 	core->vdev_dec = vdev;
 	core->dev_dec = dev;
 	mutex_init(&core->lock);
+	INIT_DELAYED_WORK(&core->dbg_work, vdec_dbg_work);
 
 	strscpy(vdev->name, "meson-video-decoder", sizeof(vdev->name));
 	vdev->release = video_device_release;
@@ -1234,6 +1413,8 @@ static void vdec_remove(struct platform_device *pdev)
 {
 	struct amvdec_core *core = platform_get_drvdata(pdev);
 
+	if (vdec_reset_core == core)
+		vdec_reset_core = NULL;
 	video_unregister_device(core->vdev_dec);
 	v4l2_device_unregister(&core->v4l2_dev);
 }
