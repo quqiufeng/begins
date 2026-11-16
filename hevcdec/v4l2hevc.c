@@ -17,7 +17,8 @@
 #include <linux/videodev2.h>
 
 #define DEV "/dev/video0"
-#define NBUF_CAP 20
+#define NBUF_CAP_MAX 32
+#define NBUF_CAP() (getenv("CAPBUF") ? atoi(getenv("CAPBUF")) : 20)
 #define NBUF_OUT 32
 #define OUT_DEPTH() (getenv("NBUF_OUT") ? atoi(getenv("NBUF_OUT")) : 8)
 #define CAP_T V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
@@ -39,7 +40,7 @@ static void die(const char *m)
 static struct {
 	void *mem[VIDEO_MAX_PLANES];
 	size_t len[VIDEO_MAX_PLANES];
-} capbuf[NBUF_CAP];
+} capbuf[NBUF_CAP_MAX];
 static unsigned cap_count;
 
 static struct { void *mem; size_t len; } outbuf[NBUF_OUT];
@@ -164,12 +165,20 @@ static void cap_setup(void)
 	unsigned i;
 	int p;
 
+	unsigned want = NBUF_CAP_MAX;
+
 	cap_release();
+	if (getenv("CAPBUF")) {
+		int v = atoi(getenv("CAPBUF"));
+		if (v > 0) want = v > NBUF_CAP_MAX ? NBUF_CAP_MAX : (unsigned)v;
+	} else {
+		want = NBUF_CAP();
+	}
 	rb.type = CAP_T;
 	rb.memory = V4L2_MEMORY_MMAP;
-	rb.count = NBUF_CAP;
+	rb.count = want;
 	if (xioctl(fd, VIDIOC_REQBUFS, &rb) < 0) die("REQBUFS cap");
-	cap_count = rb.count > NBUF_CAP ? NBUF_CAP : rb.count;
+	cap_count = rb.count > want ? want : rb.count;
 	printf("cap buffers=%u\n", cap_count);
 
 	for (i = 0; i < cap_count; i++) {
