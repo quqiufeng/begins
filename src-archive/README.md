@@ -1,13 +1,13 @@
 # src-archive — 内核源码快照
 
-直接可玩的 Linux 7.2.12 源码树，解包即用，不必自己跑裁剪流程。两份快照，各对应一个真机内核：
+直接可玩的 Linux 7.2.12 源码树，解包即用，不必自己跑裁剪流程。三份快照，各对应一个真机内核：
 
 | 文件 | 大小 | 对应内核 | 说明 |
 |---|---|---|---|
 | `linux-7.2.12-hwreal-src-20261111.tar.zst` | 68.9 MB | `7.2.12-20261111-hwreal` | 本机装机内核的裁剪树，32195 文件，解包 510 MB |
 | `linux-7.2.12-sandy-dbg2-src-20261112.tar.zst` | 77.2 MB | `7.2.12-sandy-dbg2-20261111` | 小机箱追踪/调试内核，33007 文件，解包 516 MB |
-| `linux-7.2.12-trim-src-20261115.tar.zst` | 91.3 MB | `7.2.12-x96-trim` | **后续裁减的基础备份**，50437 文件，解包 750 MB |
-| `SHA256SUMS` | 260 B | — | 三个包的校验值 |
+| `linux-7.2.12-trim-src-20261116.tar.zst` | 91.3 MB | `7.2.12-x96-trim` | 同上并含 10bit HEVC / STOP 死锁修复源码，**最新**，50438 条目 |
+| `SHA256SUMS` | 323 B | — | 上面三份包的校验值 |
 
 ```bash
 sha256sum -c SHA256SUMS
@@ -72,7 +72,7 @@ make -j6 prepare       # rc=0，objtool / resolve_btfids 正常编出
 make -j6 fs/ext4/namei.o kernel/sched/core.o drivers/net/ethernet/realtek/r8169_main.o   # rc=0
 ```
 
-## 来路（trim 包 — 后续裁减的基础）
+## 来路（trim 包 20261115 — 压缩包已删除，只留记录）
 
 `/x96-build/7.2.12-trim` 的快照，`CONFIG_LOCALVERSION="-x96-trim"`，留作下一轮裁剪的起点。
 它本身是 x96 出树构建（`O=/x96-build/kbuild-trim`）的源码树，树内**没有** `.config`；
@@ -81,6 +81,7 @@ make -j6 fs/ext4/namei.o kernel/sched/core.o drivers/net/ethernet/realtek/r8169_
 
 | 项 | 值 |
 |---|---|
+| 状态 | **2026-11-16 删除**（`rm`，腾 91.3 MB）。内容与 `20261116` 包只差 9.8 KB，源树 `/x96-build/7.2.12-trim` 仍在，需要时可重打 |
 | 打包命令 | `tar -C /x96-build --transform 's,^7\.2\.12-trim,linux-7.2.12,' --sort=name --owner=0 --group=0 --numeric-owner --mtime='2026-11-15 00:00:00' -cf - 7.2.12-trim \| zstd -19 -T6` |
 | 压缩比 | 750 MB → 91.3 MB（8.2×，zstd -19 -T6，91 s） |
 | 内容 | 50437 条目 = 47248 常规文件 + 3167 目录 + 22 符号链接（其中 11 个是 `scripts/dtc/include-prefixes/*` 的悬空链接，上游本身如此） |
@@ -106,7 +107,7 @@ make -j6 fs/ext4/namei.o kernel/sched/core.o drivers/net/ethernet/realtek/r8169_
 **验证**（打包后直接做，未抽检）：
 
 ```bash
-zstd -t linux-7.2.12-trim-src-20261115.tar.zst          # frame OK
+zstd -t linux-7.2.12-trim-src-20261115.tar.zst          # frame OK（包已删，命令留作记录）
 tar --zstd -xf ... -C /tmp/x                              # 50437 条目，0.99 s
 diff -rq /tmp/x/linux-7.2.12 /x96-build/7.2.12-trim       # 无差异
 rsync -rlpc --dry-run /x96-build/7.2.12-trim/ /tmp/x/linux-7.2.12/
@@ -114,6 +115,35 @@ rsync -rlpc --dry-run /x96-build/7.2.12-trim/ /tmp/x/linux-7.2.12/
 ```
 
 SHA256：`0a358c87077b8259a95879ca7563958ae184ab8b2f9c7f8db8bce3f6b5f8d938`
+
+## 来路（trim 包 20261116 — 当前最新）
+
+同一棵 `/x96-build/7.2.12-trim` 的重新快照，相对 20261115 包的唯一区别是**又长了一轮源码改动 + 清场更彻底**：
+
+| 项 | 值 |
+|---|---|
+| 清理掉的构建产物 | 71 个 = `drivers/staging/media/meson/vdec` 37 + `fs/pstore` 19 + `lib/reed_solomon` 15（`.o` / `.ko` / `.mod` / `.mod.c` / `.mod.o` / `.*.cmd` / `modules.order` / `Module.symvers`），总计约 2.0 MB |
+| 另外删除 | `scripts/module.lds`、`scripts/mod/devicetable-offsets.h`、`scripts/mod/elfconfig.h`（`make` 会重建；20261115 包是留着的） |
+| 清理后体积 | 750 MB / 50438 条目（47249 常规文件 + 3167 目录 + 22 符号链接） |
+| 打包命令 | `tar -C /x96-build --transform 's/7.2.12-trim/linux-7.2.12/' --sort=name --owner=0 --group=0 --numeric-owner --mtime='2026-11-16 00:00:00' -cf - 7.2.12-trim \| zstd -19 -T6` |
+| 压缩比 | 630.8 MB 内容 → 91.3 MiB（95 738 573 B，约 96 s，window 8 MiB，与 20261115 包同参数；那个包 95 728 750 B，仅差 9.8 KB） |
+| 内容 | 与源树逐字节一致，含 `README-8BIT-FIX.md`、`NOTES-drain-deadlock.md` 等本轮文档 |
+| 配置 | 仍无树内 `.config`（出树构建于 `/x96-build/kbuild-trim`），权威副本 `../configs/config-7.2.12-x96-trim-final-20261115` |
+
+**验证**（实测，非推断）：
+
+```bash
+zstd -t linux-7.2.12-trim-src-20261116.tar.zst        # 699381760 B 解压，frame OK
+tar --zstd -tf ... | head -1                          # linux-7.2.12/  ← 根目录已改名
+tar --zstd -xf ... -C /tmp/verify-trim                # 1.08 s
+rsync -rlpc --dry-run --itemize-changes /x96-build/7.2.12-trim/ /tmp/verify-trim/linux-7.2.12/
+# 输出为空 ← 47249 个常规文件逐字节一致
+```
+
+`diff -rq` 会报 11 条 `scripts/dtc/include-prefixes/*` 与 `scripts/kernel-doc` 的"没有那个文件或目录"，
+那是上游本身带的悬空符号链接（`Documentation/` 被裁后），两边报错一一对应，无实际差异，故用 rsync 比对。
+
+SHA256：`fc72a9419ae46074a18012ba3d94d1517b200d65d665b891c888c236732e59b1`
 
 ## 已知坑：`make clean` / `mrproper` 会报错
 

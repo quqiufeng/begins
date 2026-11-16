@@ -92,6 +92,7 @@ mkdir -p /x96-build/7.2.12-full && tar xf /opt/linux/src/linux-7.2.12.tar.xz \
 | **盒子 /boot** | `/boot/zImage`、`/boot/uEnv.txt`、`/boot/dtb/` | 启动三件套 |
 | **盒子 模块目录** | `/lib/modules/7.2.12-x96-trim/` | 必须与 `CONFIG_LOCALVERSION="-x96-trim"` 对上 |
 | **vdec 驱动备份** | `meson-vdec/` | HEVC 8bit 修复后的整套 vdec 目录副本（源码 + `.ko`），见 §3.5 |
+| **播放脚本 / 盒子配置** | `tvcast.sh`、`tvplay.sh`、`box-mpv.conf`、`box-stats.lua`（仓库根快照）= 运行位置 `~/bin/` 同名文件 | 高清播放全流程见 [`docs/playback.md`](docs/playback.md) |
 
 关键约束：**`CONFIG_LOCALVERSION` 与模块目录名、`uname -r` 三者必须一致**。
 trim 套是 `-x96-trim` → `7.2.12-x96-trim`；full 套是 `-x96` → `7.2.12-x96`。串了模块就加载不上。
@@ -426,3 +427,19 @@ ssh root@192.168.1.121 'cp -p /boot/zImage /boot/zImage.bak-$(date +%Y%m%d) && \
 sleep 40 && ssh root@192.168.1.121 'uname -v; md5sum /boot/zImage'
 tail -50 /x96-build/logs/netconsole.log
 ```
+
+---
+
+## 9. 高清播放（4K/HDR → 主机转码 → 盒子直显）
+
+内核/驱动确认没问题之后，日常看片走一套独立流程，不在本文展开：
+
+```bash
+~/bin/tvcast.sh 关键词      # 起播（主机 RTX3080 cuda 解 + hable tonemap + 1080p nvenc → TCP → 盒子 mpv）
+~/bin/tvcast.sh -t         # 进度/健康度（drop 冻结、sync=display-resample 即正常）
+~/bin/tvcast.sh -s         # 停止
+```
+
+**完整文档：[`docs/playback.md`](docs/playback.md)** —— 含三条命令的语义、`-t` 各字段判读、
+盒子 `/root/.config/mpv/mpv.conf` 与 `stats.lua` 全文、主机 ffmpeg 逐参数解释，以及
+`vd-lavc-dr=yes`（drop 21/s）、`v4l2m2m-copy`（drop 3.7/s）、EDID 被跳过导致无 24Hz 这三个坑。

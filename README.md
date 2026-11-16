@@ -76,6 +76,7 @@ docs/               设计文档
   trim.md           裁剪方法与五轮账本（主文档）
   design.md         **分块重写方案**：驱动复用 + 实现层按块替换，M1~M7 路线
   tracing-capture.md **动态追踪/网络抓包/TLS 明文依赖清单**（bpftrace、tcpdump、ecapture 真机实测）
+  playback.md       **高清播放**：4K/HDR 片源主机转码 → 盒子 mpv 直显（命令 + mpv.conf/stats.lua 全文 + 坑）
 notes/              踩坑记录
 kpi/                API 面清单（愿景期产物，暂不推进）
 ```
