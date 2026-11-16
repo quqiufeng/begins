@@ -40,3 +40,6 @@ build/bzImage-*
 
 # plan.py 生成物（按 rules.txt 算出的禁用符号清单，随 config 变）
 x96max/trim-tools/disable.list
+
+# 调试截图（遥控按键抓图，本地临时产物）
+.rc-photo*.jpg

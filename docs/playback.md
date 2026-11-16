@@ -21,6 +21,7 @@
 原因不在「没有缩放硬件」这个笼统结论上，而是具体三条：
 
 - 电视 EDID 实测只声明 1920×1080 / 1280×720（`X96-TV`，128 字节、无 CEA 扩展块）→ 4K 必须下采样
+  （**这条是旧电视时代的**；现在盒子驱动的是 2560×1440@60 的 BenQ PD2500Q，见 §1.2.1）
 - `/dev/video0`（meson-vdec）CAPTURE 报支持 144p–2160p 连续缩放，但 `v4l2-ctl` 设
   4K 入 + 1080p 出，驱动 rc=0 却**静默忽略**，格式回退 1280x720 VP9 → VPP 不给 M2M 缩放
 - Mali-G31 无独立硬件缩放单元，只能 shader 逐像素读写；mpv 那条链还要顺带做
@@ -49,6 +50,7 @@ C 只在「想省盒子功耗」或「要长期归档小体积」时才用，写
 |---|---|
 | 主机（仅旧推流路径用） | `192.168.1.10`（= `ip route get 192.168.1.121` 的 src，脚本自动取） |
 | 盒子（显示端） | `192.168.1.121`，root，`7.2.12-x96-trim`，mpv v0.40.0 |
+| 显示器 | BenQ PD2500Q，`card0-HDMI-A-1`，**2560×1440@60**（cmdline 锁 `video=HDMI-A-1:2560x1440@60e` + 固件 EDID） |
 | 片源 | 极空间 NAS WebDAV，索引根 `$WEBDAV_MOVIES` |
 | 推流 | `tcp://0.0.0.0:5000?listen=1`（mpegts） |
 | 凭据 | `~/.env`：`WEBDAV_URL/USER/PASS/MOVIES/SEARCH`、`X96_IP`、可选 `CAST_PORT/CAST_HOST` |
@@ -58,7 +60,7 @@ C 只在「想省盒子功耗」或「要长期归档小体积」时才用，写
 | 仓库内 | 运行位置 | md5 |
 |---|---|---|
 | `tvcast.sh` | `~/bin/tvcast.sh` | `073fe8bd42d3dd3e9009370150a06785` |
-| `tvplay.sh` | `~/bin/tvplay.sh` | `ada66329464408c864577b0cf283d5bc` |
+| `tvplay.sh` | `~/bin/tvplay.sh` | `ecafb0a834724f03479b22eabc8f9390` |
 | `box-mpv.conf` | `~/bin/box-mpv.conf` → 盒子 `/root/.config/mpv/mpv.conf` | `d8495815c5eb42270bebe649f8aabfb0` |
 | `box-stats.lua` | `~/bin/box-stats.lua` → 盒子 `/root/.config/mpv/stats.lua` | `2f95407f4458bebe46ec8127d5ab9e79` |
 
@@ -74,7 +76,7 @@ diff ~/kernel/tvcast.sh ~/bin/tvcast.sh   # 空 = 两边一致
 ```bash
 ~/bin/tvplay.sh -i            # 重建片库索引 →  ~/.cache/tvplay.index（BFS 3 层）
 ~/bin/tvplay.sh -l 关键词      # 只列表不播放
-~/bin/tvplay.sh 关键词         # 搜片 + 在电视上播（命中多首会让你选序号）
+~/bin/tvplay.sh 关键词         # 搜片 + 在显示器上播（命中多首会让你选序号）
 ~/bin/tvplay.sh -p "/sata11-18072858035/电影/xxx.mkv"   # 直给完整 dav 路径
 ~/bin/tvplay.sh -s            # 停止
 ```
@@ -112,36 +114,77 @@ V4L2 M2M 零拷贝解 → dmabuf fd → EGL/GLES3 shader 单 pass 等比缩放 �
 cd ~/kernel/hevcdec && make gl CROSS=1        # 产物 v4l2hevc-gl-aarch64
 scp v4l2hevc-gl-aarch64 root@192.168.1.121:/tmp/
 
-# 盒子上：读裸 HEVC 码流（Annex-B，含 VPS/SPS/PPS），24fps 配速播放
+# 盒子上：读裸 HEVC 码流（Annex-B，含 VPS/SPS/PPS）
+# NOWRITE=1 是看片必需项（否则写 /tmp/out.yuv，见下表）
 ssh root@192.168.1.121 \
-  'PLAY=1 GLPLAY=1 FPS=24 /tmp/v4l2hevc-gl-aarch64 /tmp/movie.265'
+  'NOWRITE=1 PLAY=1 GLPLAY=1 /tmp/v4l2hevc-gl-aarch64 /tmp/movie.265'
 
-# 长片不用先落盘：hevcdec 支持 stdin/管道，喂 NAS 的 WebDAV 即可
+# 长片不用先落盘：ffmpeg 直接从 WebDAV 拉。注意盒子上**没有 curl**，
+# 别用 curl|ffmpeg；ffmpeg 自带 http 客户端。
+# -re 必须：GL 输出路径没有节拍器，不靠它就会按解码速度播（见下表）
 ssh root@192.168.1.121 \
-  'curl -s "http://user:pass@nas/路径" | ffmpeg -i - -c copy -f hevc - \
-   | PLAY=1 GLPLAY=1 FPS=24 /tmp/v4l2hevc-gl-aarch64 -'
+  "ffmpeg -re -i 'http://user:pass@nas/路径' -map 0:v:0 -c:v copy -f hevc - \
+   | NOWRITE=1 PLAY=1 GLPLAY=1 /tmp/v4l2hevc-gl-aarch64 -"
 ```
 
 | 开关 | 作用 |
 |---|---|
 | `PLAY=1` | 配速播放（去掉就是全速抓帧，测吞吐用） |
 | `GLPLAY=1` | 走 GLES3 输出（不置位则退回 DRM 平面直通） |
-| `FPS=24` | 播放配速，默认 24；按片源帧率给（23.976 给 24 即可） |
+| `NOWRITE=1` | **看片必加**：否则每帧写 `/tmp/out.yuv`，4K 从 24fps 掉到 9.9fps（实测 write=18.6s/26s），还会撑爆 /tmp |
+| `FPS=24` | 只对 DRM 平面路径有效。`GLPLAY=1` 时 GL 输出**没有节拍器，此开关被忽略**——节拍要用 ffmpeg `-re` 提供 |
 | `LEAD=6` | 起播预垫帧数，卡首帧时可调大 |
 | `NOPACE=1` | 不限速，纯测解码 + 缩放上限 |
-| `SCALE=crop` / `DSTGEO` | 裁切填充 / 指定目标几何，默认等比 letterbox |
+| `SCALE=crop` / `DSTGEO` | 裁切填充 / 指定目标几何。默认等比 letterbox 到屏幕模式；`DSTGEO` 只对 DRM 平面路径生效，GL 路径按 connector `modes[0]` 全屏（见 §1.2.1） |
 | `HDR=1` `TM_*` | HDR10→SDR tonemap（hable，峰值/目标/饱和度可调） |
+
+### 1.2.1 输出分辨率与缩放：一律按显示器 2560×1440@60
+
+**屏幕就是唯一的目标几何，片源只做等比缩放，不转码、不改容器。**
+
+| 事实 | 值 / 位置 |
+|---|---|
+| 显示器 | BenQ PD2500Q，原生 **2560×1440@60**（`card0-HDMI-A-1`，`modes` 首行就是 2560x1440） |
+| 模式怎么锁的 | 盒子 cmdline：`video=HDMI-A-1:2560x1440@60e drm.edid_firmware=HDMI-A-1:edid/benq-pd2500q.bin`，`force=on` 跳过真 EDID，靠固件 EDID 才能列出 2560×1440 |
+| GL 路径取几何 | `glout.c: kms_pick()` 取 connector 的 `modes[0]` → 就是 cmdline 锁的那条 → 全屏 2560×1440 |
+| DRM 平面路径兜底 | `tvplay.sh` 传 `DSTGEO=2560x1440+0+0`（GL 路径忽略它，两者结果一致） |
+| 谁来缩放 | GL：GPU（Mali-G31 shader，单 pass）；DRM：显示控制器硬件 overlay 缩放 |
+
+等比 letterbox（`SCALE` 默认 fit，居中黑边）在 2560×1440 上的落点：
+
+| 片源 | 画面上屏矩形 | 黑边 |
+|---|---|---|
+| 3840×2160（16:9 4K） | 2560×1440 | 无，满屏（缩小 1.5x） |
+| 3840×1600（2.4:1） | 2560×1067 | 上下各 186px |
+| 1920×1080（FHD） | 2560×1440 | 无（**放大** 1.33x，GPU bilinear） |
+| 720×480（4:3） | 2160×1440 | 左右各 200px |
+
+- 要铺满/裁边就用 `SCALE=crop`（按屏比例内缩采样区，等价于放大后裁边）。
+- 节拍：屏 60Hz，GL 路径**没有 vblank 节拍器**，23.976 源靠 `ffmpeg -re` 按时间轴供帧
+  （实测 23.8fps、drops=0）；屏刷新率只决定 swap 时机，不决定帧率。
+- `tvplay.sh` 起播会先探屏并打印 `输出: 2560x1440@60（显示器 原生）` + 一行
+  `缩放: 3840x1600 → 2560x1067 + 上下黑边各 186`，起播后回读盒端日志里的
+  `GLOUT: 屏幕 2560x1440@60` 作为**实际选中模式**的验收；模式不是 2560x1440 会显式告警。
 
 实测（2026-11-16，X96Max / Mali-G31 / 3840×1600 10bit 源 → 2560×1440 输出）：
 
 | 测法 | 结果 |
 |---|---|
-| `PLAY=1 GLPLAY=1` 全链 | 272 帧 / 11.41s = **23.8fps**，drops=0（`FPS=24` 配速跑满） |
+| GL + `ffmpeg -re` 全链（15s 片源） | 297~369 帧 / 13.7~15.1s ≈ **实时**，drops=0 |
+| 不带 `-re` | 按解码速度播：4K 约 27.7fps（比 24 快 15%），1080p 更快 |
+| 不带 `NOWRITE` | 9.9fps，瓶颈在写 `/tmp/out.yuv`（write=18.6s/26s） |
 | 纯解码（`NOWRITE=1 NBUF_OUT=16`） | 104fps —— 瓶颈已不在解码 |
 | GLES3 shader 缩放 | 单 pass 采样 + tonemap，是 23.8fps 里的主要成本；够 24p，不够 60p |
 
-> 这条路径目前是**独立命令行播放器**：`tvplay.sh` 还没接进去（它仍走 mpv `--hwdec=no`）。
-> 要日常化，得把 §1.0 里 `tvplay.sh` 的 mpv 那行按扩展名分流到 `v4l2hevc-gl-aarch64`。
+> **`tvplay.sh` 已接入（2026-11-16）**：HEVC 且 ≤30fps 走
+> `ffmpeg -re 供流 | hevcdec(GL) 出画 ＋ mpv --no-video 出声`，其余仍走 mpv。
+>
+> 踩过的坑：① 这块板子 `ffmpeg -f alsa` 缓冲太浅（单跑 8s 就 15 次 xrun），
+> 音频只能交给 mpv；② `WEBDAV_URL` 只含 `http://host:port`，凭据要自己拼，
+> 且本机口令是 `$$` 开头，**不能把 URL 塞进 `sh -c "..."`**（内层 shell 会把
+> `$$` 展成 PID），必须用环境变量传；③ 盒子 rootfs 没有 curl，取流用 ffmpeg。
+> 待修（C 侧）：GL 路径缺 vblank 节拍器、GL 不累加 `pc.flips`、DRM 路径
+> CPU tonemap 对 10bit 源 190ms/帧。
 
 ### 1.3 `-t` 输出怎么读
 
@@ -254,7 +297,7 @@ ffmpeg -hide_banner -i "http://user:pass@nas/路径" \
 | 片段 | 作用 |
 |---|---|
 | `-map 0:v:0 -map 0:a:1?` | 只取第一条视频 + 第 2 条音轨（`?` = 没有也不报错） |
-| `scale=1920:-2` | 缩到 1080p（电视 EDID 最高 1920x1080，必须下采样；转码后就当普通 1080p 片播） |
+| `scale=1920:-2` | 缩到 1080p 省码率/省解码。**不是为了适配屏幕**——屏是 2560×1440，1080p 会被 GL 放大 1.33x；想让画面与屏幕 1:1 就改 `scale=2560:-2` |
 | `zscale=t=linear:npl=100 … tonemap=hable` | HDR→SDR hable 映射（SDR 源可整段删掉） |
 | `-c:v libx264 -crf 20` | 1080p 8–10M 量级，盒子零拷贝解码余量充足 |
 | `-movflags +faststart` | 转完直接丢 NAS，`tvplay.sh` 拿到的就是普通 1080p 片 |
@@ -269,15 +312,14 @@ ffmpeg -hide_banner -i "http://user:pass@nas/路径" \
 
 1. **`vd-lavc-dr=yes` 绝对不要开**：破坏零拷贝直出，`drop` 从 210 涨到 702（21/s）。
 2. **`hwdec=v4l2m2m-copy` 在 60Hz 必掉帧**：每帧上传吃带宽，`drop` 每秒 +3.7；要么零拷贝要么软解。
-3. **根因不是「丢帧」而是「没有 24Hz 模式」**：内核 cmdline `video=HDMI-A-1:1920x1080@60e` +
-   debugfs `force=on` → 完全跳过 EDID（`edid` 0 字节，`edid_override` 写了也不生效），模式表只剩
-   CVT 兜底（1920x1080/1024x768/800x600/848x480）。23.976fps 上 60Hz 就是 3:2 pulldown 抖动，
-   所以 `drop=0` 但看着晃。当前用 display-resample + 插帧消掉。
+3. **60Hz 屏上没有 24Hz 模式，只能靠配速消除抖动**：内核 cmdline `video=HDMI-A-1:2560x1440@60e` +
+   debugfs `force=on` → 跳过真 EDID，模式表来自固件 EDID（`edid/benq-pd2500q.bin`），
+   2560×1440 之外只有 1080p 一类，没有 23.976/24Hz。mpv 路径用 display-resample + 插帧；
+   `hevcdec` GL 路径没有节拍器，靠 `ffmpeg -re` 按时间轴供帧（实测 drops=0，看着不晃）。
 4. **字幕**：内封 ASS 特效字幕 `osd_render` 要 11.4ms/帧，纯文本约 5ms。需要省 CPU 时指定
    `--sid=<纯文本轨> --sub-auto=no`。
 5. **4K 直推盒子不是解码问题，是缩放问题**：零拷贝解码 86fps（`hevcdec` 侧 104fps）够看，
-   卡在 Mali-G31 缩 4K→1080p——`mpv --vo=gpu` 只有 4–8fps，且 VPP 不给 M2M 缩放、
-   电视 EDID 最高 1080p。**绕过办法不是转码，而是别用 mpv 的输出链**：`hevcdec` 的
+   卡在 Mali-G31 缩 4K→屏幕（2560×1440）——`mpv --vo=gpu` 只有 4–8fps，且 VPP 不给 M2M 缩放。**绕过办法不是转码，而是别用 mpv 的输出链**：`hevcdec` 的
    GLES3 单 pass 缩放实测 23.8fps（§1.2）。转码（§3）只用于省功耗/归档。
 
 ## 5. 一次完整的验证流程（旧推流路径）

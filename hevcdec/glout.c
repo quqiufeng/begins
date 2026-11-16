@@ -263,6 +263,18 @@ static const char *VS =
 	"  gl_Position = vec4(aPos,0.0,1.0);\n"
 	"}\n";
 
+/* pass2 专用：FBO 里的 tex_rgb 已经是 GL 下上顺序（pass1 的 VS 已经翻过一次），
+ * 再套 VS 会翻第二次 → 画面上下颠倒。所以 pass2 用不翻的 UV。
+ */
+static const char *VS2 =
+	"#version 300 es\n"
+	"layout(location=0) in vec2 aPos;\n"
+	"out vec2 vUV;\n"
+	"void main(){\n"
+	"  vUV = aPos*0.5+0.5;\n"
+	"  gl_Position = vec4(aPos,0.0,1.0);\n"
+	"}\n";
+
 static const char *FS =
 	"#version 300 es\n"
 	"precision highp float;\n"
@@ -737,6 +749,15 @@ static void drop_tex(void)
 	g.tex_y = g.tex_c = 0;
 }
 
+/* seek 后 dmabuf fd 全换了一批：把旧纹理扔掉，按新 fd 重新导入。
+ * GL 上下文/EGLDisplay/DRM 都不动，所以屏幕不会黑。
+ */
+void glout_reset(void)
+{
+	if (!g.inited) return;
+	drop_tex();
+}
+
 /* 上屏前抓一帧（GLDUM=/tmp/x.ppm），用来核对色调映射对不对 */
 static void dump_frame(void)
 {
@@ -828,7 +849,7 @@ static int twopass_frame(unsigned w, unsigned h)
 	int dx, dy;
 
 	if (!g.prog2) {
-		g.prog2 = mk_prog(VS, FS_COPY);
+		g.prog2 = mk_prog(VS2, FS_COPY);
 		glGenTextures(1, &g.tex_rgb);
 		glGenFramebuffers(1, &g.fbo_rgb);
 	}

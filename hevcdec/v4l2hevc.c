@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <poll.h>
+#include <signal.h>
 #include <time.h>
 #include <linux/videodev2.h>
 #ifdef USE_DRM
@@ -33,6 +34,7 @@ void glout_set_drm_fd(int fd);
 int glout_init(unsigned sw, unsigned sh);
 int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 		unsigned ypitch, unsigned cpitch);
+void glout_reset(void);
 #endif
 
 #define DEV "/dev/video0"
@@ -43,10 +45,23 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 #define CAP_T V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
 #define OUT_T V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
 
+static volatile sig_atomic_t g_reinit;	/* 定义在下方，xioctl 要先看到 */
+
 static int xioctl(int fd, unsigned long req, void *arg)
 {
 	int r;
-	do { r = ioctl(fd, req, arg); } while (r == -1 && errno == EINTR);
+
+	for (;;) {
+		r = ioctl(fd, req, arg);
+		if (r != -1 || errno != EINTR)
+			break;
+		/* seek 打断：阻塞型 ioctl（DQBUF/DQEVENT）被 SIGUSR1 打断后
+		 * 若继续重试，要等下一帧才返回——实测把 seek 拖满 3s 超时。
+		 * 直接返回 EINTR，调用方 break 回主循环处理 g_reinit。
+		 */
+		if (g_reinit)
+			return -1;
+	}
 	return r;
 }
 
@@ -81,11 +96,17 @@ static struct { size_t off, len; int key; } au[4096];
 static int n_au;
 
 static int fd;
+/* seek 时驱动没法在同一个 V4L2 会话里接新码流（meson-vdec 直接
+ * "Unrecognized dec_status 0000000F / Aborting decoding session"），
+ * 必须重开 /dev/video0。DRM/GL 那一路不碰，所以屏幕不黑。
+ */
+static void on_usr1(int sig) { (void)sig; g_reinit = 1; }
 #ifdef USE_GLOUT
 static int g_gl_ready;
 #endif
 static unsigned g_w = 640, g_h = 360;
 static int got, resets, g_refeed;
+static int g_mark_first;	/* reinit 后等待首帧，打一行供脚本同步 */
 /* 计时：把"纯解码吞吐"从启动/收尾/写盘里剥出来 */
 static int got_queued;
 static double t_first_q, t_last_q, t_first_rx, t_last_rx, t_write_acc, t_tm_acc;
@@ -263,6 +284,7 @@ static void out_setup(void)
 	struct v4l2_requestbuffers rb = {0};
 	int i;
 
+	out_nfree = 0;		/* 重开设备时会被二次调用，不清就会重复入队 */
 	for (i = 0; i < NBUF_OUT; i++)
 		if (outbuf[i].mem) {
 			munmap(outbuf[i].mem, outbuf[i].len);
@@ -341,7 +363,11 @@ static void qbuf_au(const unsigned char *data, size_t len, int key)
 	b.timestamp.tv_sec = g_au_seq / 25;
 	b.timestamp.tv_usec = (g_au_seq % 25) * 40000;
 	g_au_seq++;
-	if (xioctl(fd, VIDIOC_QBUF, &b) < 0) die("QBUF out");
+	if (xioctl(fd, VIDIOC_QBUF, &b) < 0) {
+		fprintf(stderr, "QBUF out: idx=%d n_out=%d nfree=%d len=%zu/%zu\n",
+			oi, n_out, out_nfree, len, outbuf[oi].len);
+		die("QBUF out");
+	}
 	if (!got_queued)
 		t_first_q = now_s();
 	t_last_q = now_s();
@@ -557,8 +583,14 @@ static void s_fill(size_t want)
 		ssize_t r = read(s_fd, s_buf + s_len, s_cap - s_len);
 
 		if (r < 0) {
-			if (errno == EINTR)
+			if (errno == EINTR) {
+				/* 阻塞在 read() 等 ffmpeg 供流时收到 seek 信号：
+				 * 别重新阻塞回去，交给主循环重建会话。
+				 */
+				if (g_reinit)
+					return;
 				continue;
+			}
 			die("read stream");
 		}
 		if (r == 0) {
@@ -657,6 +689,8 @@ static int stream_next_au(const unsigned char **out, size_t *outlen)
 			return 0;
 		}
 		s_fill(1u << 20);
+		if (g_reinit)
+			return -1;	/* 被打断：既不是有 AU 也不是 EOS */
 	}
 }
 
@@ -1042,6 +1076,8 @@ struct playctx {
 	uint32_t crtc_id, plane_id;
 	unsigned dw, dh;		/* 屏幕模式尺寸 */
 	uint32_t fb[NBUF_CAP_MAX];
+	/* 屏上正在扫描的那个 fb：seek 重建时不能删，否则当场黑屏 */
+	uint32_t cur_fb, prev_fb;
 	double t0;			/* 首帧节拍基准 */
 	int n;				/* 已翻页数 */
 	int flips, timeouts, drops;
@@ -1344,6 +1380,7 @@ static int play_frame(int idx, int yfd, int cfd, unsigned sw, unsigned sh)
 	sp.plane_id = pc.plane_id;
 	sp.crtc_id = pc.crtc_id;
 	sp.fb_id = pc.fb[idx];
+	pc.cur_fb = sp.fb_id;
 	play_rect(sw, sh);
 	{
 		/* DSTGEO=WxH+X+Y 强制目标矩形，用来单变量排查缩放/尺寸 */
@@ -1388,13 +1425,31 @@ static int play_frame(int idx, int yfd, int cfd, unsigned sw, unsigned sh)
 }
 #endif
 
+/* OUTPUT 格式：一个 AU 一个 buffer。初次启动和 seek 重建会话共用。 */
+static void out_fmt_setup(void)
+{
+	struct v4l2_format f = {0};
+	size_t max = getenv("MAXAU") ? atol(getenv("MAXAU")) : (6u << 20);
+
+	f.type = OUT_T;
+	f.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_HEVC;
+	f.fmt.pix_mp.num_planes = 1;
+	f.fmt.pix_mp.width = g_w;
+	f.fmt.pix_mp.height = g_h;
+	f.fmt.pix_mp.field = V4L2_FIELD_NONE;
+	f.fmt.pix_mp.plane_fmt[0].sizeimage = (max + 8191) & ~4095UL;
+	if (xioctl(fd, VIDIOC_S_FMT, &f) < 0) die("S_FMT out");
+	printf("S_FMT OUT : %ux%u sizeimage=%u (max AU %zu)\n",
+	       f.fmt.pix_mp.width, f.fmt.pix_mp.height,
+	       f.fmt.pix_mp.plane_fmt[0].sizeimage, max);
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	setvbuf(stderr, NULL, _IONBF, 0);
 	const char *path = argc > 1 ? argv[1] : "/tmp/test.265";
 	struct stat st;
-	struct v4l2_format f = {0};
 	struct v4l2_control ctl;
 	struct v4l2_event_subscription sub = {0};
 	int sf, au_idx = 0, poll_timeouts = 0, drained = 0, stream_done = 0;
@@ -1406,6 +1461,19 @@ int main(int argc, char **argv)
 	int expect = getenv("FRAMES") ? atoi(getenv("FRAMES")) : 0;
 
 	if (argc > 3) { g_w = atoi(argv[2]); g_h = atoi(argv[3]); }
+
+	{	/* seek：重建 V4L2 会话，DRM 不动。
+		 * 必须关掉 SA_RESTART（signal() 默认带），否则阻塞在 read()
+		 * 等供流时信号会被内核延迟到下一帧数据，seek 白等几秒。
+		 */
+		struct sigaction sa;
+
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = on_usr1;
+		sigemptyset(&sa.sa_mask);
+		sa.sa_flags = 0;
+		sigaction(SIGUSR1, &sa, NULL);
+	}
 
 	fd = open(DEV, O_RDWR | O_NONBLOCK);
 	if (fd < 0) die("open " DEV);
@@ -1426,21 +1494,7 @@ int main(int argc, char **argv)
 	if (!s_len) die("stream 空");
 
 	/* OUTPUT: one AU per buffer */
-	{
-		size_t max = getenv("MAXAU") ? atol(getenv("MAXAU")) : (6u << 20);
-		(void)st;
-		f.type = OUT_T;
-		f.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_HEVC;
-		f.fmt.pix_mp.num_planes = 1;
-		f.fmt.pix_mp.width = g_w;
-		f.fmt.pix_mp.height = g_h;
-		f.fmt.pix_mp.field = V4L2_FIELD_NONE;
-		f.fmt.pix_mp.plane_fmt[0].sizeimage = (max + 8191) & ~4095UL;
-		if (xioctl(fd, VIDIOC_S_FMT, &f) < 0) die("S_FMT out");
-		printf("S_FMT OUT : %ux%u sizeimage=%u (max AU %zu)\n",
-		       f.fmt.pix_mp.width, f.fmt.pix_mp.height,
-		       f.fmt.pix_mp.plane_fmt[0].sizeimage, max);
-	}
+	out_fmt_setup();
 
 	{
 		unsigned sw = 0, sh = 0;
@@ -1512,6 +1566,117 @@ int main(int argc, char **argv)
 		struct pollfd pf = { .fd = fd, .events = POLLIN };
 		int pr;
 
+		/* 收到 SIGUSR1：换新码流。meson-vdec 不接受在旧会话上接新流
+		 * （整份新 SPS/DPB 撞进老状态，驱动直接 Aborting decoding session），
+		 * 所以关掉 /dev/video0 重开一遍；DRM master、crtc/plane 和
+		 * GL 上下文都在别的 fd 上，屏幕不会黑。
+		 */
+		if (g_reinit) {
+			unsigned i;
+			int p;
+
+			g_reinit = 0;
+			printf("REINIT: 重建 V4L2 会话（DRM/GL 保留）\n");
+			/* 管道里上一段流的残留全部丢掉，新流从 SPS 开始 */
+			if (s_fd >= 0) {
+				int fl = fcntl(s_fd, F_GETFL);
+
+				if (fl >= 0) {
+					fcntl(s_fd, F_SETFL, fl | O_NONBLOCK);
+					for (;;) {
+						unsigned char tmp[65536];
+
+						if (read(s_fd, tmp, sizeof tmp) <= 0)
+							break;
+					}
+					fcntl(s_fd, F_SETFL, fl & ~O_NONBLOCK);
+				}
+			}
+			s_len = 0;
+			s_pos = 0;
+			s_au_start = 0;
+			s_au_open = 0;
+			s_cur_vcl = 0;
+			s_eof = 0;
+			s_release = 0;
+			s_au_irap = 0;
+
+			stop_stream();
+			/* 旧 dmabuf 上的 fb / GL 纹理必须一起作废 */
+			for (i = 0; i < cap_count; i++)
+				for (p = 0; p < 2; p++)
+					if (capbuf[i].dmabuf[p] >= 0) {
+						close(capbuf[i].dmabuf[p]);
+						capbuf[i].dmabuf[p] = -1;
+					}
+			/* 屏上那一张留着（删了当场黑屏），其余回收；上一轮
+			 * 留下的那张此刻已不在屏上，一并删掉 —— 每次 seek
+			 * 最多只多挂一张 fb。
+			 */
+			{
+				uint32_t onscreen = pc.cur_fb;
+
+				for (i = 0; i < NBUF_CAP_MAX; i++) {
+					if (!pc.fb[i])
+						continue;
+					if (pc.fb[i] != onscreen) {
+						uint32_t id = pc.fb[i];
+
+						ioctl(pc.dfd, DRM_IOCTL_MODE_RMFB, &id);
+					}
+					pc.fb[i] = 0;
+				}
+				if (pc.prev_fb && pc.prev_fb != onscreen) {
+					uint32_t id = pc.prev_fb;
+
+					ioctl(pc.dfd, DRM_IOCTL_MODE_RMFB, &id);
+				}
+				pc.prev_fb = onscreen;
+				pc.cur_fb = 0;
+			}
+#ifdef USE_GLOUT
+			if (getenv("PLAY"))
+				glout_reset();
+#endif
+			cap_release();
+			close(fd);
+			/* 驱动是异步收尾的：close 后它才在 workqueue 里打完
+			 * "Aborting decoding session!"。紧接着 open 会把新会话
+			 * 开在还没收干净的旧状态上，于是 seek 偶发连试两次都
+			 * 吐不出帧。留一个短落定期，代价 80ms，比闪一次屏便宜。
+			 */
+			usleep(80000);
+			fd = open(DEV, O_RDWR | O_NONBLOCK);
+			if (fd < 0) die("reopen " DEV);
+			out_fmt_setup();
+			s_fmt_cap(g_w, g_h);
+			cap_setup();
+			out_setup();
+			sub.type = V4L2_EVENT_SOURCE_CHANGE;
+			if (xioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0)
+				die("SUBSCRIBE_EVENT");
+			start_stream();
+
+			/* 本地状态清零：别把上一段流的收尾当成本流的结尾 */
+			pc.vbl_ok = 0;
+			pc.n = 0;
+			pc.drops = 0;
+			drained = 0;
+			stream_done = 0;
+			poll_timeouts = 0;
+			idle_ticks = 0;
+			eos_seen = 0;
+			g_refeed = 0;
+			s_eof = 0;
+			tq = 0;
+			au_idx = 0;
+			t_last_rx = now_s();
+			g_mark_first = 1;
+			pf.fd = fd;
+			printf("REINIT: ready\n");
+			continue;
+		}
+
 		/* 收尾阶段：等到预期帧数 / EOS / 长时间静默就停 */
 		if (drained) {
 			double el = now_s() - tq;
@@ -1563,14 +1728,26 @@ int main(int argc, char **argv)
 			if (play_pace > 0 && lead > 0 && au_idx - got >= lead)
 				break;
 			r = stream_next_au(&ap, &al);
-			if (r <= 0) { stream_done = 1; break; }
+			if (r < 0)
+				break;		/* seek 打断：回主循环处理重建 */
+			if (r == 0) { stream_done = 1; break; }
 			qbuf_au(ap, al, r == 2);
 			au_idx++;
 			idle_ticks = 0;
 		}
 
 		pr = poll(&pf, 1, drained ? 50 : (out_nfree ? 2000 : 100));
-		if (pr < 0) { perror("poll"); break; }
+		if (pr < 0) {
+			/* SIGUSR1 会打断 poll。以前这里直接 break 退主循环，
+			 * 表现是"seek 偶发卡 3s 后解码器消失"——信号恰好落在
+			 * poll 而不是 read 上时就会踩到。必须回主循环重查
+			 * g_reinit（顶部会重建会话），否则 seek 就是赌概率。
+			 */
+			if (errno == EINTR)
+				continue;
+			perror("poll");
+			break;
+		}
 		if (pr == 0) {
 			poll_timeouts++;
 			idle_ticks++;
@@ -1617,6 +1794,10 @@ int main(int argc, char **argv)
 			if (xioctl(fd, VIDIOC_DQBUF, &b) < 0)
 				break;
 			t_rx = now_s();
+			if (g_mark_first) {
+				g_mark_first = 0;
+				printf("REINIT: first frame\n");
+			}
 			if (!got)
 				t_first_rx = t_rx;
 			t_last_rx = t_rx;
