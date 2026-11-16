@@ -17,26 +17,29 @@
 | `mpv --vo=drm --hwdec=v4l2m2m-copy` | 240 帧 / 58.9s = 4fps |
 | `mpv --vo=gpu-next` | >40s 未跑完（<6fps） |
 
-解码有余量 3 倍，卡的是**后段**：Mali-G31 把 3840×2160 缩到电视的 1920×1080，
-这一步没有任何加速路径：
+解码有余量 3 倍，卡的是**后段**缩放。mpv 的 `vo=gpu` 在 Mali-G31 上只有 4–8fps，
+原因不在「没有缩放硬件」这个笼统结论上，而是具体三条：
 
 - 电视 EDID 实测只声明 1920×1080 / 1280×720（`X96-TV`，128 字节、无 CEA 扩展块）→ 4K 必须下采样
 - `/dev/video0`（meson-vdec）CAPTURE 报支持 144p–2160p 连续缩放，但 `v4l2-ctl` 设
   4K 入 + 1080p 出，驱动 rc=0 却**静默忽略**，格式回退 1280x720 VP9 → VPP 不给 M2M 缩放
-- Mali-G31 无独立硬件缩放单元，全靠 shader 逐像素读写
+- Mali-G31 无独立硬件缩放单元，只能 shader 逐像素读写；mpv 那条链还要顺带做
+  插帧 / display-resample / 完整 tonemap，叠起来就掉到个位数 fps
 
-**结论**：4K 帧能解出来，但 1080p 电视上无处安放。要么片子提前是 1080p，
-要么播放时找台机器实时缩——后者就是纯外部依赖，本文不再当作方案。
+> **旧结论作废**：上一版文档据此认定「4K 帧能解出来但无处安放，只能入库前转 1080p」。
+> 这条已经推翻 —— 自写一条只做单 pass 缩放的 GLES3 路径就够了，见 §1.2。
 
-## 因此有两条路径
+## 三条路径
 
 | 路径 | 谁干活 | 外部依赖 |
 |---|---|---|
-| **A. 盒子直接播 1080p 及以下**（日常主路） | `tvplay.sh` → 盒子 mpv | **无** |
-| **B. 4K 片源一次性转 1080p 入库** | 任意一台机器跑 ffmpeg，转完就不用了 | 只在转码那一次 |
+| **A. 1080p 及以下 → `tvplay.sh` + 盒子 mpv**（日常主路） | 盒子 mpv（零拷贝硬解） | **无** |
+| **B. 4K → `hevcdec` 自带 GLES3 输出**（4K 主路） | `v4l2hevc-gl-aarch64`，硬解 + shader 缩放 | **无** |
+| **C. 4K 片源一次性转 1080p 入库**（保底/省电） | 任意一台机器跑 ffmpeg，转完就不用了 | 只在转码那一次 |
 
-4K 原片想看，就走 B：入库时转一次，之后当普通 1080p 片子用 `tvplay.sh` 播，播放期零依赖。
-（转速取决于机器，未在本机做全片实测；`-vf scale=1920:-2` + HDR→SDR 的写法见 §3。）
+4K 原片现在**直接播**，走 B：V4L2 零拷贝解 → dmabuf → GLES3 等比缩放 + HDR10→SDR，
+实测 3840×1600 10bit 跑满 23.8fps（24fps 配速、drops=0），不需要预转码、不需要第二台机器。
+C 只在「想省盒子功耗」或「要长期归档小体积」时才用，写法见 §3。
 
 ---
 
@@ -77,7 +80,8 @@ diff ~/kernel/tvcast.sh ~/bin/tvcast.sh   # 空 = 两边一致
 ```
 
 盒子 `mpv` 直接拉 NAS 的 WebDAV 地址播，**播放链路里没有任何其他机器**。
-1080p 及以下的片源全部走这条；4K 片子先按 §3 转成 1080p 再入库，然后同样走这条。
+1080p 及以下的片源全部走这条；4K 片子走 §1.2 的 `hevcdec` 直放（同样是盒子自己干），
+只有想省功耗 / 归档小体积时才按 §3 转成 1080p 再进来。
 
 ### 1.1 旧推流路径：`tvcast.sh`（可选，需要一台带 NVENC 的机器）
 
@@ -99,7 +103,47 @@ diff ~/kernel/tvcast.sh ~/bin/tvcast.sh   # 空 = 两边一致
 
 > `-p` 和「关键词」都需要索引：没索引会提示 `缺索引，先跑: tvplay.sh -i`。
 
-### 1.2 `-t` 输出怎么读
+### 1.2 4K 直放：`hevcdec`（路径 B，硬解 + GLES3 缩放）
+
+4K 不用再转码，也不必走 mpv。`hevcdec/v4l2hevc-gl-aarch64` 一个二进制搞定：
+V4L2 M2M 零拷贝解 → dmabuf fd → EGL/GLES3 shader 单 pass 等比缩放 → DRM 上屏。
+
+```bash
+cd ~/kernel/hevcdec && make gl CROSS=1        # 产物 v4l2hevc-gl-aarch64
+scp v4l2hevc-gl-aarch64 root@192.168.1.121:/tmp/
+
+# 盒子上：读裸 HEVC 码流（Annex-B，含 VPS/SPS/PPS），24fps 配速播放
+ssh root@192.168.1.121 \
+  'PLAY=1 GLPLAY=1 FPS=24 /tmp/v4l2hevc-gl-aarch64 /tmp/movie.265'
+
+# 长片不用先落盘：hevcdec 支持 stdin/管道，喂 NAS 的 WebDAV 即可
+ssh root@192.168.1.121 \
+  'curl -s "http://user:pass@nas/路径" | ffmpeg -i - -c copy -f hevc - \
+   | PLAY=1 GLPLAY=1 FPS=24 /tmp/v4l2hevc-gl-aarch64 -'
+```
+
+| 开关 | 作用 |
+|---|---|
+| `PLAY=1` | 配速播放（去掉就是全速抓帧，测吞吐用） |
+| `GLPLAY=1` | 走 GLES3 输出（不置位则退回 DRM 平面直通） |
+| `FPS=24` | 播放配速，默认 24；按片源帧率给（23.976 给 24 即可） |
+| `LEAD=6` | 起播预垫帧数，卡首帧时可调大 |
+| `NOPACE=1` | 不限速，纯测解码 + 缩放上限 |
+| `SCALE=crop` / `DSTGEO` | 裁切填充 / 指定目标几何，默认等比 letterbox |
+| `HDR=1` `TM_*` | HDR10→SDR tonemap（hable，峰值/目标/饱和度可调） |
+
+实测（2026-11-16，X96Max / Mali-G31 / 3840×1600 10bit 源 → 2560×1440 输出）：
+
+| 测法 | 结果 |
+|---|---|
+| `PLAY=1 GLPLAY=1` 全链 | 272 帧 / 11.41s = **23.8fps**，drops=0（`FPS=24` 配速跑满） |
+| 纯解码（`NOWRITE=1 NBUF_OUT=16`） | 104fps —— 瓶颈已不在解码 |
+| GLES3 shader 缩放 | 单 pass 采样 + tonemap，是 23.8fps 里的主要成本；够 24p，不够 60p |
+
+> 这条路径目前是**独立命令行播放器**：`tvplay.sh` 还没接进去（它仍走 mpv `--hwdec=no`）。
+> 要日常化，得把 §1.0 里 `tvplay.sh` 的 mpv 那行按扩展名分流到 `v4l2hevc-gl-aarch64`。
+
+### 1.3 `-t` 输出怎么读
 
 ```
 t=558.66 fps=23.976024 drop=4 mistimed=843 vo_drop=? vcache=61.27 disp_fps=60.000000 sync=display-resample hw=no
@@ -108,7 +152,7 @@ t=558.66 fps=23.976024 drop=4 mistimed=843 vo_drop=? vcache=61.27 disp_fps=60.00
 | 字段 | 正常 | 异常含义 |
 |---|---|---|
 | `t` | 递增 | 不涨 = 卡死/流断 |
-| `fps` | 23.976 / 25 / 29.97（源帧率） | 远低于源帧率 = 渲染/缩放跟不上（4K 源必然如此） |
+| `fps` | 23.976 / 25 / 29.97（源帧率） | 远低于源帧率 = 渲染/缩放跟不上（4K 走 mpv 必然如此，改走 §1.2） |
 | `drop` | 冻结不涨（个位数） | 每秒 +3.7 → hwdec 用了 `-copy`；每秒 +21 → `vd-lavc-dr=yes` |
 | `mistimed` | 缓慢增长 | 暴涨 = 输出模式与源不匹配 |
 | `disp_fps` | 60 | 60 就是 23.976 源 → 3:2 pulldown 的来源 |
@@ -191,9 +235,10 @@ ssh root@192.168.1.121 'chmod 644 /root/.config/mpv/*'
 ssh root@192.168.1.121 "mpv tcp://192.168.1.10:5000 --config-dir=/root/.config/mpv"
 ```
 
-## 3. 4K 片源一次性转 1080p（路径 B，可直接抄）
+## 3. 4K 片源一次性转 1080p（路径 C，可直接抄）
 
-只在想看的 4K 片子入库前跑一次，跑完就不需要任何转码机。**不绑定 GPU**：
+**不是必需品**——4K 已经能直放（§1.2）。只在两种情况下才转：想省盒子功耗，
+或者要长期归档小体积版本。跑一次就不需要任何转码机。**不绑定 GPU**：
 CPU 软解 + libx264 即可（有 N 卡时把 `-c:v libx264 -preset veryfast -crf 20`
 换成 `-c:v h264_nvenc -preset p4 -b:v 8M -maxrate 12M -bufsize 16M`，速度快，仅此而已）。
 
@@ -209,7 +254,7 @@ ffmpeg -hide_banner -i "http://user:pass@nas/路径" \
 | 片段 | 作用 |
 |---|---|
 | `-map 0:v:0 -map 0:a:1?` | 只取第一条视频 + 第 2 条音轨（`?` = 没有也不报错） |
-| `scale=1920:-2` | 缩到 1080p（电视 EDID 最高 1920x1080，必须下采样；盒子自己缩只有 4–8fps） |
+| `scale=1920:-2` | 缩到 1080p（电视 EDID 最高 1920x1080，必须下采样；转码后就当普通 1080p 片播） |
 | `zscale=t=linear:npl=100 … tonemap=hable` | HDR→SDR hable 映射（SDR 源可整段删掉） |
 | `-c:v libx264 -crf 20` | 1080p 8–10M 量级，盒子零拷贝解码余量充足 |
 | `-movflags +faststart` | 转完直接丢 NAS，`tvplay.sh` 拿到的就是普通 1080p 片 |
@@ -230,9 +275,10 @@ ffmpeg -hide_banner -i "http://user:pass@nas/路径" \
    所以 `drop=0` 但看着晃。当前用 display-resample + 插帧消掉。
 4. **字幕**：内封 ASS 特效字幕 `osd_render` 要 11.4ms/帧，纯文本约 5ms。需要省 CPU 时指定
    `--sid=<纯文本轨> --sub-auto=no`。
-5. **4K 直推盒子不是解码问题，是缩放问题**：零拷贝解码 86fps 够看，但 Mali-G31 缩 4K→1080p
-   只有 4–8fps，且 VPP 不给 M2M 缩放、电视 EDID 最高 1080p。所以 4K 只在入库前转一次（§3），
-   不要指望播放时直推。
+5. **4K 直推盒子不是解码问题，是缩放问题**：零拷贝解码 86fps（`hevcdec` 侧 104fps）够看，
+   卡在 Mali-G31 缩 4K→1080p——`mpv --vo=gpu` 只有 4–8fps，且 VPP 不给 M2M 缩放、
+   电视 EDID 最高 1080p。**绕过办法不是转码，而是别用 mpv 的输出链**：`hevcdec` 的
+   GLES3 单 pass 缩放实测 23.8fps（§1.2）。转码（§3）只用于省功耗/归档。
 
 ## 5. 一次完整的验证流程（旧推流路径）
 

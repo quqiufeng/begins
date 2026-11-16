@@ -430,16 +430,29 @@ tail -50 /x96-build/logs/netconsole.log
 
 ---
 
-## 9. 高清播放（4K/HDR → 主机转码 → 盒子直显）
+## 9. 高清播放（NAS 片源 → 盒子本地播放）
 
 内核/驱动确认没问题之后，日常看片走一套独立流程，不在本文展开：
 
 ```bash
-~/bin/tvcast.sh 关键词      # 起播（主机 RTX3080 cuda 解 + hable tonemap + 1080p nvenc → TCP → 盒子 mpv）
-~/bin/tvcast.sh -t         # 进度/健康度（drop 冻结、sync=display-resample 即正常）
-~/bin/tvcast.sh -s         # 停止
+~/bin/tvplay.sh 关键词      # 盒子上直接播（自己解自己放，链路里没有其他机器）
+~/bin/tvplay.sh -l 关键词   # 只列表
+~/bin/tvplay.sh -i         # 重建片库索引
 ```
 
-**完整文档：[`docs/playback.md`](docs/playback.md)** —— 含三条命令的语义、`-t` 各字段判读、
-盒子 `/root/.config/mpv/mpv.conf` 与 `stats.lua` 全文、主机 ffmpeg 逐参数解释，以及
-`vd-lavc-dr=yes`（drop 21/s）、`v4l2m2m-copy`（drop 3.7/s）、EDID 被跳过导致无 24Hz 这三个坑。
+盒子零拷贝硬解实测 4K HEVC10 有 86fps（3.5x 实时），**解码从来不是瓶颈**；
+卡的是后段缩放：`mpv --vo=gpu` 在 Mali-G31 上缩 4K→1080p 只有 4–8fps，
+且 VPP 不给 M2M 缩放。**但这不等于 4K 只能转码**——不走 mpv 的输出链即可：
+`hevcdec/v4l2hevc-gl-aarch64`（V4L2 零拷贝解 → dmabuf → GLES3 单 pass 缩放 + tonemap）
+实测跑满 23.8fps、drops=0。所以 4K 直接播；转 1080p 只用于省功耗/归档。
+
+```bash
+cd ~/kernel/hevcdec && make gl CROSS=1 && scp v4l2hevc-gl-aarch64 root@192.168.1.121:/tmp/
+ssh root@192.168.1.121 'PLAY=1 GLPLAY=1 FPS=24 /tmp/v4l2hevc-gl-aarch64 /tmp/movie.265'
+```
+
+**完整文档：[`docs/playback.md`](docs/playback.md)** —— 含各测法的实测帧率、`tvplay.sh`
+与 `hevcdec` 命令语义、盒子 `/root/.config/mpv/mpv.conf` 与 `stats.lua` 全文、
+4K→1080p 的 ffmpeg 逐参数解释，以及 `vd-lavc-dr=yes`（drop 21/s）、
+`v4l2m2m-copy`（drop 3.7/s）、EDID 被跳过导致无 24Hz 这三个坑。
+历史方案 `tvcast.sh`（实时转码推流）留档但非推荐路径。
