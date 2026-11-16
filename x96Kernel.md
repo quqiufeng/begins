@@ -8,6 +8,69 @@
 
 ---
 
+## 0. 源码从哪来 —— 缺文件从 tar 包补（先看这段）
+
+trim 过的源码树 `/x96-build/7.2.12-trim` 是被 `trim-tools` 裁出来的：
+**原始 101078 个条目 → 留下 47322 个文件 / 752M**。裁剪清单之外的目录整段不在，
+所以遇到下面这些症状，不要去网上找、不要重下 linux，直接从本机的完整源码包补回来：
+
+- `make` 报 `No rule to make target ...`、`fatal error: xxx.h: No such file or directory`
+- 某个驱动/子目录 `ls` 是空的，但 `Kconfig` 里还引用着
+- 想抄一份原版驱动做对比，手上只有被改过的版本
+
+| 项 | 值 |
+|---|---|
+| **完整源码包** | `/opt/linux/src/linux-7.2.12.tar.xz` —— 160445268 B（153M），101078 个条目，**完整未裁剪** |
+| 包内前缀 | `linux-7.2.12/`（解压时注意 `--strip-components=1`） |
+| 裁剪后的树 | `/x96-build/7.2.12-trim`，752M / 47322 文件 |
+
+**只补单个文件/目录**（推荐，不碰其它东西）：
+
+```bash
+# 例：把原版 vdec 目录整段解到临时处对比 / 补回
+mkdir -p /tmp/src && tar xf /opt/linux/src/linux-7.2.12.tar.xz \
+    -C /tmp/src --strip-components=1 \
+    linux-7.2.12/drivers/staging/media/meson/vdec
+
+# 补回树里（先 diff 看清差异再覆盖，别瞎 cp 把改好的代码冲掉）
+diff -r /tmp/src/drivers/staging/media/meson/vdec \
+        /x96-build/7.2.12-trim/drivers/staging/media/meson/vdec
+cp -a /tmp/src/drivers/staging/media/meson/vdec/. \
+      /x96-build/7.2.12-trim/drivers/staging/media/meson/vdec/
+```
+
+**先查包里有没有这个路径**（免得白解压 153M）：
+
+```bash
+tar tf /opt/linux/src/linux-7.2.12.tar.xz | grep '路径关键词'
+```
+
+**整个树重建**（裁剪树坏了才用，几十分钟，会丢掉 trim 的改动）：
+
+```bash
+mkdir -p /x96-build/7.2.12-full && tar xf /opt/linux/src/linux-7.2.12.tar.xz \
+    -C /x96-build/7.2.12-full --strip-components=1
+```
+
+### ⚠️ 这个 tar 包**救不了**改过的驱动
+
+实测把上游原版 vdec 目录解出来跟现役树对比（`diff -rq`，2026-11-16）：
+
+| 类别 | 数量 | 文件 |
+|---|---|---|
+| **上游没有，本机新增** | 2 | `codec_hevc.c`(42K)、`codec_hevc.h` ← HEVC 8bit 修复的主体，**tar 包里根本不存在** |
+| 被改过 | 14 | `codec_h264.c` `codec_hevc_common.c/.h` `codec_vp9.c` `esparser.c/.h` `hevc_regs.h` `vdec.c/.h` `vdec_helpers.c/.h` `vdec_hevc.c` `vdec_platform.c` `Makefile` |
+| 与上游一致 | 11 | `codec_mpeg12.c/.h` `codec_h264.h` `codec_vp9.h` `dos_regs.h` `vdec_1.c/.h` `vdec_hevc.h` `vdec_platform.h` `Kconfig` `TODO` |
+
+也就是说 **25 个文件里 16 个和上游不一样**。结论：
+
+- **补缺 / 对比 / 看原版长什么样 → 用 tar 包**
+- **复原「盒子上现在跑的那份」→ 只能用仓库 `meson-vdec/`（§3.5）**，tar 包给不了
+- 反过来也要小心：`cp -a` 从 tar 覆盖进树，会一次性把 14 个文件 + 2 个新增全冲掉，
+  驱动直接编不出来（`Makefile` 里引用的 `codec_hevc.o` 没源文件了）
+
+---
+
 ## 1. 一张表：所有用到的路径
 
 | 角色 | 路径 | 说明 |
