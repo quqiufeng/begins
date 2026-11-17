@@ -84,6 +84,8 @@ struct vout {
 	int in_cb;		/* 回调里只许 submit，pump/flush/close 会重入 */
 
 	/* 节拍 */
+	double t_ref;		/* 合成 vblank 序号的时间原点 */
+	int t_ref_have;
 	uint32_t vbl_base, vbl_first, vbl_last;
 	double pts_base;
 	int vbl_ok, started;
@@ -115,32 +117,44 @@ static void vdie(const char *m)
 	fprintf(stderr, "VOUT: %s: %s\n", m, strerror(errno));
 }
 
-/* ---------- vblank：RELATIVE 0 只回报 $sequence，不阻塞 ---------- */
+/* ---------- vblank 序号：用单调时钟合成，不靠驱动 ---------- */
+/* meson 的 drm_vblank_count() 只在"有人正等 vblank"时才随中断更新：没人等
+ * 就冻住不动。而调度逻辑恰恰是"先看当前序号、再决定等不等"——序号不动就永
+ * 远判定"还没到点"，于是从不调用 WAIT_VBLANK，计数更不会走，实测卡死在同一
+ * 帧上（屏全黑、shown=0、队列每轮只丢不翻）。这里改用 CLOCK_MONOTONIC × 刷新
+ * 率合成一个同节奏的序号：行为等价（1 槽 = 1 个刷新周期），且与驱动实现无关。 */
 static uint32_t vbl_seq(struct vout *v, int *ok)
 {
-	union drm_wait_vblank wv = {0};
+	double t;
 
-	wv.request.type = _DRM_VBLANK_RELATIVE |
-			  ((v->crtc_idx << _DRM_VBLANK_HIGH_CRTC_SHIFT) &
-			   _DRM_VBLANK_HIGH_CRTC_MASK);
-	wv.request.sequence = 0;
-	if (ioctl(v->dfd, DRM_IOCTL_WAIT_VBLANK, &wv) < 0) {
+	if (!v->refresh) {
 		if (ok) *ok = 0;
 		return 0;
 	}
+	t = now_s();
+	if (!v->t_ref_have) {
+		v->t_ref = t;
+		v->t_ref_have = 1;
+	}
 	if (ok) *ok = 1;
-	return wv.reply.sequence;
+	return (uint32_t)((t - v->t_ref) * v->refresh);
 }
 
+/* 等到目标槽的墙钟时刻。pump 已经用预算限制过调用，这里不会再等过头；
+ * 最后 2ms 细睡，避免 usleep 的调度粒度把一整帧睡丢。 */
 static int vbl_wait_abs(struct vout *v, uint32_t target)
 {
-	union drm_wait_vblank wv = {0};
+	double due;
 
-	wv.request.type = _DRM_VBLANK_ABSOLUTE |
-			  ((v->crtc_idx << _DRM_VBLANK_HIGH_CRTC_SHIFT) &
-			   _DRM_VBLANK_HIGH_CRTC_MASK);
-	wv.request.sequence = target;
-	return ioctl(v->dfd, DRM_IOCTL_WAIT_VBLANK, &wv);
+	if (!v->refresh || !v->t_ref_have) return -1;
+	due = v->t_ref + (double)target / v->refresh;
+	for (;;) {
+		double left = due - now_s();
+
+		if (left <= 0) return 0;
+		if (left > 0.002) usleep((useconds_t)((left - 0.002) * 1e6));
+		else usleep(200);
+	}
 }
 
 /* ---------- 完成反馈 ---------- */
@@ -375,11 +389,29 @@ static int primary_bring_up(struct vout *v, const struct drm_mode_modeinfo *m)
 	if (ioctl(v->dfd, DRM_IOCTL_MODE_CREATE_DUMB, &cd) < 0) {
 		vdie("CREATE_DUMB"); return -1;
 	}
-	fb.width = cd.width; fb.height = cd.height;
-	fb.bpp = 32; fb.depth = 24; fb.pitch = cd.pitch;
-	fb.handle = cd.handle;
-	if (ioctl(v->dfd, DRM_IOCTL_MODE_ADDFB, &fb) < 0) {
-		vdie("ADDFB(primary)"); goto bad;
+	/* legacy ADDFB 按 (bpp=32, depth=24) 推出的是 **XRGB8888**：alpha 位被
+	 * 驱动忽略 → 全 0 的缓冲照样是不透明黑，正好盖在 overlay 上面（meson
+	 * primary 的 normalized-zpos=1，overlay 是 0）。必须用 ADDFB2 明确要
+	 * ARGB8888，alpha=0 才是真透明。 */
+	{
+		struct drm_mode_fb_cmd2 f2 = {0};
+
+		f2.width = cd.width; f2.height = cd.height;
+		f2.pixel_format = DRM_FORMAT_ARGB8888;
+		f2.handles[0] = cd.handle;
+		f2.pitches[0] = cd.pitch;
+		f2.offsets[0] = 0;
+		if (ioctl(v->dfd, DRM_IOCTL_MODE_ADDFB2, &f2) < 0) {
+			vdie("ADDFB2(primary ARGB8888)");
+			fb.width = cd.width; fb.height = cd.height;
+			fb.bpp = 32; fb.depth = 24; fb.pitch = cd.pitch;
+			fb.handle = cd.handle;
+			if (ioctl(v->dfd, DRM_IOCTL_MODE_ADDFB, &fb) < 0) {
+				vdie("ADDFB(primary)"); goto bad;
+			}
+		} else {
+			fb.fb_id = f2.fb_id;
+		}
 	}
 
 	/* 内容未定义，必须显式清零；alpha=0 让 overlay 透上来 */
@@ -422,6 +454,7 @@ struct vout *vout_open(const char *drmdev)
 	const char *dev = drmdev ? drmdev : "/dev/dri/card0";
 	uint32_t enc_id = 0;
 	struct drm_mode_modeinfo mode = {0};
+	struct drm_mode_modeinfo want = {0};	/* 2560x1440@60 目标 */
 	int i;
 
 	v = calloc(1, sizeof(*v));
@@ -456,18 +489,43 @@ struct vout *vout_open(const char *drmdev)
 		gc.encoders_ptr = (uint64_t)(uintptr_t)&myenc;
 		gc.count_encoders = 1;
 		if (ioctl(v->dfd, DRM_IOCTL_MODE_GETCONNECTOR, &gc) < 0) continue;
+		/* 必须只认 connected 的 connector：X96 上 card0 同时挂着
+		 * Composite-1（CVBS，status=unknown）和 HDMI-A-1，前者排在
+		 * 前面且带 720x576i/720x480i 模式。只看 count_modes 会选中
+		 * CVBS → 输出 720x576@50、HDMI 上什么也没有、vout 队列瞬间
+		 * 堵死（"queue full, drop"）。 */
+		if (gc.connection != 1 /* DRM_MODE_CONNECTED */)
+			continue;
 		if (!gc.count_modes) continue;
 		nmode = gc.count_modes > 64 ? 64 : (int)gc.count_modes;
 
 		v->conn_id = conns[i];
-		/* 不取 modes[0]：EDID 的第一项常常是首选分辨率但顺序不可靠 */
+		/* 目标模式写死 2560x1440@60：这台显示器只有这一个模式，屏幕
+		 * 是固定的，选别的分辨率要么黑屏要么走 scaler。先按 (宽,高,刷新)
+		 * 精确找；找不到再退化为"取最大面积（<=4096 宽）"，最后兜底
+		 * modes[0]，别让 EDID 顺序决定结果。
+		 */
 		for (j = 0; j < nmode; j++) {
-			if (modes[j].hdisplay > 4096) continue;
-			if (modes[j].hdisplay * modes[j].vdisplay >
-			    mode.hdisplay * mode.vdisplay)
-				mode = modes[j];
+			if (modes[j].hdisplay != 2560 || modes[j].vdisplay != 1440)
+				continue;
+			if (!want.hdisplay ||
+			    abs((int)modes[j].vrefresh - 60) <
+			    abs((int)want.vrefresh - 60))
+				want = modes[j];
 		}
-		if (!mode.hdisplay) mode = modes[0];
+		if (want.hdisplay) {
+			mode = want;
+		} else {
+			for (j = 0; j < nmode; j++) {
+				if (modes[j].hdisplay > 4096) continue;
+				if (modes[j].hdisplay * modes[j].vdisplay >
+				    mode.hdisplay * mode.vdisplay)
+					mode = modes[j];
+			}
+			if (!mode.hdisplay) mode = modes[0];
+			fprintf(stderr, "VOUT: 没有 2560x1440@60，退化为 %ux%u@%u\n",
+				mode.hdisplay, mode.vdisplay, mode.vrefresh);
+		}
 		enc_id = gc.encoder_id ? gc.encoder_id : myenc;
 	}
 	if (!v->conn_id) { fprintf(stderr, "VOUT: 没有已连接的 connector\n"); goto fail; }
@@ -692,6 +750,14 @@ int vout_submit(struct vout *v, const int fd[2], unsigned w, unsigned h,
 
 		f.slot = pts_slot(v, pts, cur);
 		f.has_slot = 1;
+		if (getenv("VOUTDBG")) {
+			static int c;
+			if (c < 6 || (c % 50) == 0)
+				fprintf(stderr, "[sub] #%d pts=%.3f base=%.3f cur=%u slot=%u d=%ld t_first_ago=%.3f\n",
+					c, pts, v->pts_base, cur, f.slot,
+					(long)((long long)f.slot - (long long)cur), now_s() - v->t_first);
+			c++;
+		}
 		if ((long long)f.slot - (long long)cur > 2LL * v->refresh) {
 			/* 槽位远得离谱（pts 起点不是 0 之类）：重锚，否则队列
 			 * 会卡在这一张上等到天荒，后面的帧全被它堵死。 */
@@ -762,7 +828,15 @@ int vout_pump(struct vout *v, int timeout_ms)
 
 					/* 还没到点且不许等：停在这，交给下一次 pump。
 					 * 队首槽位最小（FIFO），停它就是停全部。 */
-					if (need > (int)left) break;
+					if (need > (int)left) {
+						if (getenv("VOUTDBG")) {
+							static int c;
+							if ((c++ % 30) == 0)
+								fprintf(stderr, "[pump] break qn=%d cur=%u slot=%u need=%d left=%.1f okv=%d\n",
+									v->qn, cur, f->slot, need, left, okv);
+						}
+						break;
+					}
 				}
 				if (vbl_wait_abs(v, f->slot) < 0) {
 					v->timeouts++;

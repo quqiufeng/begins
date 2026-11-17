@@ -111,6 +111,11 @@ voutprobe-aarch64: vout-selftest.c vout.c vout.h
 
 # HDR 色彩路径自检（纯数学：PQ/曲线/LUT/增益/矩阵，主机上直接跑，不需要设备）
 # 以前没有规则，只在命令行里手敲 cc —— 于是 hdrcolor.inc 改了没人回归。
+# 把 GL 片元的数学搬到 CPU 出对照图：改曲线/sat/knee 后肉眼验一遍，
+# 板子不在手边时唯一的"看图"手段。用法：./hcvisual out.ppm [target knee peak primaries]
+hcvisual: hcvisual.c $(PLAY_HDR)
+	$(CC_HOST) -O2 -Wall -Wextra -o $@ hcvisual.c -lm
+
 hdrselftest: hdr-selftest
 hdr-selftest: hdr-selftest.c $(PLAY_HDR)
 	$(CC_HOST) -O2 -Wall -Wextra -o $@ hdr-selftest.c -lm
@@ -124,4 +129,4 @@ clean:
 	      v4l2hevc-gl-aarch64 glout glout-aarch64 *.yuv \
 	      glselftest glselftest-aarch64 \
 	      aout aout-aarch64 aoutctl aoutctl-aarch64 aoutprobe-aarch64 \
-	      vout.o vout-aarch64.o voutprobe voutprobe-aarch64 raptest hdr-selftest
+	      vout.o vout-aarch64.o voutprobe voutprobe-aarch64 raptest hdr-selftest hcvisual

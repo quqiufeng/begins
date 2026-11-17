@@ -1582,6 +1582,7 @@ out:
 
 struct tmctx {
 	int on, curve, diag, built, full, noop, time_it, gmode;
+	int dither;		/* TMDITHER=0 关：A/B 比抖动效果用 */
 	int src_env;		/* TM_SRC_PEAK 显式给了：用户说了算，不再自动跟 SEI */
 	int src_auto;		/* 峰值是 SEI/兜底来的，SEI 到了要自己重建 LUT */
 	int sat_env;		/* TM_SAT 显式给了：用户说了算，不跟色域走 */
@@ -1672,6 +1673,11 @@ static void tm_build(void)
 	tm.knee = getenv("TM_KNEE") ? atof(getenv("TM_KNEE")) : 0.7;
 	tm.diag = getenv("TMDIAG") != NULL;
 	tm.noop = getenv("TMNOOP") != NULL;	/* 只读写不做变换：量带宽上限 */
+	{
+		const char *d = getenv("TMDITHER");
+
+		tm.dither = !(d && (!strcmp(d, "0") || !strcmp(d, "off")));
+	}
 	tm.time_it = getenv("TMTIME") != NULL;
 	tm.full = getenv("TM_FULL") != NULL;	/* 源是全范围（少见） */
 	{	/* TM_GAIN=code（默认/历史）| lin（线性光比值，暗部不掉色） */
@@ -1788,6 +1794,24 @@ static void tm_refresh(void)
 	tm_compile();
 }
 
+/* 8x8 有序（Bayer）阈值。LUT 把 220 个输入码压进 112 个输出码，高光段
+ * 更狠（knee=0.70 时 148..1000nits 只剩 36 个码，76 处相邻输入碰撞），
+ * 平坦渐变直接出带。在输出码上叠 ±1 LSB 有序抖动：一半像素 +1、一半 -1，
+ * 均值不变，一块 8x8 里能多辨约 1.6 bit 层次，代价是每像素两条饱和加减。
+ * 抖动放在查表之后（输出码域），不是输入索引——索引 ±1 对"5 个输入码
+ * 塌成一个输出码"毫无作用，只有抬输出电平才破得开。
+ */
+static const unsigned char hc_bayer8[8][8] = {
+	{ 0, 32,  8, 40,  2, 34, 10, 42}, {48, 16, 56, 24, 50, 18, 58, 26},
+	{12, 44,  4, 36, 14, 46,  6, 38}, {60, 28, 52, 20, 62, 30, 54, 22},
+	{ 3, 35, 11, 43,  1, 33,  9, 41}, {51, 19, 59, 27, 49, 17, 57, 25},
+	{15, 47,  7, 39, 13, 45,  5, 37}, {63, 31, 55, 23, 61, 29, 53, 21},
+};
+/* 三档：0..20 → -1，21..42 → 0，43..63 → +1，各档 21/22/21 个格子，
+ * 均值精确为 0。早先写成二档（全 ±1）平坦区会出固定棋盘纹——没有像素
+ * 停在原码，宁可让多数像素保持原码、少数偏一格。 */
+#define HC_DTH(th) ((th) < 21 ? -1 : (th) >= 43 ? 1 : 0)
+
 /* 就地映射一块 NV12（NV12M 两块 plane） */
 static void tm_apply(int idx, unsigned w, unsigned h)
 {
@@ -1885,9 +1909,26 @@ static void tm_apply(int idx, unsigned w, unsigned h)
 		const uint8x16_t c0 = vdupq_n_u8(0), c1 = vdupq_n_u8(1);
 		const uint8x16_t c2 = vdupq_n_u8(2), c3 = vdupq_n_u8(3);
 		const uint8x16_t m63 = vdupq_n_u8(63);
+		/* 抖动用：每行两条 16 像素的 0/1 掩码（Bayer 周期 8、重复两遍
+		 * 就够，因为 x 每次跨 16 且从 0 起，x&15 的模式每轮都一样）。
+		 * inc=这一格 +1，dec=这一格 -1，两者都不置位的格子保持原码。 */
+		const uint8x16_t clo = vdupq_n_u8(tm.full ? 0 : 16);
+		const uint8x16_t chi = vdupq_n_u8(tm.full ? 255 : 235);
+		unsigned char bm_inc[8][16], bm_dec[8][16];
+		int bi, bj;
+
+		for (bi = 0; bi < 8; bi++)
+			for (bj = 0; bj < 16; bj++) {
+				int t = hc_bayer8[bi][bj & 7];
+
+				bm_inc[bi][bj] = t >= 43;
+				bm_dec[bi][bj] = t < 21;
+			}
 
 		for (y = 0; y < h; y++) {
 			unsigned char *r = yp + (size_t)y * ystride;
+			const uint8x16_t inc = vld1q_u8(bm_inc[y & 7]);
+			const uint8x16_t dec = vld1q_u8(bm_dec[y & 7]);
 
 			for (x = 0; x + 16 <= w; x += 16) {
 				uint8x16_t v = vld1q_u8(r + x);
@@ -1907,10 +1948,23 @@ static void tm_apply(int idx, unsigned w, unsigned h)
 					c = vbslq_u8(vceqq_u8(hi, c3), d, c);
 					o = vbslq_u8(vceqq_u8(hi, c2), c, a);
 					o = vbslq_u8(vceqq_u8(hi, c0), vqtbl4q_u8(q0, idx), o);
+					if (tm.dither) {
+						o = vqaddq_u8(vqsubq_u8(o, dec), inc);
+						o = vminq_u8(vmaxq_u8(o, clo), chi);
+					}
 				}
 				vst1q_u8(r + x, o);
 			}
-			for (; x < w; x++) r[x] = tm.noop ? r[x] : tm.lut[r[x]];
+			for (; x < w; x++) {
+				int t;
+
+				if (tm.noop) continue;
+				t = tm.lut[r[x]];
+				if (tm.dither)
+					t += HC_DTH(hc_bayer8[y & 7][x & 7]);
+				r[x] = (unsigned char)(t < (tm.full ? 0 : 16) ? (tm.full ? 0 : 16)
+						       : t > (tm.full ? 255 : 235) ? (tm.full ? 255 : 235) : t);
+			}
 		}
 	} else
 #endif
@@ -1926,7 +1980,14 @@ static void tm_apply(int idx, unsigned w, unsigned h)
 					if (v > ymax) ymax = v;
 					ysum += v;
 				}
-				r[x] = tm.lut[v];
+				if (tm.dither) {
+					int t = tm.lut[v] + HC_DTH(hc_bayer8[y & 7][x & 7]);
+					int lo = tm.full ? 0 : 16, hi = tm.full ? 255 : 235;
+
+					r[x] = (unsigned char)(t < lo ? lo : t > hi ? hi : t);
+				} else {
+					r[x] = tm.lut[v];
+				}
 			}
 		}
 	}
@@ -3032,6 +3093,10 @@ int main(int argc, char **argv)
 				}
 				/* 时间轴在播放器手里：首帧锚点 + 帧号/配速。
 				 * pts 只用来让 Renderer 找上屏槽（它不改解码状态）。
+				 * 但只有"自己带节拍器"的后端才需要槽（RENDER_CAP_PACE）；
+				 * 没节拍器的后端（DRM 直出：submit 只入队不阻塞）由播放器
+				 * 按 pts 睡够了再交，这里再给 pts 反而会和墙钟错位——队首
+				 * 槽永远比当前 vblank 领先，pump 等不到就整场不上屏。
 				 */
 				/* 先标在飞再提交：后端可能就地回调（丢帧/同步后端），
 				 * 回调里 cap_recycle 会把它清掉，撤不回来就永远别再 QBUF。
@@ -3039,9 +3104,36 @@ int main(int argc, char **argv)
 				cap_busy[b.index] = 1;
 				rc = render_submit(rend, capbuf[b.index].dmabuf,
 						   capw, caph, capw, capw,
-						   g_play_fps > 0 ? t_play0 + got / g_play_fps : 0,
+						   (g_play_fps > 0 && render_has_pace(rend)) ?
+						   t_play0 + got / g_play_fps : 0,
 						   &capbuf[b.index]);
 				if (rc >= 0) {
+					static int yn;
+					if (getenv("YSTAT") && yn < 5 &&
+					    capbuf[b.index].mem[0]) {
+						unsigned char *yp8 = capbuf[b.index].mem[0];
+						size_t i, n = (size_t)capw * caph;
+						unsigned lo = 255, hi = 0;
+						unsigned long long sum = 0;
+						for (i = 0; i < n; i += 97) {
+							unsigned v = yp8[i];
+							if (v < lo) lo = v;
+							if (v > hi) hi = v;
+							sum += v;
+						}
+						printf("YSTAT #%d %ux%u ypitch=%u "
+						       "min=%u max=%u mean=%.1f\n",
+						       yn, capw, caph, capw, lo, hi,
+						       (double)sum / (double)((n + 96) / 97));
+						if (yn == 0) {
+							FILE *df = fopen("/tmp/y.raw", "wb");
+							if (df) {
+								fwrite(yp8, 1, n, df);
+								fclose(df);
+							}
+						}
+						yn++;
+					}
 					rendered = 1;	/* 交接成功：回收权归 Renderer */
 				} else {
 					cap_busy[b.index] = 0;
@@ -3061,6 +3153,11 @@ int main(int argc, char **argv)
 				if (due > nn)
 					usleep((useconds_t)((due - nn) * 1e6));
 			}
+			/* 每解出一帧就推一次：解码器一次 DQBUF 可能连吐多帧（DPB
+			 * 重排），pump 只在轮末调的话会把攒下的几帧在同一个 vblank
+			 * 里一次翻完——中间的等于白翻（算 miss），屏幕上是卡顿。 */
+			if (rend)
+				render_pump(rend, 0);
 			got++;
 			/* 自愈路径的确定性验证开关：FORCEREINIT=300 在第 300 帧
 			 * 主动走一遍"固件 hang → 整块复位 → 等 IRAP"流程，
@@ -3084,9 +3181,10 @@ int main(int argc, char **argv)
 			}
 		}
 
-		/* 推队列：按 pts 找槽、到点才翻。超时给 5ms，等 vblank 不空转 */
+		/* 兜底再推一次（每帧的那次在解帧处已经调过）：这里不阻塞，
+		 * 只把还没翻掉的一并清掉，免得轮末还挂着帧。 */
 		if (rend)
-			render_pump(rend, 5);
+			render_pump(rend, 0);
 
 		/* recycle output buffers */
 		for (;;) {

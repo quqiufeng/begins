@@ -43,6 +43,42 @@ ssh root@<box> /tmp/v4l2hevc-aarch64 /tmp/test720.265
 | `FRAMES` | 期望帧数，用于收尾校验 |
 | `SPSDBG` | 打印 SPS 解析中间值 |
 
+### 上屏播放（PLAY=1）
+
+解码和上屏是两条独立路径：**不设 `PLAY` 时进程只解码**，`render_open()`
+根本不会被调用，没有任何输出 plane，屏幕上什么都不变（YUV 全写进
+`/tmp/out.yuv`）。播放必须显式打开：
+
+```bash
+ffmpeg -v error -i <片源>.mkv -map 0:v:0 -c copy \
+       -bsf:v hevc_mp4toannexb -f hevc - \
+| PLAY=1 RENDER=gl NOWRITE=1 ./v4l2hevc-aarch64 -
+```
+
+| 变量 | 说明 |
+|---|---|
+| `PLAY` | **必填**，否则不走渲染路径，只解码落盘 |
+| `RENDER` | `auto` / `drm`（直出 plane）/ `gl`（GLES3 出图） |
+| `NOWRITE` | **播放时务必置位**：裸 YUV 落 `/tmp/out.yuv`，1080p 约 150 MB/s，1.9 G 的 tmpfs 十几秒就满 |
+| `FPS` / `LEAD` | 配速与领先量，默认 24 / 6；`NOPACE` 关节拍 |
+| `TMDITHER=0` | 关有序抖动（A/B 比效果用） |
+
+`mkv` 是 length-prefixed，要喂 `-bsf:v hevc_mp4toannexb` 转 Annex-B
+（或 `-f hevc`），否则首包没有 start code，SPS 都读不出来。
+
+启动日志里这两行就是"上屏成功"的判据：
+
+```
+PLAY: plane=43 收 NV12 (10 种格式) crtc=0
+RENDER: mode=gles tonemap=cpu src=3840x1600
+```
+
+再对一眼内核态 plane 归属，`allocated by` 是播放器进程而不是 `[fbcon]`：
+
+```bash
+head -4 /sys/kernel/debug/dri/0/state    # plane[40]: allocated by = v4l2hevc-aarch6
+```
+
 ## 设计要点
 
 - 一个 AU 一个 OUTPUT buffer，驱动靠 `vififo offset` 与 `sess->timestamps` 匹配帧。
@@ -80,6 +116,22 @@ SOURCE_CHANGE 回调、退出路径）一律不许自己拼 `stop_stream + close
 2. **dump 按 stride 逐行写**，原因见上。
 3. `timeout -s KILL` 会在 fwrite 途中杀进程，造成最后一帧看起来"不一致"，
    比对时不要用它。
+4. **忘了 `PLAY=1` 会被误判成"驱动没拿到 DRM"**：日志里没有 `RENDER:` 行、
+   `/sys/kernel/debug/dri/0/state` 里 plane 仍归 `[fbcon]`，看起来像没抢到
+   主控；实际是渲染后端压根没建。先查 `PLAY`，再查 DRM。
+5. **primary plane 要用 ADDFB2 的 ARGB8888**：legacy `ADDFB(bpp=32,depth=24)`
+   推出的是 XRGB8888，alpha 位被忽略，全 0 缓冲照样是不透明黑，把下面
+   overlay 完全盖住。meson primary 的 `normalized-zpos=1` 高于 overlay(0)。
+6. **vblank 序号不能靠 meson 驱动**：`drm_vblank_count()` 只在有人等 vblank
+   时才随中断更新，而调度恰是"先读序号再决定等不等" → 序号冻住 → 永远判定
+   没到点 → 从不 WAIT_VBLANK，卡死在同一帧（屏全黑、shown=0）。改用
+   `CLOCK_MONOTONIC × refresh` 合成同节奏序号。
+7. **DRM 直出后端不要声明 `RENDER_CAP_PACE`**：`vout_submit` 只入队不阻塞，
+   声明了 PACE 播放器就撒手不管，帧按供流速度灌进 3 格队列、每轮被顶掉，
+   `shown=0`。节拍必须由播放器按 pts 睡出来。
+8. **connector 只认 `connected`**：X96 上 card0 同时挂 Composite-1（CVBS，
+   status=unknown）和 HDMI-A-1，前者排前面且带 720x576i 模式。只看
+   `count_modes` 会选中 CVBS → 输出 720x576@50、HDMI 全黑、vout 队列堵死。
 
 ## 验证结论（2026-11-16，X96Max / meson-vdec）
 
@@ -100,3 +152,18 @@ SOURCE_CHANGE 回调、退出路径）一律不许自己拼 `stop_stream + close
 ```
 
 写盘模式受 IO 限制约 30 fps，与硬解能力无关。
+
+### 上屏播放实机数据（2026-11-17，X96Max + GLES3 + 2560x1440@60）
+
+片源 `Sicario.Day.of.the.Soldado 2160p HEVC 10bit HDR`（3840x1600），
+`PLAY=1 RENDER=gl NOWRITE=1` 直连 ffmpeg 管道：
+
+```
+PLAY: plane=43 收 NV12 (10 种格式) crtc=0
+PLAY: scale=fit  src=3840x1600 -> 2560x1067 @ +0+186 (screen 2560x1440)
+HB t=10 au=237 got=234      ← 23.7 fps
+HB t=20 au=477 got=474      ← 23.9 fps（片源 23.976）
+```
+
+掉帧 0，`out_nfree=8/8` 常驻，`plane[40] allocated by = v4l2hevc-aarch6`（comm 只取前 15 字节）。
+HDR 源在该后端走 CPU 色调映射（日志 `tonemap=cpu`），4K 输入仍能满帧。

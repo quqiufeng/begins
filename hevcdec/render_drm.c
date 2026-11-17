@@ -133,7 +133,10 @@ static void drm_stats(struct renderer *r, struct render_stats *st)
 
 const struct render_ops render_ops_drm = {
 	.name = "drm",
-	.caps = RENDER_CAP_PACE,	/* SDR only；但自己排 vblank 槽 */
+	/* 不声明 PACE：vout_submit 只入队、不阻塞，节拍必须由播放器按 pts 睡
+	 * 出来。早先这里声明了 PACE，播放器就撒手不管，帧按 ffmpeg 供流速度灌
+	 * 进 3 格队列、每轮都被顶掉，屏上一帧都上不去（shown=0）。 */
+	.caps = 0,
 	.probe = drm_probe,
 	.init = drm_init,
 	.submit = drm_submit,
