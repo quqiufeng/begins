@@ -34,8 +34,8 @@ GL_LIBS  := $(CROSSLIB)/libEGL.so.1 $(CROSSLIB)/libGLESv2.so.2 $(CROSSLIB)/libgb
 GL_CFLAGS := -O2 -Wall -Wformat
 
 # 播放器 = 主循环 + Renderer 分发 + 两个后端 + vout
-PLAY_SRC := v4l2hevc.c spscolor.c render.c render_drm.c render_gl.c vout.c aout.c pctl.c
-PLAY_HDR := render.h vout.h hdrcolor.inc csig.h spscolor.h aout.h pctl.h
+PLAY_SRC := v4l2hevc.c spscolor.c render.c render_drm.c render_gl.c vout.c aout.c pctl.c osd.c
+PLAY_HDR := render.h vout.h hdrcolor.inc csig.h spscolor.h aout.h pctl.h osd.h
 
 .PHONY: all clean drm gl vout voutprobe glselftest aout aoutprobe hdrselftest mpvctl rcd
 
@@ -62,8 +62,8 @@ GLSELF := glselftest-aarch64
 
 glselftest: $(GLSELF)
 
-$(GLSELF): gl-selftest.c glout.c $(GL_LIBS)
-	aarch64-linux-gnu-gcc $(GL_CFLAGS) -DGLOUT_NO_MAIN -o $@ gl-selftest.c glout.c \
+$(GLSELF): gl-selftest.c glout.c osd.c $(PLAY_HDR) $(GL_LIBS)
+	aarch64-linux-gnu-gcc $(GL_CFLAGS) -DGLOUT_NO_MAIN -o $@ gl-selftest.c glout.c osd.c \
 	  -idirafter /usr/include -idirafter /usr/include/libdrm -lm $(GL_LIBS)
 
 # aout: 独立音频输出模块（裸 ALSA ioctl，不用 mpv/libasound 做输出）
@@ -123,6 +123,10 @@ voutprobe: vout-selftest.c vout.c vout.h
 voutprobe-aarch64: vout-selftest.c vout.c vout.h
 	aarch64-linux-gnu-gcc -O2 -Wall -Wextra -static -o $@ vout-selftest.c vout.c -lm
 
+# 提示条离线自检（osd.c 的同一份代码烘 PPM，改文案/字形后肉眼看一遍）
+osdtest: osd-selftest.c osd.c osd.h
+	$(CC_HOST) -O2 -Wall -Wextra -o $@ osd-selftest.c osd.c -pthread
+
 # HDR 色彩路径自检（纯数学：PQ/曲线/LUT/增益/矩阵，主机上直接跑，不需要设备）
 # 以前没有规则，只在命令行里手敲 cc —— 于是 hdrcolor.inc 改了没人回归。
 # 把 GL 片元的数学搬到 CPU 出对照图：改曲线/sat/knee 后肉眼验一遍，
@@ -144,4 +148,4 @@ clean:
 	      glselftest glselftest-aarch64 \
 	      aout aout-aarch64 aoutctl aoutctl-aarch64 aoutprobe-aarch64 \
 	      mpvctl mpvctl-aarch64 rcinputd rcinputd-aarch64 \
-	      vout.o vout-aarch64.o voutprobe voutprobe-aarch64 raptest hdr-selftest hcvisual
+	      vout.o vout-aarch64.o voutprobe voutprobe-aarch64 raptest hdr-selftest hcvisual osdtest osd.ppm

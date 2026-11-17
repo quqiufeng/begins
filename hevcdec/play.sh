@@ -7,6 +7,11 @@
 #   ./play.sh -d 片子.mkv                 # 后台放，然后 ./play.sh status 看进度
 #   ./play.sh pause / resume / stop / status
 #
+#   # NAS 上的片子：参数给 NAS 上完整的路径，认证从 .env 里取，不落地直接播
+#   ./play.sh /sata11-18072858035/av/Unpai/xxx.mp4
+#   ./play.sh -n /sata11-18072858035/av/Unpai/xxx.mp4    # -n 只看解析结果，不放
+#   （.env 里要 WEBDAV_URL / WEBDAV_USER / WEBDAV_PASS，见 docs/playback.md）
+#
 # 电影就是「ffmpeg 供流 | 播放器解码上屏」一条管道，这个脚本只做四件事：
 # 拼管道、管进程组、清理旧实例、把状态写进 /tmp/play.*。
 #
@@ -34,9 +39,110 @@ AFIFO=${AFIFO:-/tmp/play.afifo}  # ffmpeg 写 PCM 的管道，内建 aout 从这
 AUDIO_BUF=${AUDIO_BUF:-16384}
 AUDIO_PERIOD=${AUDIO_PERIOD:-4096}
 DEBUG=0
+DRYRUN=0                      # -n：只解析片源/打印命令，不播
 
 enc() { printf '%s' "$1" | base64 -w0 2>/dev/null || printf '%s' "$1" | base64 | tr -d '\n'; }
 dec() { printf '%s' "$1" | base64 -d 2>/dev/null; }
+
+# ── NAS 片源（.env）──────────────────────────────────────────
+# 片源不必先下载、也不必手拼 URL：参数给 NAS 上的完整路径就够，
+# 脚本按 .env 里的 WEBDAV_URL / WEBDAV_USER / WEBDAV_PASS 自己拼出带认证的
+# http 源。认证只能内嵌在 URL 里 —— ffmpeg 的 http 协议没有 user/password
+# 选项，盒子上也没有 curl 可用（tvplay.sh 用的是同一个写法）。
+_SDIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+ENVF=${PLAY_ENV:-}          # 显式指定 .env 时优先（PLAY_ENV=/path/.env play.sh ...）
+
+env_find() {                # .env 查找顺序：指定的 → cwd 向上 → 脚本目录向上 → ~/.env
+	[ -n "$ENVF" ] && return 0
+	_d=$(pwd)
+	while :; do
+		[ -r "$_d/.env" ] && { ENVF=$_d/.env; return 0; }
+		[ "$_d" = / ] && break
+		_d=$(dirname "$_d")
+	done
+	_d=${_SDIR:-.}
+	while :; do
+		[ -r "$_d/.env" ] && { ENVF=$_d/.env; return 0; }
+		[ "$_d" = / ] && break
+		_d=$(dirname "$_d")
+	done
+	for _d in "$HOME/.config/lite/.env" "$HOME/.env"; do
+		[ -r "$_d" ] && { ENVF=$_d; return 0; }
+	done
+	return 1
+}
+
+# 只认 KEY=VALUE 单行：值可以带 '...' "..."，也可以裸写后用 # 注释。
+# 不 source 整个 .env —— 那是给 mpv/tvplay 用的杂物清单，里面有裸空格值，
+# 一把 . 进来就会把 set -u 的 play.sh 打崩。
+env_get() {	# env_get <KEY>
+	[ -n "$ENVF" ] || return 0
+	_v=$(sed -n "s/^[[:space:]]*$1=//p" "$ENVF" 2>/dev/null | tail -n 1)
+	case "$_v" in
+	\'*) _v=${_v#\'}; _v=${_v%%\'*} ;;
+	\"*) _v=${_v#\"}; _v=${_v%%\"*} ;;
+	*)   _v=${_v%%#*}; _v=$(printf '%s' "$_v" | sed 's/[[:space:]]*$//') ;;
+	esac
+	printf '%s' "$_v"
+}
+
+nas_setup() {	# 环境变量优先，其次 .env；缺 WEBDAV_URL 就返回 1
+	[ -n "${NAS_READY:-}" ] && return 0
+	env_find
+	NAS_URL=${WEBDAV_URL:-$(env_get WEBDAV_URL)}
+	NAS_USER=${WEBDAV_USER:-$(env_get WEBDAV_USER)}
+	NAS_PASS=${WEBDAV_PASS:-$(env_get WEBDAV_PASS)}
+	NAS_ROOT=${WEBDAV_MOVIES:-$(env_get WEBDAV_MOVIES)}
+	NAS_READY=1
+	[ -n "$NAS_URL" ] || return 1
+	return 0
+}
+
+# 逐字节百分号编码：保留 unreserved 和 / 和 %，中文/空格/@ 都转 %XX。
+# % 保留是故意的 —— NAS 的 WebDAV href 本来就是 %E5%B0%8F... 这种已编码形式，
+# 再转一遍就成了 %25E5（404）。裸路径里真带 % 的片子名极罕见，认了。
+url_enc() {
+	printf '%s' "$1" | od -An -tu1 -v | tr -s ' \n' '  ' |
+		awk '{ for (i = 1; i <= NF; i++) {
+			c = $i + 0
+			if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+			    c == 45 || c == 46 || c == 95 || c == 126 || c == 47 || c == 37) printf "%c", c
+			else printf "%%%02X", c } }'
+}
+
+# <host:port>/<path> → http://user:pass@host:port/<enc(path)>
+dav_url() {
+	_hp=$1
+	_hp=${_hp#http://}; _hp=${_hp#https://}
+	_h=${_hp%%/*}
+	case "$_hp" in */*) _p=/${_hp#*/} ;; *) _p= ;; esac
+	printf 'http://%s:%s@%s%s' "$NAS_USER" "$NAS_PASS" "$_h" "$(url_enc "$_p")"
+}
+
+# 片源解析：本地文件 > 显式 URL > NAS 完整路径。
+# 判据是「文件在本地存不存在」—— 盒子上不可能有 /sata11-... 这个目录，
+# 所以这种绝对路径必然是 NAS 上的。
+resolve_src() {
+	case "$SRC" in
+	http://*|https://*|rtsp://*|rtmp://*|udp://*|tcp://*|ftp://*) return 0 ;;
+	dav://*)	# dav://host:port/path 直接给完整地址（认证仍然从 .env 来）
+		nas_setup || return 0
+		SRC=$(dav_url "${SRC#dav://}")
+		SRC_REMOTE=1
+		return 0
+		;;
+	esac
+	[ -f "$SRC" ] && return 0	# 本地文件优先
+	nas_setup || return 0		# 没配 NAS：原样留给后面报「片源不存在」
+	case "$SRC" in
+	nas:*) _p=${NAS_ROOT}${SRC#nas:} ;;	# nas:/av/x.mp4 = 相对 WEBDAV_MOVIES
+	/*)    _p=$SRC ;;
+	*)     return 0 ;;
+	esac
+	SRC=$(dav_url "${NAS_URL#http://}$_p")
+	SRC_REMOTE=1
+	return 0
+}
 
 usage() {
 	cat <<EOF
@@ -45,6 +151,8 @@ usage() {
       play.sh key <动作>      # 遥控器入口：toggle/fwd/back/fwdmore/backmore/volup/voldn/mute/quit
 
 片源可以是 mkv/mp4/ts（走 ffmpeg 解封装）或裸流 .265/.h265/.hevc（直接喂）。
+也可以给 NAS 上完整的路径（/sata11-.../av/xxx.mp4，或 nas:/av/xxx.mp4），
+认证从 .env 的 WEBDAV_URL/WEBDAV_USER/WEBDAV_PASS 取，不落地直接播。
 
 选项：
   -r gl|drm|auto  上屏后端（默认 $RENDER）
@@ -54,12 +162,72 @@ usage() {
   -B <路径>       播放器二进制（默认 $BIN）
   -d              后台放，立即返回（配 status/pause/stop 用）
   -v              前台同时 tail 日志
+  -n              只把片源解析成最终 URL/命令打出来，不播（查 .env 对不对）
   -h              本帮助
 EOF
 }
 
 die() { echo "play.sh: $*" >&2; exit 1; }
 say() { echo "play.sh: $*"; }
+
+# ── fbcon 让位 ───────────────────────────────────────────────
+# seek/fwd 不是原地跳，而是整条链重开：旧进程退出 → DRM master 释放 →
+# 内核的 fbdev 客户端立刻把 mesondrmfb 里的 tty1 文本重新推上主 plane，
+# 屏幕上就是「命令行界面」一闪；按住快进连发时反复闪。
+# 实测（dri/0/state + fbcon 绑/解绑对照）：解绑 fbcon 后，master 释放时
+# 没人来抢屏，主 plane 继续引用最后那个 fb → 间隙里画面「冻结在上一帧」，
+# 连发 5 次只有 1 帧 10ms 的空档，一帧不黑、不掉文本。
+# 代价：解绑期间 HDMI/串口上没有内核 console（日志照样进 $LOG），
+#       所以停止/退出必须 rebind，否则崩了就没命令行可看。
+vtcon_bind() {
+	for _b in /sys/class/vtconsole/vtcon*/bind; do
+		[ -e "$_b" ] || continue
+		case "$(cat "${_b%/*}/name" 2>/dev/null)" in
+		*frame*|*[Ff]bcon*) printf '%s' "$_b"; return 0 ;;
+		esac
+	done
+	return 1
+}
+
+fbcon_hold() {
+	_b=$(vtcon_bind) || return 0
+	[ "$(cat "$_b" 2>/dev/null)" = 0 ] && return 0
+	[ -w "$_b" ] || { say "提示：$_b 不可写，seek 间隙可能闪回命令行"; return 0; }
+	echo 0 > "$_b" 2>/dev/null && say "fbcon 已解绑（seek 间隙不再闪回命令行）"
+	return 0
+}
+
+fbcon_release() {
+	_b=$(vtcon_bind) || return 0
+	[ "$(cat "$_b" 2>/dev/null)" = 1 ] && return 0
+	echo 1 > "$_b" 2>/dev/null && say "fbcon 已重新绑定（命令行恢复）"
+	return 0
+}
+
+# 看门狗：播放器崩了/被 kill -9 时没人执行 stop，命令行会一直黑着。
+# 连续 8s 见不到播放器才 rebind —— seek 重开的间隙只 ~1s，不会误触。
+fbcon_watch() {
+	_b=$(vtcon_bind) || return 0
+	[ -w "$_b" ] || return 0
+	_wd=/tmp/play.fbcon.wd
+	if [ -f "$_wd" ] && kill -0 "$(cat "$_wd" 2>/dev/null)" 2>/dev/null; then
+		return 0
+	fi
+	setsid sh -c '
+n=0
+while :; do
+	sleep 1
+	if pgrep -x v4l2hevc-aarch6 >/dev/null 2>&1 || \
+	   pgrep -x v4l2hevc >/dev/null 2>&1 || \
+	   pgrep -x mpv >/dev/null 2>&1; then n=0
+	else
+		n=$((n + 1))
+		[ "$n" -ge 8 ] && { echo 1 > "'"$_b"'"; exit 0; }
+	fi
+done' </dev/null >/dev/null 2>&1 &
+	echo $! > "$_wd"
+	return 0
+}
 
 # ── 进程组操作 ───────────────────────────────────────────────
 # 整条管道（ffmpeg + 播放器）用 setsid 起成独立进程组，
@@ -117,11 +285,14 @@ cleanup_old() {
 # ── 播放 ─────────────────────────────────────────────────────
 do_play() {
 	SRC=$1
+	SRC_REMOTE=0
+	resolve_src		# NAS 完整路径 → 带认证的 http 源（本地文件/显式 URL 原样）
 	case "$SRC" in
 	http://*|https://*|rtsp://*) ;;
-	*) [ -f "$SRC" ] || [ -r "$SRC" ] || die "片源不存在：$SRC" ;;
+	*) [ -f "$SRC" ] || [ -r "$SRC" ] || die "片源不存在：$SRC$(
+		case "$SRC_REMOTE" in 1) echo "（NAS 地址已解析，检查 .env 的 WEBDAV_*）" ;; esac)" ;;
 	esac
-	[ -x "$BIN" ] || die "找不到播放器：$BIN（scp 到盒子上，或用 -B 指定）"
+	[ -x "${BIN:-/tmp/v4l2hevc-aarch64}" ] || die "找不到播放器：$BIN（scp 到盒子上，或用 -B 指定）"
 
 	case "$SS" in ''|*[!0-9.]*) die "起播秒不是数字：$SS" ;; esac
 	case "$DUR" in ''|*[!0-9.]*) die "时长不是数字：$DUR" ;; esac
@@ -130,6 +301,14 @@ do_play() {
 	case "$SRC" in
 	*.265|*.h265|*.hevc|*.bin) NAKED=1 ;;
 	*) NAKED=0 ;;
+	esac
+	# NAS 上读片：网络抖一下不该整条链卡死（默认 rw_timeout 是无限等）。
+	# -reconnect* 只对 http 输入有意义，本地文件加上也无害。
+	HTTP_OPT=""
+	case "$SRC" in
+	http://*|https://*)
+		HTTP_OPT="-rw_timeout 15000000 -reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_delay_max 4"
+		;;
 	esac
 	# 裸流没有时间戳，不能 seek：宁可拒绝，也别让人以为"跳过去了"
 	if [ "$NAKED" = 1 ] && [ "$SS" != "0" ] && [ "$SS" != "0.0" ]; then
@@ -143,6 +322,19 @@ do_play() {
 	case "$SCALE"  in fit|fill|crop) ;; *) die "SCALE 只能是 fit/fill/crop" ;; esac
 	case "$AUDIO"  in 0|1) ;; *) die "AUDIO 只能是 0/1" ;; esac
 
+	# -n：只验片源解析（.env 对不对、URL 通不通），不碰屏也不杀旧实例
+	if [ "$DRYRUN" = 1 ]; then
+		_safe=$(printf '%s' "$SRC" | sed 's#://\([^:/@]*\):[^@]*@#://\1:***@#')
+		printf '片源：%s\n' "$_safe"
+		[ "$SRC_REMOTE" = 1 ] && printf '来源：NAS %s（认证取 %s）\n' "$NAS_URL" "${ENVF:-环境变量}"
+		printf '播放器：%s\n' "${BIN:-/tmp/v4l2hevc-aarch64}"
+		printf '命令：ffmpeg -re %s-i "%s" -map 0:v:0 -c:v copy -f hevc - | %s -\n' \
+			"${SS:+-ss $SS }" "$_safe" "${BIN:-/tmp/v4l2hevc-aarch64}"
+		return 0
+	fi
+
+	fbcon_hold          # 必须在 cleanup_old 之前：老实例退出那一刻就要没人来抢屏
+	fbcon_watch
 	cleanup_old
 	: > "$LOG"
 
@@ -175,6 +367,10 @@ do_play() {
 			AF="-map 0:a:0 -f s16le -ar 48000 -ac 2 $AFIFO"
 		else
 			say "片源没有音轨，只放画面"
+			# 电视上看不见终端：屏幕上也得说一句，否则"按音量键没反应"，
+			# 用户会以为遥控器坏了（其实是没音轨，音量本就无处可调）。
+			PLAY_OSD="${PLAY_OSD:+$PLAY_OSD  ·  }无音轨 只放画面"
+			export PLAY_OSD
 		fi
 	fi
 
@@ -182,7 +378,7 @@ do_play() {
 	# set -f：关掉通配，$AF 里的 `0:a:0` 之类不会被当 glob 展开。
 	# AUDIO_FIFO 直接 export：写成 `${X:+AUDIO_FIFO=...}` 那个赋值不会生效，
 	# 展开出来的是一个「命令名」，报 AUDIO_FIFO=/tmp/play.afifo: not found。
-	export SRC SS DUR DA NAKED BIN LOG RENDER SCALE AFIFO_USE SOCK AUDIO
+	export SRC SS DUR DA NAKED BIN LOG RENDER SCALE AFIFO_USE SOCK AUDIO HTTP_OPT
 	if [ -n "$AFIFO_USE" ]; then export AUDIO_FIFO="$AFIFO_USE"; else unset AUDIO_FIFO; fi
 	export AUDIO_BUF AUDIO_PERIOD
 	[ -n "$FPS" ] && export FPS
@@ -195,10 +391,10 @@ if [ "$NAKED" = 1 ]; then
 	cat "$SRC"
 else
 	ffmpeg -hide_banner -loglevel warning -nostdin -y -re \
-		${SS:+-ss "$SS"} $DA \
+		${SS:+-ss "$SS"} $DA $HTTP_OPT \
 		-i "$SRC" -map 0:v:0 -c:v copy -f hevc - $AF 2>>"$LOG"
 fi | PLAY=1 NOWRITE=1 RENDER="$RENDER" SCALE="$SCALE" PLAY_SOCK="$SOCK" \
-	"$BIN" - >>"$LOG" 2>&1'
+	"${BIN:-/tmp/v4l2hevc-aarch64}" - >>"$LOG" 2>&1'
 
 	# </dev/null：不然 ssh 远端起播时子进程握着 stdin，ssh 永远等不到 EOF
 	# 外层 sh 也要重定向：否则它握着调用者的 stdout，ssh 远端起播会一直等 EOF
@@ -225,8 +421,9 @@ fi | PLAY=1 NOWRITE=1 RENDER="$RENDER" SCALE="$SCALE" PLAY_SOCK="$SOCK" \
 
 	# SRC/SOCK/AUDIO 都要写进 state：遥控器 seek 要整条链重开，
 	# 重启参数只能从 state 里取（播放进程自己不记得是从哪部片子来的）。
+	umask 077	# state 里存着带凭据的源地址（SRCB64），别人别读
 	{
-		printf 'VPID=%s\nAPID=%s\nSS=%s\nDUR=%s\nBIN=%s\n' "$VPID" "$APID" "$SS" "$DUR" "$BIN"
+		printf 'VPID=%s\nAPID=%s\nSS=%s\nDUR=%s\nBIN=%s\n' "$VPID" "$APID" "$SS" "$DUR" "${BIN:-/tmp/v4l2hevc-aarch64}"
 		printf 'LOGF=%s\nSOCK=%s\nAUDIO=%s\nRENDER=%s\nSCALE=%s\nFPS=%s\n' \
 			"$LOG" "$SOCK" "$AUDIO" "$RENDER" "$SCALE" "${FPS:-}"
 		printf 'SRCB64=%s\n' "$(enc "$SRC")"
@@ -298,6 +495,7 @@ do_stop() {
 		group_sig KILL "${VPID:-}"
 	fi
 	rm -f "$STATE"
+	fbcon_release        # 停止后把命令行还给人
 	say "已停止"
 }
 
@@ -352,6 +550,18 @@ do_status() {
 #   ① 重开参数全从 state 取（SRC/SOCK/AUDIO/RENDER/SCALE/FPS）；
 #   ② 3s 内的重复 seek 直接丢弃 —— 按住 ▶ 的连发会在松开后逐个补跑，
 #      表现就是「按一下，画面消失半天」。
+# 秒 → 屏幕上的位置：>1h 给 h:mm:ss，否则 mm:ss
+fmt_pos() {
+	_t=${1:-0}
+	case "$_t" in ''|*[!0-9]*) _t=0 ;; esac
+	_h=$((_t / 3600)); _m=$(((_t % 3600) / 60)); _s=$((_t % 60))
+	if [ "$_h" -gt 0 ]; then
+		printf '%d:%02d:%02d' "$_h" "$_m" "$_s"
+	else
+		printf '%02d:%02d' "$_m" "$_s"
+	fi
+}
+
 seek_guard() {
 	_s=/tmp/play.seek.stamp
 	_n=$(date +%s); _p=$(cat "$_s" 2>/dev/null || echo 0)
@@ -412,6 +622,10 @@ do_key() {
 		say "跳到 ${T}s（原 ${P}s，偏移 $D）"
 		SRC=$(dec "${SRCB64:-}")
 		[ -n "$SRC" ] || { say "state 里没有片源，无法重开"; return 1; }
+		# 新实例起来先报一句"跳到哪儿了"：seek 期间屏幕黑 ~1s，
+		# 没有这句用户分不清"按上了"和"没反应"。
+		PLAY_OSD="位置 $(fmt_pos "$T")"
+		export PLAY_OSD
 		setsid sh "$0" -d -a "${AUDIO:-1}" -r "${RENDER:-gl}" -s "${SCALE:-fit}" \
 			${FPS:+-f "$FPS"} -B "${BIN:-/tmp/v4l2hevc-aarch64}" \
 			"$SRC" "$T" "$_r" >/dev/null 2>&1 </dev/null
@@ -443,13 +657,14 @@ pause|resume|stop|status|log|key)
 esac
 
 BACKGROUND=0
-while getopts 'r:s:f:a:B:dvHh' _o 2>/dev/null; do
+while getopts 'r:s:f:a:B:dnvHh' _o 2>/dev/null; do
 	case "$_o" in
 	r) RENDER=$OPTARG ;;
 	s) SCALE=$OPTARG  ;;
 	f) FPS=$OPTARG    ;;
 	a) AUDIO=$OPTARG  ;;
 	B) BIN=$OPTARG    ;;
+	n) DRYRUN=1       ;;	# 只解析片源，不播
 	d) BACKGROUND=1   ;;
 	v) DEBUG=1        ;;
 	h) usage; exit 0  ;;
@@ -464,6 +679,7 @@ SS=${2:-0}
 DUR=${3:-0}
 
 do_play "$SRC" || exit 1
+[ "$DRYRUN" = 1 ] && exit 0     # -n 只看解析结果，没有进程要等
 
 if [ "$BACKGROUND" = 1 ]; then
 	say "后台运行，PID $VPID（./play.sh status 查看，stop 停止）"

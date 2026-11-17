@@ -8,6 +8,7 @@ raptest
 hdr-selftest
 hdrtest
 csigtest
+osdtest
 
 # 交叉编译用的盒子设备库（libEGL/libGLESv2/libdrm 等，来自设备 rootfs，不可再分发）
 crosslib/

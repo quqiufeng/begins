@@ -31,6 +31,7 @@
 /* 一个播放器，两种 Renderer：上屏方式在 render_*.c 里，播放器不认识它们 */
 #include "render.h"
 #include "aout.h"	/* 内嵌音频输出（-DAOUT_EMBED 编进来，不再单独一个二进制） */
+#include "osd.h"	/* 音量/暂停提示条：pctl 写，gl 后端合成到画面 */
 #include "pctl.h"	/* 内置控制口 /tmp/play.sock + evdev 遥控（替代 mpvctl/rcinputd） */
 
 /* 内容信号（SEI 里的 maxCLL / mastering display）。这个 TU 出强定义，
@@ -2946,6 +2947,11 @@ int main(int argc, char **argv)
 		 * 也就不会再有"冻住过"那种要靠 HERE 时钟猜的误判。
 		 */
 		if (pctl_paused()) {
+			/* 暂停时没有新帧，提示条只能靠补画出现/擦掉：
+			 * 不补，冻住的那一帧会把"|| 暂停"永远挂在屏幕上。
+			 */
+			if (osd_poll_dirty())
+				render_repaint(rend);
 			usleep(20000);
 			continue;
 		}
@@ -3171,6 +3177,11 @@ int main(int argc, char **argv)
 		if (pr == 0) {
 			poll_timeouts++;
 			idle_ticks++;
+			/* 播放中但暂时没新帧（供流打嗝/门控等待）：提示条到期
+			 * 也要擦掉，否则最后那一帧会被永久烙在画面上。
+			 */
+			if (osd_poll_dirty())
+				render_repaint(rend);
 			if (g_verbose && poll_timeouts <= 3)
 				printf("poll timeout #%d au=%d/%d out_nfree=%d got=%d\n",
 				       poll_timeouts, au_idx, g_stream_au, out_nfree, got);

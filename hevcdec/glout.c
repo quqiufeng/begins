@@ -28,7 +28,10 @@
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
 #include "perfstat.h"
+#include "osd.h"
 typedef void (*pfn_image_tex)(GLenum, void *);
+int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
+		unsigned ypitch, unsigned cpitch);
 
 static double now_s(void)
 {
@@ -536,6 +539,16 @@ static struct {
 	unsigned rw, rh;
 	unsigned frames;
 	double t_gl;
+	/* OSD 叠加层：纹理只在内容版本号变了才重传（按键时才变，逐帧重传
+	 * 一行字也要一次 glTexImage2D，没必要）。gen 来自 osd_gen()。
+	 */
+	GLuint prog_osd, tex_osd;
+	unsigned osd_gen, osd_w, osd_h;
+	/* 上一帧的入参：暂停时没有新帧，但提示条要到点消失/按键要出现，
+	 * 得拿同一块 dma-buf 重画一遍（纹理按 fd 复用，不重导入）。
+	 */
+	int last_fy, last_fc, have_last;
+	unsigned last_w, last_h, last_yp, last_cp;
 } g;
 
 /* 收一次 GPU 完成时间。perf 开时 glFinish 把它变成真实耗时——不加 glFinish
@@ -633,6 +646,17 @@ static const char *FS_COPY =
 	"in vec2 vUV;\n"
 	"out vec4 oCol;\n"
 	"void main(){ oCol = vec4(texture(uTex, vUV).rgb, 1.0); }\n";
+
+/* OSD：一行提示的 RGBA 位图（真 alpha，底条半透明），按 src_alpha 混上去。
+ * 和画面 pass 分开编一个程序：片元里不做色彩变换，提示条不该跟着 HDR 走。
+ */
+static const char *FS_OSD =
+	"#version 300 es\n"
+	"precision mediump float;\n"
+	"uniform sampler2D uTex;\n"
+	"in vec2 vUV;\n"
+	"out vec4 oCol;\n"
+	"void main(){ oCol = texture(uTex, vUV); }\n";
 
 /* 复用调用方已打开的 DRM fd（master 只能有一个，另开 fd 会 SetCrtc EACCES） */
 void glout_set_drm_fd(int fd)
@@ -1014,6 +1038,80 @@ static uint32_t bo_to_fb(struct gbm_bo *bo)
 /* ---------- 画一帧 ---------- */
 
 /* 两遍渲染：pass1 源分辨率全功能色调映射 → 纹理；pass2 纹理整屏放大 */
+/* 画提示条：底部居中再往左偏一点（电视过扫描不留边）。
+ * 位置按屏幕高度缩放，1080p 上就是烘出来的原尺寸。
+ */
+static void osd_draw(void)
+{
+	int W, H, m;
+	unsigned qw, qh, qx, qy;
+	double k;
+	unsigned char *px;
+
+	if (!osd_active())
+		return;
+	if (!g.prog_osd) {
+		g.prog_osd = mk_prog(VS, FS_OSD);
+		if (!g.prog_osd)
+			return;
+		glGenTextures(1, &g.tex_osd);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, g.tex_osd);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		g.osd_gen = 0;
+	}
+	if (osd_gen() != g.osd_gen) {
+		px = osd_rgba(&W, &H);
+		if (!px)
+			return;
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, g.tex_osd);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA,
+			     GL_UNSIGNED_BYTE, px);
+		free(px);
+		g.osd_w = (unsigned)W;
+		g.osd_h = (unsigned)H;
+		g.osd_gen = osd_gen();
+		/* 一行日志：屏幕上有没有提示条，只有这里能看出来（fb0 是死图，
+		 * 取画面要读 plane 的 GBM buffer，盒子上一时半会儿拿不到） */
+		printf("OSD: 上屏 %dx%d\n", W, H);
+		fflush(stdout);
+	}
+	if (!g.osd_w || !g.osd_h)
+		return;
+	k = (double)g.dh / 1080.0;
+	qw = (unsigned)(g.osd_w * k + 0.5);
+	qh = (unsigned)(g.osd_h * k + 0.5);
+	m = (int)(40.0 * k);
+	qx = (unsigned)m;
+	qy = (unsigned)m;
+	glViewport((int)qx, (int)qy, qw, qh);
+	glUseProgram(g.prog_osd);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, g.tex_osd);
+	glUniform1i(glGetUniformLocation(g.prog_osd, "uTex"), 0);
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glBindVertexArray(g.vao);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	glDisable(GL_BLEND);
+}
+
+/* 暂停补画：没有新帧，但提示条要出现/到点消失。
+ * 拿上一帧的同一块 dma-buf 重走一遍（纹理按 fd 命中，不重导入），
+ * 所以只花一次绘制，不碰解码器也不动时间轴。
+ */
+int glout_repaint(void)
+{
+	if (!g.inited || !g.have_last)
+		return -1;
+	return glout_frame(g.last_fy, g.last_fc, g.last_w, g.last_h,
+			   g.last_yp, g.last_cp);
+}
+
 static int twopass_frame(unsigned w, unsigned h)
 {
 	unsigned dW, dH, pw, ph;
@@ -1103,6 +1201,7 @@ static int twopass_frame(unsigned w, unsigned h)
 	glBindTexture(GL_TEXTURE_2D, g.tex_rgb);
 	glUniform1i(glGetUniformLocation(g.prog2, "uTex"), 0);
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	osd_draw();		/* 提示条在屏幕坐标里，两 pass 之后再合成 */
 	gpu_done(t0);		/* twopass 也要记，别只记单 pass */
 	return 0;
 }
@@ -1180,6 +1279,13 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 		g.tex_c = g.tc[k].tc;
 	}
 	if (g.twopass) {
+		g.last_fy = fd_y;
+		g.last_fc = fd_c;
+		g.last_w = w;
+		g.last_h = h;
+		g.last_yp = ypitch;
+		g.last_cp = cpitch;
+		g.have_last = 1;
 		if (twopass_frame(w, h)) return -1;
 		goto swap;
 	}
@@ -1219,6 +1325,14 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 		gpu_done(t0);
 	}
+	g.last_fy = fd_y;
+	g.last_fc = fd_c;
+	g.last_w = w;
+	g.last_h = h;
+	g.last_yp = ypitch;
+	g.last_cp = cpitch;
+	g.have_last = 1;
+	osd_draw();
 
 swap:
 	dump_frame();

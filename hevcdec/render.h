@@ -75,6 +75,10 @@ struct render_ops {
 	int  (*wait_shown)(struct renderer *r, int timeout_ms);
 	void (*close)(struct renderer *r);
 	void (*stats)(struct renderer *r, struct render_stats *st);
+	/* 没有新帧也要重画（OSD 出现/到期）。只有把画面留在自己手里的后端
+	 * 能做到：gl 重画上一帧；drm 后端画面在 plane 上、提示条无处可画，
+	 * 留 NULL，播放器收到 osd 重画请求就是空操作。 */
+	int  (*repaint)(struct renderer *r);
 };
 
 struct renderer {
@@ -97,6 +101,7 @@ int render_submit(struct renderer *r, const int fd[2], unsigned w, unsigned h,
 int render_pump(struct renderer *r, int timeout_ms);
 int render_flush(struct renderer *r);
 int render_wait_shown(struct renderer *r, int timeout_ms);
+int render_repaint(struct renderer *r);
 void render_stats(struct renderer *r, struct render_stats *st);
 
 const char *render_name(const struct renderer *r);

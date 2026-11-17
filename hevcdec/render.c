@@ -101,6 +101,13 @@ int render_flush(struct renderer *r)
 	return r->ops->flush(r);
 }
 
+int render_repaint(struct renderer *r)
+{
+	if (!r || !r->ops->repaint)
+		return 0;
+	return r->ops->repaint(r);
+}
+
 int render_wait_shown(struct renderer *r, int timeout_ms)
 {
 	if (!r || !r->ops->wait_shown)

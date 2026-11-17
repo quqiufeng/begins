@@ -25,6 +25,7 @@ void glout_set_drm_fd(int fd);
 int  glout_init(unsigned sw, unsigned sh);
 int  glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 		 unsigned ypitch, unsigned cpitch);
+int  glout_repaint(void);
 void glout_reset(void);
 void glout_perf_print(void);
 void glout_stats(double *draw_sum, double *draw_max, double *swap_sum,
@@ -105,6 +106,12 @@ static int gl_pump(struct renderer *r, int timeout_ms)
 	return 0;			/* 同步后端没有队列可推 */
 }
 
+static int gl_repaint(struct renderer *r)
+{
+	(void)r;
+	return glout_repaint();
+}
+
 static int gl_flush(struct renderer *r)
 {
 	(void)r;
@@ -163,6 +170,7 @@ const struct render_ops render_ops_gl = {
 	.wait_shown = gl_wait_shown,
 	.close = gl_close,
 	.stats = gl_get_stats,
+	.repaint = gl_repaint,
 };
 
 #else /* !HAVE_GLOUT —— 后端不存在，但符号要在，auto 选择时直接跳过 */

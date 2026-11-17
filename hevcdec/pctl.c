@@ -30,6 +30,7 @@
 #include <linux/input.h>
 
 #include "aout.h"
+#include "osd.h"
 #include "pctl.h"
 
 #define RC_LOGF "/tmp/play.rc.log"
@@ -50,6 +51,20 @@ static double now_s(void)
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* ---------- 屏幕提示 ----------
+ * 控制口和遥控器是两条入口，提示必须走同一处：否则 RCs 上有条，-c vol +10
+ * 没有，用户看到的行为就取决于他是按遥控还是调脚本。
+ */
+static void osd_vol(void)
+{
+	osd_show(1.2, "%s%d%%", g_mute ? "静音 " : "音量 ", aout_vol());
+}
+
+static void osd_pause(int on)
+{
+	osd_show(on ? 0 : 0.8, on ? "|| 暂停" : "> 播放");
 }
 
 static long (*g_pos_ms)(void);
@@ -155,9 +170,14 @@ static int handle_line(int fd, char *line)
 		reply(fd, buf);
 		return 0;
 	}
-	if (!strcmp(a, "pause"))  { set_paused(1); reply(fd, "{\"ok\":1}\n"); return 0; }
-	if (!strcmp(a, "resume")) { set_paused(0); reply(fd, "{\"ok\":1}\n"); return 0; }
-	if (!strcmp(a, "toggle")) { set_paused(!g_paused); reply(fd, "{\"ok\":1}\n"); return 0; }
+	if (!strcmp(a, "pause"))  { set_paused(1); osd_pause(1); reply(fd, "{\"ok\":1}\n"); return 0; }
+	if (!strcmp(a, "resume")) { set_paused(0); osd_pause(0); reply(fd, "{\"ok\":1}\n"); return 0; }
+	if (!strcmp(a, "toggle")) {
+		set_paused(!g_paused);
+		osd_pause(g_paused);
+		reply(fd, "{\"ok\":1}\n");
+		return 0;
+	}
 	if (!strcmp(a, "mute")) {
 		if (!g_mute) {
 			g_saved_vol = aout_vol() > 0 ? aout_vol() : 100;
@@ -167,6 +187,7 @@ static int handle_line(int fd, char *line)
 			g_mute = 0;
 			aout_set_vol_abs(g_saved_vol);
 		}
+		osd_vol();
 		{
 			char buf[64];
 
@@ -185,6 +206,7 @@ static int handle_line(int fd, char *line)
 			nv = atoi(b);
 		aout_set_vol_abs(nv);
 		if (aout_vol() > 0) g_mute = 0;
+		osd_vol();
 		{
 			char buf[64];
 
@@ -412,12 +434,16 @@ static void *rc_thread(void *arg)
 				g_last_act = act;
 				g_last_t = time(NULL);
 
-				if (!strcmp(act, "toggle"))
+				if (!strcmp(act, "toggle")) {
 					set_paused(!g_paused);
-				else if (!strcmp(act, "volup"))
+					osd_pause(g_paused);
+				} else if (!strcmp(act, "volup")) {
 					aout_set_vol_abs(aout_vol() + 10);
-				else if (!strcmp(act, "voldn"))
+					osd_vol();
+				} else if (!strcmp(act, "voldn")) {
 					aout_set_vol_abs(aout_vol() - 10);
+					osd_vol();
+				}
 				else if (!strcmp(act, "mute")) {
 					if (!g_mute) {
 						g_saved_vol = aout_vol() > 0 ? aout_vol() : 100;
@@ -427,6 +453,7 @@ static void *rc_thread(void *arg)
 						g_mute = 0;
 						aout_set_vol_abs(g_saved_vol);
 					}
+					osd_vol();
 				}
 				else if (!strcmp(act, "quit"))
 					do_quit();
@@ -441,6 +468,19 @@ static void *rc_thread(void *arg)
 
 /* ---------- 启动/收尾 ---------- */
 
+/* 起播提示：seek 是整链重开，屏幕先黑 ~1s 再出画面。新实例一起来就把
+ * "跳到第几秒"挂上，用户才知道这次确实跳了、跳到了哪儿。play.sh 把目标
+ * 位置塞进 PLAY_OSD；4s 足够盖住首帧黑洞，也不会赖在画面上。
+ * 没有这个环境变量（正常起播）就什么都不显示。
+ */
+static void osd_startup(void)
+{
+	const char *e = getenv("PLAY_OSD");
+
+	if (e && *e)
+		osd_show(4.0, "%s", e);
+}
+
 void pctl_start(void)
 {
 	pthread_t th;
@@ -454,6 +494,7 @@ void pctl_start(void)
 		if (pthread_create(&th, NULL, rc_thread, NULL) == 0)
 			pthread_detach(th);
 	}
+	osd_startup();
 }
 
 void pctl_stop(void)
