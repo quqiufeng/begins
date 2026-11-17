@@ -50,7 +50,7 @@ node() { "${SSH[@]}" "$NODE $*" 2>/dev/null; }
 node_push() {
   cat > /tmp/tvplay-node-src.sh <<'EOS'
 #!/bin/sh
-# tvplay-node-v10  协议版本串：加/改子命令时同步改 ensure_node 里的匹配串
+# tvplay-node-v17  协议版本串：加/改子命令时同步改 ensure_node 里的匹配串
 # tvplay 盒端助手：所有参数 base64 进来，避免 ssh 嵌套引号
 # v5: 供流(ffmpeg)与解码(hevcdec)拆成两个进程，中间走命名管道 VFIFO，
 #     哑写者常驻占住写端 → seek 只换 ffmpeg，解码器读不到 EOF、DRM 不释放，
@@ -62,6 +62,27 @@ HW=/tmp/v4l2hevc-gl-aarch64
 VFIFO=/tmp/tvplay.vfifo
 dec() { printf '%s' "$1" | base64 -d; }
 now() { date +%s; }
+# 解码器真身 pid：pgrep -f 会误配到"命令行里带这个名字"的 shell（ssh/bash -c、
+# 甚至本脚本自己的等待循环），USR1 打到错进程上就是"按快进毫无反应 19 秒后整链重开"。
+# 所以一律按 /proc/PID/exe 校验，并优先用 play 落进 state 的 DECPID。
+decpid() {
+  local p e
+  # 首选 stdin 就是这个管道的那个：一场播放里只该有一个，旧链路的残留解码器
+  # 也在跑同一个程序名，但它读的是别的管道/普通管道，认错就会打到死进程上。
+  for p in $(pgrep -f 'v4l2hevc-gl-aarch64' 2>/dev/null); do
+    [ "$(readlink "/proc/$p/fd/0" 2>/dev/null)" = "$VFIFO" ] && { printf '%s\n' "$p"; return 0; }
+  done
+  for p in $(pgrep -f 'v4l2hevc-gl-aarch64' 2>/dev/null); do
+    e=$(readlink "/proc/$p/exe" 2>/dev/null)
+    case "$e" in */v4l2hevc-gl-aarch64*) printf '%s\n' "$p"; return 0;; esac
+  done
+  return 1
+}
+decpid_ok() {  # $1=pid：还活着且确实是解码器
+  [ -n "${1:-}" ] && [ -r "/proc/$1/cmdline" ] || return 1
+  case "$(readlink "/proc/$1/exe" 2>/dev/null)" in */v4l2hevc-gl-aarch64*) return 0;; esac
+  return 1
+}
 
 case "$1" in
 probe)
@@ -81,10 +102,31 @@ feed)
   URL=$(dec "$KEYB64")
   pkill -9 -f 'ffmpeg .*-f hevc' 2>/dev/null
   echo "feed: -ss $T" >> "$LOG"
-  URL="$URL" T="$T" VFIFO="$VFIFO" LOG="$LOG" setsid nohup sh -c \
-    'ffmpeg -hide_banner -loglevel warning -re -ss "$T" -i "$URL" \
-       -map 0:v:0 -c:v copy -f hevc - > "$VFIFO" 2>>"$LOG"' \
-    >>"$LOG" 2>&1 </dev/null &
+  # 直接起 ffmpeg（不再套 sh -c）：$! 就是 ffmpeg 本体，看门狗要按它采样
+  setsid nohup ffmpeg -hide_banner -loglevel warning -re -ss "$T" -i "$URL" \
+    -map 0:v:0 -c:v copy -f hevc - > "$VFIFO" 2>>"$LOG" </dev/null &
+  _fp=$!
+  echo "feed: ffmpeg pid=$_fp" >> "$LOG"
+  # 供流看门狗：WebDAV 偶发不回包时 ffmpeg 会僵在 read 上（rchar 一点也不涨），
+  # 解码器则在"等 RAP"里无限等 —— 屏幕定格，遥控器怎么按都像"没用"。
+  # 6 秒 rchar 不动就重起这一条供流（不碰解码器/DRM，不黑屏）。暂停(T 态)跳过。
+  _rt=${FEED_RETRY:-0}
+  if [ "$_rt" -lt 3 ]; then
+    ( _i=0; _last=0
+      while :; do
+        sleep 1
+        [ -d "/proc/$_fp" ] || break
+        _st=$(awk '{print $3}' "/proc/$_fp/stat" 2>/dev/null)
+        [ "$_st" = T ] && { _i=0; _last=0; continue; }   # 暂停中，不算卡
+        _r=$(sed -n 's/^rchar: //p' "/proc/$_fp/io" 2>/dev/null)
+        if [ "$_r" = "$_last" ]; then _i=$((_i+1)); else _i=0; _last=$_r; fi
+        if [ "$_i" -ge 6 ]; then
+          echo "watchdog: 供流 6s 无数据(rchar=$_r) → 重起 @${T}s（第$(( _rt+1 ))次）" >> "$LOG"
+          kill -9 "$_fp" 2>/dev/null
+          FEED_RETRY=$((_rt+1)) exec "$0" feed "$2"
+        fi
+      done ) >/dev/null 2>&1 &
+  fi
   exit 0
   ;;
 
@@ -160,7 +202,13 @@ play)
   HW="$HW" VFIFO="$VFIFO" GEO="$GEO" LOG="$LOG" setsid nohup sh -c \
     'DSTGEO="$GEO+0+0" NOWRITE=1 PLAY=1 GLPLAY=1 "$HW" - < "$VFIFO" 2>>"$LOG"' \
     >>"$LOG" 2>&1 </dev/null &
-  sleep 0.2
+  sleep 0.25
+  # 把解码器 pid 落到 state：遥控器 seek 靠它精确打信号（见 decpid 注释）
+  _dp=$(decpid)
+  if [ -n "$_dp" ]; then
+    sed -i '/^DECPID=/d' "$STATE"
+    echo "DECPID=$_dp" >> "$STATE"
+  fi
   "$0" feed "$(printf '%s' "$START" | base64 -w0)"
   exit 0
   ;;
@@ -201,10 +249,29 @@ key)
   save_pa() { sed -i "s/^PAUSE_AT=.*/PAUSE_AT=$1/" "$STATE"; }
   mpvctl() {  # mpv IPC：盒子上只有 perl 能做 unix socket
     printf '%s\n' "$1" | perl -MIO::Socket::UNIX -e '
-      my $s = IO::Socket::UNIX->new(Peer => "/tmp/mpv.sock") or exit 1;
+      my $s = IO::Socket::UNIX->new(Peer => "/tmp/mpv.sock") or exit 7;
       my $l = <STDIN>; print $s $l; $s->close;' 2>/dev/null
+    _rc=$?
+    [ "$_rc" -ne 0 ] && echo "key: mpvctl rc=$_rc 失败：$1" >> "$LOG"
+    return $_rc
+  }
+  audio_start() {  # $1=起点秒：重开音频进程（IPC 死掉时的自愈路径）
+    # 实测连做几次 seek 后 mpv 的 IPC 监听会拒连（ECONNREFUSED），此后 pause/
+    # seek/volume 全部静默失效 —— 声音留在原地，画面已经跳走，几十秒后就是
+    # "画面在前进、声音还是老地方"。没有 IPC 就只能重开 mpv 并给它 --start。
+    pkill -9 -f 'mpv .*--no-video' 2>/dev/null
+    sleep 0.2
+    rm -f /tmp/mpv.sock
+    _v=$(cat /tmp/tvplay.vol 2>/dev/null || echo 100)
+    setsid nohup /usr/bin/mpv --no-config --no-video --vo=null \
+      --ao=alsa --audio-device=alsa/hw:0,0 --audio-channels=stereo \
+      --volume="$_v" --input-ipc-server=/tmp/mpv.sock \
+      --cache=yes --cache-secs=20 --aid="${TRACK:-1}" --start="$1" \
+      "$URL" >>"$LOG" 2>&1 </dev/null &
+    echo "key: 音频进程重开 @$1s（IPC 不可用）" >> "$LOG"
   }
   restart() {  # $1=起点秒：seek 只能重启管线（码流是 ffmpeg -re 现推的）
+    rmdir /tmp/tvplay.seek.lock 2>/dev/null
     pkill -9 -f 'rcinputd-aarch64'    2>/dev/null
     pkill -9 -f 'v4l2hevc-gl-aarch64' 2>/dev/null
     pkill -9 -f 'ffmpeg .*-f hevc'    2>/dev/null
@@ -216,13 +283,33 @@ key)
   }
   softseek() {  # $1=目标秒：重建 V4L2 会话，DRM/控制台全程不释放
     _t=$1
-    echo "softseek → $_t (暂停=$PA)"
-    echo "key: softseek $_t" >> "$LOG"
+    # 串行化：seek 要重建 V4L2 会话（100~600ms）。连按方向键时下一个 seek 若
+    # 同时进行，两个重建互相踩，且 cur() 还读着没更新的 START/OFF ——
+    # 实测连按 3 次只净进 3 秒，用户看到的就是"快进没有用"。因此：
+    #   ① 拿到锁再动；② 先把目标乐观写进 state，后来的按键从目标继续加。
+    _lk=/tmp/tvplay.seek.lock
+    _w=0
+    while ! mkdir "$_lk" 2>/dev/null; do
+      _w=$((_w+1))
+      if [ "$_w" -gt 100 ]; then rm -rf "$_lk"; fi   # 10s 抢不到 = 上把卡死
+      sleep 0.1
+    done
+    echo "softseek → $_t (暂停=$PA)$([ "$_w" -gt 0 ] && echo " 排队$((_w*100))ms")"
+    echo "key: softseek $_t (等锁 $((_w*100))ms)" >> "$LOG"
+    START=$(now); OFF=$_t
+    sed -i "s/^START=.*/START=$START/; s/^OFF=.*/OFF=$OFF/" "$STATE" 2>/dev/null
     # 1. 只冻声音；画面留屏（解码器不停，DRM master 一直是我们的）
-    mpvctl '{"command":["set_property","pause",true]}'
-    # 2. 声音先在暂停态 seek 到位：mpv 找索引+填缓存 ~600ms，
-    #    正好和下面重建会话重叠，等首帧出来它已经就位。
-    mpvctl "{\"command\":[\"seek\",$_t,\"absolute\"]}"
+    #    IPC 连不上就重开音频进程：mpv 的 --input-ipc-server 在一段时间/几次
+    #    连接后会拒连，命令全丢，声音和画面就此脱节（差 70 秒那种）。
+    if mpvctl '{"command":["set_property","pause",true]}'; then
+      # 2. 声音先在暂停态 seek 到位：mpv 找索引+填缓存 ~600ms，
+      #    正好和下面重建会话重叠，等首帧出来它已经就位。
+      mpvctl "{\"command\":[\"seek\",$_t,\"absolute\"]}"
+      _audio_new=0
+    else
+      audio_start "$_t"
+      _audio_new=1
+    fi
     # 3. 掐旧供流（残留字节由解码器自己在重建时读掉，不用 cat 排空）
     pkill -9 -f 'ffmpeg .*-f hevc' 2>/dev/null
     # 4. 让解码器重建 V4L2 会话：meson-vdec 不能在同一会话里接新码流
@@ -233,28 +320,36 @@ key)
     #      （会闪一下，但保证出画，不会停在没有画面的黑屏上）。
     _att=1
     while : ; do
-      _dpid=$(pgrep -f 'v4l2hevc-gl-aarch64' | head -1)
+      _dpid=${DECPID:-}
+      decpid_ok "$_dpid" || _dpid=$(decpid)
       [ -z "$_dpid" ] && { echo "key: 解码器已退出，整链重开" >> "$LOG"; restart "$_t"; }
+      echo "key: 目标解码器 pid=$_dpid" >> "$LOG"
       pkill -CONT -f 'v4l2hevc-gl-aarch64' 2>/dev/null   # 暂停态下也能响应信号
-      _n=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+      _n=$(wc -c < "$LOG" 2>/dev/null || echo 0)
       kill -USR1 "$_dpid" 2>/dev/null
-      _i=0
+      _i=0; _next=20
       while [ "$_i" -lt 150 ]; do
         sleep 0.02
-        tail -n +"$((_n+1))" "$LOG" 2>/dev/null | grep -q 'REINIT: ready' && break
+        tail -c +"$((_n+1))" "$LOG" 2>/dev/null | grep -q 'REINIT: ready' && break
+        # 补发：解码器若正卡在"等 RAP"的读重试里，SIGUSR1 的 EINTR 会被那个
+        # 内层循环吞掉（实测连按第二次能丢 10s），每 400ms 再敲一次，让它
+        # 在真正的读/poll 边界上收到。事务中间收到不算失败、也不吃预算。
+        if [ "$_i" -ge "$_next" ]; then
+          kill -USR1 "$_dpid" 2>/dev/null; _next=$((_i+20))
+        fi
         _i=$((_i+1))
       done
       echo "key: 会话重建 $((_i*20))ms (第${_att}次)" >> "$LOG"
       "$0" feed "$(b64 "$_t")"
       _j=0
-      while [ "$_j" -lt 150 ]; do
+      while [ "$_j" -lt 250 ]; do
         sleep 0.02
-        tail -n +"$((_n+1))" "$LOG" 2>/dev/null | grep -q 'REINIT: first frame' && break
-        pgrep -f 'v4l2hevc-gl-aarch64' >/dev/null 2>&1 || break   # 解码器死了别等满超时
+        tail -c +"$((_n+1))" "$LOG" 2>/dev/null | grep -q 'REINIT: first frame' && break
+        decpid_ok "$_dpid" || break                      # 解码器死了别等满超时
         _j=$((_j+1))
       done
       echo "key: 首帧就绪 $((_j*20))ms (第${_att}次)" >> "$LOG"
-      tail -n +"$((_n+1))" "$LOG" 2>/dev/null | grep -q 'REINIT: first frame' && break
+      tail -c +"$((_n+1))" "$LOG" 2>/dev/null | grep -q 'REINIT: first frame' && break
       _att=$((_att+1))
       [ "$_att" -gt 2 ] && { echo "key: 重建两次未出帧，退回 restart" >> "$LOG"; restart "$_t"; }
       pkill -9 -f 'ffmpeg .*-f hevc' 2>/dev/null
@@ -271,9 +366,10 @@ key)
       pkill -STOP -f 'ffmpeg .*-f hevc'    2>/dev/null
       echo "softseek: 保持暂停 @${_t}s"
     else
-      mpvctl '{"command":["set_property","pause",false]}'
+      [ "${_audio_new:-0}" = 1 ] || mpvctl '{"command":["set_property","pause",false]}'
       echo "softseek: 续播 @${_t}s"
     fi
+    rmdir "$_lk" 2>/dev/null
   }
 
   case "$ACT" in
@@ -298,7 +394,7 @@ key)
     t=$(( $(cur) + d )); [ "$t" -lt 0 ] && t=0
     echo "$ACT → $t"
     # 有常驻解码器 + 命名管道时走软 seek（无黑屏）；否则退回整链重开
-    if [ -p "$VFIFO" ] && pgrep -f 'v4l2hevc-gl-aarch64' >/dev/null 2>&1; then
+    if [ -p "$VFIFO" ] && { decpid_ok "${DECPID:-}" || decpid >/dev/null; }; then
       softseek "$t"
     else
       restart "$t"
@@ -356,7 +452,7 @@ EOS
 }
 
 # 版本不符也重推：助手常驻 /tmp，只判 -x 会让旧协议一直生效（踩过：disp 子命令拿不到模式）
-ensure_node() { "${SSH[@]}" "test -x $NODE && grep -q tvplay-node-v10 $NODE" 2>/dev/null || \
+ensure_node() { "${SSH[@]}" "test -x $NODE && grep -q tvplay-node-v17 $NODE" 2>/dev/null || \
   node_push || { echo "✘ 无法部署盒端助手" >&2; return 1; }; }
 
 # ─────────────────────────── 索引 ───────────────────────────
