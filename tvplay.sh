@@ -50,7 +50,7 @@ node() { "${SSH[@]}" "$NODE $*" 2>/dev/null; }
 node_push() {
   cat > /tmp/tvplay-node-src.sh <<'EOS'
 #!/bin/sh
-# tvplay-node-v9  协议版本串：加/改子命令时同步改 ensure_node 里的匹配串
+# tvplay-node-v10  协议版本串：加/改子命令时同步改 ensure_node 里的匹配串
 # tvplay 盒端助手：所有参数 base64 进来，避免 ssh 嵌套引号
 # v5: 供流(ffmpeg)与解码(hevcdec)拆成两个进程，中间走命名管道 VFIFO，
 #     哑写者常驻占住写端 → seek 只换 ffmpeg，解码器读不到 EOF、DRM 不释放，
@@ -109,7 +109,15 @@ play)
     "$(printf '%s' "$URL" | base64 -w0)" > "$STATE"
   : > "$LOG"
   # 遥控器守护：按键 → 本脚本 key 分支
-  setsid nohup /tmp/rcinputd-aarch64 >>/tmp/tvplay-rc.log 2>&1 </dev/null &
+  # 必须显式给 RC_NODE：rcinputd 默认认 /root/play.sh（老助手），那样按键会走
+  # 老链路的 state（/tmp/play.state 根本不存在）→ "遥控器：没有在放的片子"，
+  # 表现就是按方向键毫无反应。另外先掐掉旧守护：旧版 grab 着设备，新实例
+  # EVIOCGRAB 会 EBUSY 直接退出，于是"永远是那个指错路的进程"。
+  pkill -9 -f 'rcinputd-aarch64' 2>/dev/null
+  sleep 0.1
+  _rc=/tmp/rcinputd-aarch64
+  [ -x /root/rcinputd-aarch64 ] && _rc=/root/rcinputd-aarch64
+  RC_NODE=/tmp/tvplay-node.sh setsid nohup "$_rc" >>/tmp/tvplay-rc.log 2>&1 </dev/null &
   VOL=$(cat /tmp/tvplay.vol 2>/dev/null || echo 100)
 
   if [ "$PLAYER" = mpv ]; then
@@ -297,7 +305,19 @@ key)
     fi ;;
   volup|voldn|mute)
     V=$(cat /tmp/tvplay.vol 2>/dev/null || echo 100)
-    case "$ACT" in volup) V=$((V+5));; voldn) V=$((V-5));; mute) V=0;; esac
+    VP=$(cat /tmp/tvplay.vol.prev 2>/dev/null || echo 100)
+    case "$ACT" in
+      volup) V=$((V+5));;
+      voldn) V=$((V-5));;
+      mute) # 静音键是开关：0 → 还原上次音量（旧做法一律置 0，按一下就再也
+            # 回不来，只能靠 + 键一点点加；而且那次"快进顺带静音"就是它）
+            if [ "$V" -gt 0 ]; then
+              printf '%s\n' "$V" > /tmp/tvplay.vol.prev
+              V=0
+            else
+              V=$VP; [ "$V" -gt 0 ] || V=100
+            fi ;;
+    esac
     [ "$V" -lt 0 ] && V=0; [ "$V" -gt 150 ] && V=150
     printf '%s\n' "$V" > /tmp/tvplay.vol
     mpvctl "{\"command\":[\"set_property\",\"volume\",$V]}"
@@ -336,7 +356,7 @@ EOS
 }
 
 # 版本不符也重推：助手常驻 /tmp，只判 -x 会让旧协议一直生效（踩过：disp 子命令拿不到模式）
-ensure_node() { "${SSH[@]}" "test -x $NODE && grep -q tvplay-node-v9 $NODE" 2>/dev/null || \
+ensure_node() { "${SSH[@]}" "test -x $NODE && grep -q tvplay-node-v10 $NODE" 2>/dev/null || \
   node_push || { echo "✘ 无法部署盒端助手" >&2; return 1; }; }
 
 # ─────────────────────────── 索引 ───────────────────────────
