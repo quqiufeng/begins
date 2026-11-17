@@ -5,7 +5,7 @@
 set -u
 LOG=/tmp/tvplay.log
 STATE=/tmp/tvplay.state
-HW=/tmp/v4l2hevc-gl-aarch64
+HW=/tmp/v4l2hevc-aarch64
 CTL=/tmp/mpvctl-aarch64
 SOCK=/tmp/tvplay.sock
 dec() { printf '%s' "$1" | base64 -d; }
@@ -34,6 +34,7 @@ play)
   PLAYER=$(dec "$2"); URL=$(dec "$3"); START=$(dec "$4")
   TRACK=$(dec "$5");  AUDIO=$(dec "$6"); FPS=$(dec "$7")
   GEO=$(dec "${8:-}")   # 显示器输出几何 WxH
+  RENDER=$(dec "${9:-}")  # 上屏后端 drm|gl|auto（缺省 gl）
 
   # 校验：宁可回落默认，也不要把解码失败的垃圾写进 state ——
   # 坏值会顺着 restart_at 再传一轮，逐次累积成二进制乱码。
@@ -41,9 +42,10 @@ play)
   case "$FPS"   in ''|*[!0-9]*) FPS=0 ;; esac
   case "$TRACK" in ''|*[!0-9]*) TRACK=1 ;; esac
   case "$GEO"   in [0-9]*x[0-9]*) ;; *) GEO=2560x1440 ;; esac
+  case "$RENDER" in drm|gl|auto) ;; *) RENDER=gl ;; esac
 
   # 清场
-  pkill -9 -f 'v4l2hevc-gl-aarch64' 2>/dev/null
+  pkill -9 -f 'v4l2hevc-aarch64' 2>/dev/null
   pkill -9 -f 'ffmpeg .*-f hevc'    2>/dev/null
   pkill -9 -f 'mpv .*--no-video'    2>/dev/null
   pkill -9 -x mpv                   2>/dev/null
@@ -55,9 +57,11 @@ play)
     printf 'START=%s\nOFF=%s\nPLAYER=%s\n' "$(now)" "$START" "$PLAYER"
     printf 'KEYB64=%s\n' "$(enc "$URL")"
     printf 'TRACKB64=%s\nAUDIO=%s\nFPS=%s\nGEO=%s\n' "$(enc "$TRACK")" "$AUDIO" "$FPS" "$GEO"
+    printf 'RENDER=%s\n' "$RENDER"
     printf 'PAUSE_AT=0\nPAUSED_FOR=0\n'
   } > "$STATE"
   : > "$LOG"
+  rm -f /tmp/tvplay.render   # 上一轮的路径记录不能留：宁可"未知"也别报错的
 
   if [ "$PLAYER" = mpv ]; then
     # 旧路径：整片交给 mpv（H.264 等非 HEVC）
@@ -72,8 +76,7 @@ play)
 
   # ── HEVC 硬解路径 ──
   # 视频: ffmpeg 解封装 + -re 按片源节拍供流 → hevcdec 零拷贝解 → GLES3 上屏
-  #   -re 必须：hevcdec 的 GL 输出路径没有 vblank 节拍器（FPS 对 GLPLAY 无效），
-  #             不靠 -re 就会以解码速度播放（4K 实测快 15%，1080p 会飞）
+  #   -re 保留：控制管道水位/seek 响应；配速已归播放器（FPS 两个后端都生效）
   #   音频交给 mpv：ffmpeg 的 -f alsa 在这块板子上缓冲太浅（8s 15 次 xrun）
   export START LOG HW
   if [ "$AUDIO" = 1 ]; then
@@ -85,9 +88,11 @@ play)
   fi
   # NOWRITE=1 必须：否则 hevcdec 写 /tmp/out.yuv，4K 从 24fps 掉到 10fps
   # DSTGEO 只对 DRM 平面路径生效（GL 路径按 connector modes[0] 铺屏，两者都是 2560x1440）
-  URL="$URL" GEO="$GEO" setsid nohup sh -c 'ffmpeg -hide_banner -loglevel warning -re -ss "$START" \
+  # RENDER 要挂在外层 env 上：管道里那个 RENDER= 是内层 sh 展开的，
+  # 变量没 export 进去就成了空串 → 后端回落 auto（auto 会选 drm）。
+  URL="$URL" GEO="$GEO" RENDER="$RENDER" setsid nohup sh -c 'ffmpeg -hide_banner -loglevel warning -re -ss "$START" \
       -i "$URL" -map 0:v:0 -c:v copy -f hevc - 2>>"$LOG" \
-    | DSTGEO="$GEO+0+0" NOWRITE=1 PLAY=1 GLPLAY=1 "$HW" - >>"$LOG" 2>&1' \
+    | DSTGEO="$GEO+0+0" NOWRITE=1 PLAY=1 RENDER="$RENDER" "$HW" - >>"$LOG" 2>&1' \
     >>"$LOG" 2>&1 </dev/null &
   exit 0
   ;;
@@ -101,7 +106,7 @@ key)
   P=$(pos)
 
   pause_video() {
-		pkill -STOP -f 'v4l2hevc-gl-aarch64' 2>/dev/null
+		pkill -STOP -f 'v4l2hevc-aarch64' 2>/dev/null
 		pkill -STOP -f 'ffmpeg .*-f hevc'    2>/dev/null
 		pkill -STOP -f 'mpv .*--no-video'    2>/dev/null
 		pkill -STOP -x mpv 2>/dev/null
@@ -109,7 +114,7 @@ key)
 		echo "key: pause" >> "$LOG"
   }
   resume_video() {
-		pkill -CONT -f 'v4l2hevc-gl-aarch64' 2>/dev/null
+		pkill -CONT -f 'v4l2hevc-aarch64' 2>/dev/null
 		pkill -CONT -f 'ffmpeg .*-f hevc'    2>/dev/null
 		pkill -CONT -f 'mpv .*--no-video'    2>/dev/null
 		pkill -CONT -x mpv 2>/dev/null
@@ -126,7 +131,8 @@ key)
 		# state 文件被写坏）。TRACK/AUDIO/GEO 还需能容忍旧 state 的空值。
 		sh "$0" play "$(enc "${PLAYER}")" "$KEYB64" "$(enc "$1")" \
 			"$(enc "${TRACK:-1}")" "$(enc "${AUDIO:-1}")" \
-			"$(enc "${FPS:-0}")" "$(enc "${GEO:-2560x1440}")"
+			"$(enc "${FPS:-0}")" "$(enc "${GEO:-2560x1440}")" \
+			"$(enc "${RENDER:-gl}")"
   }
 
   # 音量必须夹在 0..100：mpv 的 add 会一路累加，
@@ -165,7 +171,7 @@ key)
     # 于是 toggle 被发到一条空 socket，画面上什么都没发生。
     # 而且 HEVC 链的画面(v4l2hevc/ffmpeg)和声音(独立 mpv)是两个进程，
     # 只 toggle mpv 只会哑掉声音、画面照跑 —— 必须整条 STOP/CONT。
-    if pgrep -f 'v4l2hevc-gl-aarch64' >/dev/null 2>&1; then
+    if pgrep -f 'v4l2hevc-aarch64' >/dev/null 2>&1; then
       if [ "${PAUSE_AT:-0}" -gt 0 ]; then resume_video; else pause_video; fi
       exit 0
     fi
@@ -207,13 +213,26 @@ key)
   ;;
 
 stop)
-  pkill -9 -f 'v4l2hevc-gl-aarch64' 2>/dev/null
+  pkill -9 -f 'v4l2hevc-aarch64' 2>/dev/null
   pkill -9 -f 'ffmpeg .*-f hevc'    2>/dev/null
   pkill -9 -f 'mpv .*--no-video'    2>/dev/null
   pkill -9 -x mpv                   2>/dev/null
   rm -f "$SOCK"
+  rm -f /tmp/tvplay.render
   chvt 1 2>/dev/null
   exit 0
+  ;;
+
+render)
+  # 上屏路径：只有播放器知道真相（RENDER=auto 到底选了谁、HDR 是 CPU 转还是
+  # shader 转），它写 /tmp/tvplay.render，这里只读。没有文件就是"还没起来"，
+  # 顺手把 state 里请求的后端报出来，别让人以为它在 GL 上跑。
+  if [ -f /tmp/tvplay.render ]; then
+    cat /tmp/tvplay.render
+  else
+    . "$STATE" 2>/dev/null
+    printf 'RENDER=%s\nMODE=unknown\n' "${RENDER:-?}"
+  fi
   ;;
 
 state)
@@ -224,7 +243,7 @@ state)
   else
     el=$(( $(now) - START + OFF ))
   fi
-  n=$(pgrep -f 'v4l2hevc-gl-aarch64|mpv' 2>/dev/null | wc -l)
+  n=$(pgrep -f 'v4l2hevc-aarch64|mpv' 2>/dev/null | wc -l)
   printf '%s %s %s %s %s\n' "$el" "${PLAYER:-?}" "${n:-0}" "${KEYB64:-}" "${PAUSE_AT:-0}"
   ;;
 
@@ -243,7 +262,7 @@ disp)
   ;;
 
 alive)
-  pgrep -f 'v4l2hevc-gl-aarch64|mpv' 2>/dev/null | wc -l
+  pgrep -f 'v4l2hevc-aarch64|mpv' 2>/dev/null | wc -l
   ;;
 
 log)

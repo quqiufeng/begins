@@ -31,4 +31,4 @@ for i in $(seq 1 "$N"); do
 	sleep 1
 	printf '%-8s %s %s\n' "abort$i" "$(free_kb)" "$(used_pg)"
 done
-echo "# 结束：进程 $(pgrep -c -f 'v4l2hevc-gl-aarch64' 2>/dev/null) 个解码器残留"
+echo "# 结束：进程 $(pgrep -c -f 'v4l2hevc-aarch64' 2>/dev/null) 个解码器残留"

@@ -3,6 +3,11 @@ v4l2hevc
 v4l2hevc-aarch64
 *-aarch64
 *.yuv
+# 自检程序（make raptest / hdr-selftest / csigtest）
+raptest
+hdr-selftest
+hdrtest
+csigtest
 
 # 交叉编译用的盒子设备库（libEGL/libGLESv2/libdrm 等，来自设备 rootfs，不可再分发）
 crosslib/

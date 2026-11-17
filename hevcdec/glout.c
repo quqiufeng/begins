@@ -27,6 +27,7 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
+#include "perfstat.h"
 typedef void (*pfn_image_tex)(GLenum, void *);
 
 static double now_s(void)
@@ -36,6 +37,7 @@ static double now_s(void)
 	clock_gettime(CLOCK_MONOTONIC, &t);
 	return t.tv_sec + t.tv_nsec / 1e9;
 }
+
 
 static void gdie(const char *m)
 {
@@ -49,74 +51,47 @@ static void gdie(const char *m)
 #define TM_HABLE 3
 
 static struct {
-	int curve, on;
+	int curve, on, gain;
+	int tf;			/* HC_TF_*：VUI 传递函数，决定码值→线性光用哪条 EOTF */
 	double src_peak, target, sat, knee;
 } tp;
 
-static double pq_eotf(double n)
-{
-	const double m1 = 0.1593017578125, m2 = 78.84375;
-	const double c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
-	double np, num, den;
+/* 色彩数学统一在 hdrcolor.inc（v4l2hevc.c 的软映射吃同一份文本） */
+#include "hdrcolor.inc"
+/* 内容峰值同样来自码流 SEI；gl-selftest 单独链接时靠里面的弱定义兜住 */
+#include "csig.h"
 
-	if (n <= 0.0) return 0.0;
-	np = pow(n, 1.0 / m2);
-	num = np - c1;
-	den = c2 - c3 * np;
-	if (num <= 0.0) return 0.0;
-	return 10000.0 * pow(num / den, 1.0 / m1);
+/* 老名字，保持调用点不变 */
+#define pq_eotf hc_pq_eotf
+#define pq_oetf hc_pq_oetf
+#define curve_hable hc_hable
+
+static struct hdrcolor tp_hc(void)
+{
+	struct hdrcolor c;
+
+	c.on = tp.on;
+	c.curve = tp.curve;		/* TM_* 与 HC_* 数值一致 */
+	c.src_peak = tp.src_peak;
+	c.target = tp.target;
+	c.sat = 1.0;			/* sat 在着色器里用 mix() 做，不进 LUT */
+	c.knee = tp.knee;
+	c.full = 0;
+	c.gain_mode = tp.gain;
+	c.transfer = tp.tf;
+	return c;
 }
 
-static double pq_oetf(double L)
-{
-	const double m1 = 0.1593017578125, m2 = 78.84375;
-	const double c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
-	double y = L / 10000.0, ym;
-
-	if (y <= 0.0) return 0.0;
-	ym = pow(y, m1);
-	return pow((c1 + c2 * ym) / (1.0 + c3 * ym), m2);
-}
-static double bt709_encode(double d)
-{
-	if (d <= 0.0) return 0.0;
-	if (d >= 1.0) return 1.0;
-	return (d < 0.018) ? 4.5 * d : 1.099 * pow(d, 0.45) - 0.099;
-}
-
-static double curve_hable(double x)
-{
-	const double A = 0.15, B = 0.50, C = 0.10, D = 0.20, E = 0.02, F = 0.30;
-	double f1 = (x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F);
-	double fw = (A + C * B + D * E) / (A + B + D * F);
-
-	return f1 / fw;
-}
+/* 着色器要的是 0..1 的 code，bt709_encode 在 glout 里一直无 16/219 偏移 */
+#define bt709_encode hc_bt709_oetf
 
 static double tm_curve(double x)
 {
-	switch (tp.curve) {
-	case TM_CLIP:
-		return x > 1.0 ? 1.0 : x;
-	case TM_REINHARD:
-		return 2.0 * x / (1.0 + x);
-	case TM_HABLE:
-		return curve_hable(x);
-	default: {
-		double k = tp.knee, t;
+	struct hdrcolor c = tp_hc();
 
-		if (x <= k) return x;
-		t = (x - k) / (1.0 - k);
-		return k + (1.0 - k) * (1.0 - exp(-t));
-	}
-	}
+	return hc_curve(&c, x);
 }
 
-/* ---------- LUT → 多项式（去掉依赖纹理采样） ----------
- * 目标机上「依赖纹理采样」的 LUT 每像素多花 ~4.7ns（= 每屏 17ms），
- * 而 8 次多项式只要几个 FMA。这里用最小二乘把 256 项 LUT 拟合成
- * code(n)、gain(n) 两条 7 次曲线，误差打印出来供核对。
- */
 #define PDEG 7
 #define MAXD 16
 static float poly_c[MAXD + 1], poly_g[MAXD + 1];
@@ -197,50 +172,60 @@ static double fit_poly(const float *lut, int which, float *coef, int deg)
 }
 
 /* 256 项 RGBA32F：r = 输出码(0..1)，g = 色度增益 */
+/* 这次 LUT 是按多少 nits 编的；SEI 后到时用来判断要不要重建 */
+static double tp_peak_used;
+static int tp_peak_env;		/* TM_SRC_PEAK 显式给了，就不跟 SEI */
+static int tp_sat_env;		/* TM_SAT 显式给了，就不跟色域 */
+static int tp_pri;		/* 编表时用的 colour_primaries */
+
 static void build_lut(float *out)
 {
 	const char *e = getenv("TM");
 	int i;
 
 	tp.curve = TM_CURVE;
-	tp.src_peak = getenv("TM_SRC_PEAK") ? atof(getenv("TM_SRC_PEAK")) : 1000.0;
+	if (getenv("TM_SRC_PEAK")) {
+		tp.src_peak = atof(getenv("TM_SRC_PEAK"));
+		tp_peak_env = 1;
+	} else if (csig_peak() > 0.0) {
+		tp.src_peak = csig_peak();	/* 码流里的 maxCLL */
+	} else {
+		tp.src_peak = 1000.0;		/* 兜底：后面 tm_peak_sync() 会补 */
+	}
 	tp.target = getenv("TM_TARGET") ? atof(getenv("TM_TARGET")) : 200.0;
-	tp.sat = getenv("TM_SAT") ? atof(getenv("TM_SAT")) : 0.90;
+	/* 和软映射同一条规则（hdrcolor.inc）：2020 源才压，709 源 1.0。
+	 * GL 路径的 wide 一直是 0.90，这里保持不变，只补上“看色域”。 */
+	if (getenv("TM_SAT")) {
+		tp.sat = atof(getenv("TM_SAT"));
+		tp_sat_env = 1;
+	} else {
+		tp.sat = hc_sat_from_primaries(g_cm.primaries, 0.90);
+	}
+	tp_pri = g_cm.primaries;
 	tp.knee = getenv("TM_KNEE") ? atof(getenv("TM_KNEE")) : 0.7;
+	tp.tf = g_cm.transfer;	/* 0=未标 → hc_is_hdr 按 PQ 兜底 */
 	tp.on = 1;
 	if (e && (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "no"))) tp.on = 0;
 	if (e && !strcmp(e, "clip")) tp.curve = TM_CLIP;
 	if (e && !strcmp(e, "reinhard")) tp.curve = TM_REINHARD;
 	if (e && !strcmp(e, "hable")) tp.curve = TM_HABLE;
+	tp.gain = (getenv("TM_GAIN") && (!strcmp(getenv("TM_GAIN"), "lin") ||
+		  !strcmp(getenv("TM_GAIN"), "linear"))) ? HC_GAIN_LIN : HC_GAIN_CODE;
 	if (tp.src_peak < tp.target) tp.src_peak = tp.target;
 	if (tp.knee <= 0.05 || tp.knee >= 1.0) tp.knee = 0.7;
 
-	for (i = 0; i < 256; i++) {
-		double n = ((double)i - 16.0) / 219.0;
-		double L, x, d, code, nout, gain = 1.0;
+	{
+		struct hdrcolor c = tp_hc();
+		unsigned char lut[256];
+		unsigned short gain[256];
 
-		if (n < 0.0) n = 0.0;
-		if (n > 1.0) n = 1.0;
-		if (!tp.on) {
-			out[i * 4 + 0] = i / 255.0f;
-			out[i * 4 + 1] = 1.0f;
+		hc_build(&c, lut, gain);
+		for (i = 0; i < 256; i++) {
+			out[i * 4 + 0] = lut[i] / 255.0f;
+			out[i * 4 + 1] = gain[i] / 1024.0f;
 			out[i * 4 + 2] = 0.0f;
 			out[i * 4 + 3] = 1.0f;
-			continue;
 		}
-		L = pq_eotf(n);
-		x = L / tp.target;
-		d = tm_curve(x);
-		code = (16.0 + 219.0 * bt709_encode(d)) / 255.0;
-		nout = (code * 255.0 - 16.0) / 219.0;
-		if (n > 0.004) {
-			gain = nout / n;
-			if (gain > 3.9) gain = 3.9;
-		}
-		out[i * 4 + 0] = (float)code;
-		out[i * 4 + 1] = (float)gain;
-		out[i * 4 + 2] = 0.0f;
-		out[i * 4 + 3] = 1.0f;
 	}
 	{
 		double e1 = fit_poly(out, 0, poly_c, poly_deg);
@@ -248,8 +233,11 @@ static void build_lut(float *out)
 
 		printf("GLOUT: poly 误差 code=%.4f gain=%.4f\n", e1, e2);
 	}
-	printf("GLOUT: TM %s curve=%d peak=%.0f target=%.0f sat=%.2f knee=%.2f\n",
-	       tp.on ? "on" : "off", tp.curve, tp.src_peak, tp.target, tp.sat, tp.knee);
+	tp_peak_used = tp.src_peak;
+	printf("GLOUT: TM %s tf=%s curve=%d peak=%.0f(%s) target=%.0f sat=%.2f knee=%.2f\n",
+	       tp.on ? "on" : "off", hc_tf_name(tp.tf), tp.curve, tp.src_peak,
+	       tp_peak_env ? "env" : csig_peak() > 0.0 ? "sei" : "默认",
+	       tp.target, tp.sat, tp.knee);
 }
 
 
@@ -295,10 +283,7 @@ static const char *FS =
 	"  rgb.r = Y1 + 1.47460 * cr;\n"
 	"  rgb.g = Y1 - 0.16455 * cb - 0.57135 * cr;\n"
 	"  rgb.b = Y1 + 1.88140 * cb;\n"
-	"  vec3 o;\n"
-	"  o.r =  1.6605*rgb.r - 0.5876*rgb.g - 0.0728*rgb.b;\n"
-	"  o.g = -0.1246*rgb.r + 1.1329*rgb.g - 0.0083*rgb.b;\n"
-	"  o.b = -0.0182*rgb.r - 0.1006*rgb.g + 1.1187*rgb.b;\n"
+	"  vec3 o = uGm * rgb;\n"
 	"  o = clamp(o, 0.0, 1.0);\n"
 	"  float lum = dot(o, vec3(0.2126, 0.7152, 0.0722));\n"
 	"  o = mix(vec3(lum), o, uSat);\n"
@@ -308,32 +293,47 @@ static const char *FS =
 	"}\n";
 
 
+/* 源色域→709 的 3x3 上到 uGm。系数本身在 hdrcolor.inc（hc_mat），和软映射
+ * 是同一组数：以前这里手抄了九个数，P3 片要么走错矩阵要么全无。GLSL 的
+ * mat3 构造按列主序收参数，所以上行主序时要转置一次。 */
+static void gm_upload(GLuint prog)
+{
+	const double *m = hc_mat(tp_pri);
+	float c[9];
+	int i, j;
+
+	for (i = 0; i < 3; i++)
+		for (j = 0; j < 3; j++)
+			c[i * 3 + j] = (float)m[j * 3 + i];
+	glUniformMatrix3fv(glGetUniformLocation(prog, "uGm"), 1, GL_FALSE, c);
+}
+
 static const char *FSV[11] = {NULL};
 static void build_fsv(void)
 {
 	FSV[0] = FS;			/* 全功能 */
 	FSV[1] = "#version 300 es\nprecision highp float;\n"
-		"uniform sampler2D uY, uC, uLut;\nuniform float uSat;\n"
+		"uniform sampler2D uY, uC, uLut;\nuniform float uSat;\nuniform mat3 uGm;\n"
 		"in vec2 vUV;\nout vec4 oCol;\n"
 		"void main(){ float y = texture(uY,vUV).r; oCol=vec4(y,y,y,1.0); }\n";
 	FSV[2] = "#version 300 es\nprecision highp float;\n"
-		"uniform sampler2D uY, uC, uLut;\nuniform float uSat;\n"
+		"uniform sampler2D uY, uC, uLut;\nuniform float uSat;\nuniform mat3 uGm;\n"
 		"in vec2 vUV;\nout vec4 oCol;\n"
 		"void main(){ vec2 c=texture(uC,vUV).rg; float y=texture(uY,vUV).r;"
 		" oCol=vec4(y,c,1.0); }\n";
 	FSV[3] = "#version 300 es\nprecision highp float;\n"
-		"uniform sampler2D uY, uC, uLut;\nuniform float uSat;\n"
+		"uniform sampler2D uY, uC, uLut;\nuniform float uSat;\nuniform mat3 uGm;\n"
 		"in vec2 vUV;\nout vec4 oCol;\n"
 		"void main(){ vec2 c=texture(uC,vUV).rg; float y=texture(uY,vUV).r;"
 		" vec2 l=texture(uLut,vec2(y,0.5)).rg; oCol=vec4(y,c.r,l.r,1.0); }\n";
 	FSV[4] = "#version 300 es\nprecision highp float;\n"
-		"uniform sampler2D uY, uC, uLut;\nuniform float uSat;\n"
+		"uniform sampler2D uY, uC, uLut;\nuniform float uSat;\nuniform mat3 uGm;\n"
 		"in vec2 vUV;\nout vec4 oCol;\n"
 		"void main(){ vec2 c=texture(uC,vUV).rg; float y=texture(uY,vUV).r;"
 		" float Y=dot(vec3(y,c),vec3(0.21,0.5,0.29));"
 		" oCol=vec4(Y, Y*1.3, Y*0.7, 1.0); }\n";
 	FSV[5] = "#version 300 es\nprecision highp float;\n"
-		"uniform sampler2D uY, uC, uLut;\nuniform float uSat;\n"
+		"uniform sampler2D uY, uC, uLut;\nuniform float uSat;\nuniform mat3 uGm;\n"
 		"in vec2 vUV;\nout vec4 oCol;\n"
 		"void main(){ vec2 c=texture(uC,vUV).rg; float y=texture(uY,vUV).r;"
 		" vec2 l=texture(uLut,vec2(y,0.5)).rg;"
@@ -341,7 +341,7 @@ static void build_fsv(void)
 		" for(int i=0;i<8;i++) o=o*0.99+0.01*l.r; oCol=vec4(o,1.0); }\n";
 
 	FSV[6] = "#version 300 es\nprecision highp float;\n"
-		"uniform sampler2D uY, uC, uLut;\nuniform float uSat;\n"
+		"uniform sampler2D uY, uC, uLut;\nuniform float uSat;\nuniform mat3 uGm;\n"
 		"in vec2 vUV;\nout vec4 oCol;\n"
 		"void main(){"
 		" float y8 = texture(uY,vUV).r;"
@@ -351,15 +351,13 @@ static void build_fsv(void)
 		" float Y1=(yo-16.0)/219.0;"
 		" float cb=(c8.x-128.0)/224.0*gain, cr=(c8.y-128.0)/224.0*gain;"
 		" vec3 rgb = vec3(Y1+1.4746*cr, Y1-0.1646*cb-0.5714*cr, Y1+1.8814*cb);"
-		" vec3 o = vec3(1.6605*rgb.r-0.5876*rgb.g-0.0728*rgb.b,"
-		" -0.1246*rgb.r+1.1329*rgb.g-0.0083*rgb.b,"
-		" -0.0182*rgb.r-0.1006*rgb.g+1.1187*rgb.b);"
+		" vec3 o = uGm * rgb;"
 		" o = clamp(o,0.0,1.0);"
 		" float lum = dot(o, vec3(0.2126,0.7152,0.0722));"
 		" o = mix(vec3(lum), o, uSat);"
 		" oCol = vec4(clamp(o,0.0,1.0),1.0); }\n";
 	FSV[7] = "#version 300 es\nprecision highp float;\n"
-		"uniform sampler2D uY, uC, uLut;\nuniform float uSat;\n"
+		"uniform sampler2D uY, uC, uLut;\nuniform float uSat;\nuniform mat3 uGm;\n"
 		"in vec2 vUV;\nout vec4 oCol;\n"
 		"void main(){"
 		" float y8 = texture(uY,vUV).r*255.0;"
@@ -369,9 +367,7 @@ static void build_fsv(void)
 		" float Y1=(yo-16.0)/219.0;"
 		" float cb=(c8.x-128.0)/224.0*gain, cr=(c8.y-128.0)/224.0*gain;"
 		" vec3 rgb = vec3(Y1+1.4746*cr, Y1-0.1646*cb-0.5714*cr, Y1+1.8814*cb);"
-		" vec3 o = vec3(1.6605*rgb.r-0.5876*rgb.g-0.0728*rgb.b,"
-		" -0.1246*rgb.r+1.1329*rgb.g-0.0083*rgb.b,"
-		" -0.0182*rgb.r-0.1006*rgb.g+1.1187*rgb.b);"
+		" vec3 o = uGm * rgb;"
 		" o = clamp(o,0.0,1.0);"
 		" float lum = dot(o, vec3(0.2126,0.7152,0.0722));"
 		" o = mix(vec3(lum), o, uSat);"
@@ -380,6 +376,7 @@ static void build_fsv(void)
 	FSV[8] = "#version 300 es\nprecision highp float;\n"
 		"uniform sampler2D uY, uC;\n"
 		"uniform float uPc[8], uPg[8], uSat;\n"
+		"uniform mat3 uGm;\n"
 		"in vec2 vUV;\nout vec4 oCol;\n"
 		"float ev(float c[8], float x){ float r=c[7];"
 		" for(int i=6;i>=0;i--) r = r*x + c[i]; return r; }\n"
@@ -391,9 +388,7 @@ static void build_fsv(void)
 		" float Y1=(yo-16.0)/219.0;"
 		" float cb=(c8.x-128.0)/224.0*gain, cr=(c8.y-128.0)/224.0*gain;"
 		" vec3 rgb = vec3(Y1+1.4746*cr, Y1-0.1646*cb-0.5714*cr, Y1+1.8814*cb);"
-		" vec3 o = vec3(1.6605*rgb.r-0.5876*rgb.g-0.0728*rgb.b,"
-		" -0.1246*rgb.r+1.1329*rgb.g-0.0083*rgb.b,"
-		" -0.0182*rgb.r-0.1006*rgb.g+1.1187*rgb.b);"
+		" vec3 o = uGm * rgb;"
 		" o = clamp(o,0.0,1.0);"
 		" float lum = dot(o, vec3(0.2126,0.7152,0.0722));"
 		" o = mix(vec3(lum), o, uSat);"
@@ -403,7 +398,7 @@ static void build_fsv(void)
 
 
 	FSV[9] = "#version 300 es\nprecision highp float;\n"
-		"uniform sampler2D uY, uC, uLut;\nuniform float uSat;\n"
+		"uniform sampler2D uY, uC, uLut;\nuniform float uSat;\nuniform mat3 uGm;\n"
 		"in vec2 vUV;\nout vec4 oCol;\n"
 		"void main(){"
 		" float y8 = texture(uY,vUV).r;"
@@ -413,9 +408,7 @@ static void build_fsv(void)
 		" float Y1=(yo-16.0)/219.0;"
 		" float cb=(c8.x-128.0)/224.0*gain, cr=(c8.y-128.0)/224.0*gain;"
 		" vec3 rgb = vec3(Y1+1.4746*cr, Y1-0.1646*cb-0.5714*cr, Y1+1.8814*cb);"
-		" vec3 o = vec3(1.6605*rgb.r-0.5876*rgb.g-0.0728*rgb.b,"
-		" -0.1246*rgb.r+1.1329*rgb.g-0.0083*rgb.b,"
-		" -0.0182*rgb.r-0.1006*rgb.g+1.1187*rgb.b);"
+		" vec3 o = uGm * rgb;"
 		" o = clamp(o,0.0,1.0);"
 		" float lum = dot(o, vec3(0.2126,0.7152,0.0722));"
 		" o = mix(vec3(lum), o, uSat);"
@@ -425,6 +418,7 @@ static void build_fsv(void)
 	FSV[10] = "#version 300 es\nprecision highp float;\n"
 		"uniform sampler2D uY, uC;\n"
 		"uniform float uPc[12], uSat;\n"
+		"uniform mat3 uGm;\n"
 		"in vec2 vUV;\nout vec4 oCol;\n"
 		"void main(){"
 		" float n = clamp((texture(uY,vUV).r*255.0-16.0)/219.0, 0.0, 1.0);"
@@ -441,9 +435,7 @@ static void build_fsv(void)
 		" float Y1=(yo-16.0)/219.0;"
 		" float cb=(c8.x-128.0)/224.0*gain, cr=(c8.y-128.0)/224.0*gain;"
 		" vec3 rgb = vec3(Y1+1.4746*cr, Y1-0.1646*cb-0.5714*cr, Y1+1.8814*cb);"
-		" vec3 o = vec3(1.6605*rgb.r-0.5876*rgb.g-0.0728*rgb.b,"
-		" -0.1246*rgb.r+1.1329*rgb.g-0.0083*rgb.b,"
-		" -0.0182*rgb.r-0.1006*rgb.g+1.1187*rgb.b);"
+		" vec3 o = uGm * rgb;"
 		" o = clamp(o,0.0,1.0);"
 		" float lum = dot(o, vec3(0.2126,0.7152,0.0722));"
 		" o = mix(vec3(lum), o, uSat);"
@@ -510,6 +502,13 @@ static struct {
 	struct gbm_bo *fly[4];
 	int fhead, ftail, nfly;
 	double t_sum, t_max, tsum;
+	/* 分布账：平均 fps 会把"偶尔 40ms"和"稳定 30ms"算成一样，这里分开记 */
+	struct ps_hist h_draw, h_swap, h_flip, h_int;
+	long drops;		/* 提交了但没上屏（swap/lock/SetCrtc/PageFlip 失败） */
+	int perf;		/* PERF=0 关掉逐帧 glFinish（会改流水线行为） */
+	double vbl_ms;		/* 一个刷新周期，判 vblank miss 的基准 */
+	double t_latch, t_latch_prev;
+	int latch_have;
 	/* 每块 dmabuf 一纹理。EGLImage 必须一起存：Mali 上 img 拿着
 	 * dma_buf 的引用，只 glDeleteTextures 不销毁 img，旧 buffer 就
 	 * 释放不掉，会话重建后新 dmabuf 分配/复用会 EBUSY
@@ -524,6 +523,22 @@ static struct {
 	unsigned frames;
 	double t_gl;
 } g;
+
+/* 收一次 GPU 完成时间。perf 开时 glFinish 把它变成真实耗时——不加 glFinish
+ * 拿到的只是"命令塞进队列"的时间，和 GPU 实际干完差了整整一帧，这种数看着
+ * 漂亮但会漏掉所有掉帧。关掉（PERF=0）则退回旧行为，可对比 glFinish 本身的
+ * 代价。 */
+static void gpu_done(double t0)
+{
+	double dt;
+
+	if (!g.perf) return;
+	glFinish();
+	dt = now_s() - t0;
+	g.t_sum += dt;
+	if (dt > g.t_max) g.t_max = dt;
+	ps_add(&g.h_draw, dt * 1000.0);
+}
 
 /* ---------- KMS：找 connector/crtc/mode ---------- */
 static int kms_pick(void)
@@ -568,6 +583,24 @@ static int kms_pick(void)
 	drmModeFreeResources(res);
 	printf("GLOUT: 屏幕 %ux%u@%u crtc=%u conn=%u\n", g.dw, g.dh,
 	       g.mode.vrefresh, g.crtc_id, g.conn_id);
+	/* 刷新周期按 mode 算，不用 vrefresh：后者常被驱动凑整，2560x1440@60
+	 * 实际是 59.95，阈值差 1% 就会把正常帧判成 miss。 */
+	g.vbl_ms = g.mode.htotal && g.mode.vtotal && g.mode.clock
+		   ? (double)g.mode.htotal * g.mode.vtotal / g.mode.clock
+		   : 1000.0 / (g.mode.vrefresh ? g.mode.vrefresh : 60);
+	{
+		const char *e = getenv("PERF");
+
+		g.perf = e ? atoi(e) : 1;
+		ps_init(&g.h_draw, "draw", "ms", g.vbl_ms);
+		ps_init(&g.h_swap, "swap", "ms", g.vbl_ms);
+		ps_init(&g.h_flip, "flip", "ms", g.vbl_ms * 1.5);
+		ps_init(&g.h_int,  "intv", "ms", g.vbl_ms * 1.5);
+		g.h_flip.slot_unit = g.vbl_ms;	/* flip 迟到几个周期 */
+		g.h_int.slot_unit = g.vbl_ms;	/* 上屏间隔几个周期 */
+		if (!g.perf)
+			printf("GLOUT: PERF=0，不做逐帧 glFinish，draw 只反映建命令时间\n");
+	}
 	return 0;
 }
 
@@ -653,6 +686,65 @@ int glout_init(unsigned sw, unsigned sh)
 	return 0;
 }
 
+/* LUT 纹理上传 + 采样参数（初始化一次；SEI 峰值后到时重建也走这条） */
+static void lut_upload(const float *lut)
+{
+	glBindTexture(GL_TEXTURE_2D, g.tex_lut);
+	if (getenv("GLLUT8")) {
+		unsigned char l8[256 * 4];
+		int i;
+
+		for (i = 0; i < 256; i++) {
+			float g8 = lut[i * 4 + 1] * (255.0f / 4.0f);
+
+			l8[i * 4 + 0] = (unsigned char)(lut[i * 4 + 0] * 255.0f + 0.5f);
+			l8[i * 4 + 1] = (unsigned char)(g8 < 0 ? 0 : g8 > 255 ? 255 : g8 + 0.5f);
+			l8[i * 4 + 2] = 0;
+			l8[i * 4 + 3] = 255;
+		}
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 1, 0, GL_RGBA,
+			     GL_UNSIGNED_BYTE, l8);
+	} else
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, 256, 1, 0, GL_RGBA,
+			     GL_FLOAT, lut);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+}
+
+/* GL 这条路径在开流前就把 LUT 建好了，而 maxCLL 往往跟着第一帧的 SEI 才到。
+ * 峰值一变就重建表 + 重拟多项式（uPc/uPg 每帧都上传，不用另外处理），
+ * 否则整片都在按兜底的 1000 压。每帧两次比较的代价。
+ */
+static void tm_peak_sync(void)
+{
+	float lut[256 * 4];
+	double p;
+
+	if (!tp_sat_env && g_cm.primaries != tp_pri) {
+		double s;
+
+		tp_pri = g_cm.primaries;
+		s = hc_sat_from_primaries(tp_pri, 0.90);
+		if (fabs(s - tp.sat) > 0.001) {
+			tp.sat = s;
+			build_lut(lut);
+			lut_upload(lut);
+			printf("GLOUT: 色域 -> %s，sat=%.2f，LUT 重建\n",
+			       cm_gamut(), tp.sat);
+		}
+	}
+	if (tp_peak_env)
+		return;
+	p = csig_peak();
+	if (p <= 0.0 || fabs(p - tp_peak_used) <= 0.5)
+		return;
+	build_lut(lut);
+	lut_upload(lut);
+	printf("GLOUT: 内容峰值 -> %.0fnits(sei)，LUT 重建\n", tp.src_peak);
+}
+
 /* ---------- GL 资源（懒初始化） ---------- */
 static int glout_gl_init(void)
 {
@@ -677,28 +769,7 @@ static int glout_gl_init(void)
 	glEnableVertexAttribArray(0);
 	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)0);
 	glGenTextures(1, &g.tex_lut);
-	glBindTexture(GL_TEXTURE_2D, g.tex_lut);
-	if (getenv("GLLUT8")) {
-		unsigned char l8[256 * 4];
-		int i;
-
-		for (i = 0; i < 256; i++) {
-			float g8 = lut[i * 4 + 1] * (255.0f / 4.0f);
-
-			l8[i * 4 + 0] = (unsigned char)(lut[i * 4 + 0] * 255.0f + 0.5f);
-			l8[i * 4 + 1] = (unsigned char)(g8 < 0 ? 0 : g8 > 255 ? 255 : g8 + 0.5f);
-			l8[i * 4 + 2] = 0;
-			l8[i * 4 + 3] = 255;
-		}
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 1, 0, GL_RGBA,
-			     GL_UNSIGNED_BYTE, l8);
-	} else
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, 256, 1, 0, GL_RGBA,
-			     GL_FLOAT, lut);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	lut_upload(lut);
 	g.tex_y = 0;
 	g.tex_c = 0;
 	return 0;
@@ -771,10 +842,40 @@ static void drop_tex(void)
 /* seek 后 dmabuf fd 全换了一批：把旧纹理扔掉，按新 fd 重新导入。
  * GL 上下文/EGLDisplay/DRM 都不动，所以屏幕不会黑。
  */
+/* 给自检/上层看的统计：片元（含 glFinish 的绘制）累计与峰值、swap 累计 */
+void glout_stats(double *draw_sum, double *draw_max, double *swap_sum,
+		 unsigned *frames)
+{
+	if (draw_sum) *draw_sum = g.t_sum;
+	if (draw_max) *draw_max = g.t_max;
+	if (swap_sum) *swap_sum = g.tsum;
+	if (frames) *frames = g.frames;
+}
+
 void glout_reset(void)
 {
 	if (!g.inited) return;
 	drop_tex();
+}
+
+/* 帧级性能结论。故意不打印 fps：fps 是下面四个量的商，看商看不出病因。 */
+void glout_perf_print(void)
+{
+	if (!g.frames) return;
+	printf("--- GLOUT 性能（%u 帧, 周期 %.3f ms）---\n", g.frames, g.vbl_ms);
+	ps_print(&g.h_draw);
+	ps_print(&g.h_swap);
+	ps_print(&g.h_flip);
+	if (g.h_flip.n) {
+		long miss = (long)g.h_flip.over;
+
+		printf("PERF flip  vblank miss %ld 次 / %ld 次翻页 (%.1f%%)"
+		       "，最大迟到 %.2f ms = %.2f 个周期\n",
+		       miss, g.h_flip.n, 100.0 * miss / g.h_flip.n,
+		       g.h_flip.maxv, g.vbl_ms > 0 ? g.h_flip.maxv / g.vbl_ms : 0);
+	}
+	ps_print(&g.h_int);
+	printf("PERF 掉帧 %ld 帧 / 提交 %u 帧\n", g.drops, g.frames);
 }
 
 /* 上屏前抓一帧（GLDUM=/tmp/x.ppm），用来核对色调映射对不对 */
@@ -844,6 +945,23 @@ static void wait_flip_to(int ms)
 static void wait_flip(void)
 {
 	wait_flip_to(200);
+}
+
+/* 一次上屏的两笔账：
+ *   flip 延迟 = 请求翻页 → flip 完成事件。翻页只会落在某个 vblank 边界上，
+ *     所以正常值 ≤ 1 个周期；超过 1.5 周期说明这一帧没赶上最近那个 vblank，
+ *     也就是真正意义上的 vblank miss（不是"fps 低"，是"交晚了"）。
+ *   intv = 两次真正上屏的间隔。24fps@60 应该只有 33.3/50.0 两个峰；出现
+ *     16.7 说明某些帧被重复扫了，出现 66.7 说明漏了一个槽。
+ */
+static void record_flip(double t_req)
+{
+	double now = now_s(), ms = (now - t_req) * 1000.0;
+
+	ps_add(&g.h_flip, ms);
+	if (g.latch_have) ps_add(&g.h_int, (now - g.t_latch_prev) * 1000.0);
+	g.t_latch_prev = now;
+	g.latch_have = 1;
 }
 
 /* GBM 前缓冲 → fb_id（每种 bo 复用） */
@@ -948,6 +1066,7 @@ static int twopass_frame(unsigned w, unsigned h)
 	glUniform1i(glGetUniformLocation(g.prog, "uC"), 1);
 	glUniform1i(glGetUniformLocation(g.prog, "uLut"), 2);
 	glUniform1f(glGetUniformLocation(g.prog, "uSat"), (float)tp.sat);
+	gm_upload(g.prog);
 	glUniform1fv(glGetUniformLocation(g.prog, "uPc"), 12, poly_c);
 	glUniform1fv(glGetUniformLocation(g.prog, "uPg"), 12, poly_g);
 	glBindVertexArray(g.vao);
@@ -969,10 +1088,7 @@ static int twopass_frame(unsigned w, unsigned h)
 	glBindTexture(GL_TEXTURE_2D, g.tex_rgb);
 	glUniform1i(glGetUniformLocation(g.prog2, "uTex"), 0);
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-	if (getenv("GLTIME")) {
-		glFinish();
-		g.t_sum += now_s() - t0;
-	}
+	gpu_done(t0);		/* twopass 也要记，别只记单 pass */
 	return 0;
 }
 
@@ -997,6 +1113,7 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 			return -1;
 		}
 	}
+	tm_peak_sync();	/* 峰值后到就重建 LUT（每帧两次比较） */
 	if (w != g.sw || h != g.sh) {
 		drop_tex();
 		g.sw = w;
@@ -1077,6 +1194,7 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 	glUniform1i(glGetUniformLocation(g.prog, "uC"), 1);
 	glUniform1i(glGetUniformLocation(g.prog, "uLut"), 2);
 	glUniform1f(glGetUniformLocation(g.prog, "uSat"), (float)tp.sat);
+	gm_upload(g.prog);
 	glUniform1fv(glGetUniformLocation(g.prog, "uPc"), 12, poly_c);
 	glUniform1fv(glGetUniformLocation(g.prog, "uPg"), 12, poly_g);
 	glBindVertexArray(g.vao);
@@ -1084,36 +1202,35 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 		double t0 = now_s();
 
 		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-		if (getenv("GLTIME")) {
-			glFinish();
-			g.t_sum += now_s() - t0;
-			if (now_s() - t0 > g.t_max) g.t_max = now_s() - t0;
-		}
+		gpu_done(t0);
 	}
 
 swap:
 	dump_frame();
 	{
-		double ts = now_s();
+		double ts = now_s(), dt;
 
 		if (!eglSwapBuffers(g.dpy, g.surf)) {
 			printf("GLOUT: swap 失败 0x%x\n", eglGetError());
+			g.drops++;
 			return -1;
 		}
-		g.tsum += now_s() - ts;
+		dt = now_s() - ts;
+		g.tsum += dt;
+		ps_add(&g.h_swap, dt * 1000.0);
 	}
 	if (0) {
 		printf("GLOUT: swap 失败 0x%x\n", eglGetError());
 		return -1;
 	}
 	bo = gbm_surface_lock_front_buffer(g.gs);
-	if (!bo) { printf("GLOUT: lock_front 失败\n"); return -1; }
+	if (!bo) { printf("GLOUT: lock_front 失败\n"); g.drops++; return -1; }
 	fbr = gbm_bo_get_user_data(bo) ? *(uint32_t *)gbm_bo_get_user_data(bo) : 0;
 	if (!fbr) {
 		uint32_t *slot = calloc(1, sizeof(uint32_t));
 
 		fbr = bo_to_fb(bo);
-		if (!fbr) return -1;
+		if (!fbr) { g.drops++; return -1; }
 		*slot = fbr;
 		gbm_bo_set_user_data(bo, slot, NULL);
 	}
@@ -1132,6 +1249,7 @@ swap:
 		g.first = 0;
 	} else {
 		int tries = 0, ok = 0;
+		double t_req = now_s();
 
 		/* EBUSY = 上一个 flip 还挂在 CRTC 上没完成（内核同一时刻
 		 * 只允许一个 pending flip）。以前这里直接放弃 → 进程 die →
@@ -1150,6 +1268,7 @@ swap:
 		}
 		if (ok) {
 			wait_flip();
+			record_flip(t_req);
 		} else {
 			/* 兜底：SetCrtc 会同步等旧 flip 收尾，代价是一次
 			 * 直切（可能轻微闪），但比整链重启强得多。
@@ -1160,8 +1279,10 @@ swap:
 					   &g.conn_id, 1, &g.mode)) {
 				printf("GLOUT: SetCrtc 兜底也失败: %s\n",
 				       strerror(errno));
+				g.drops++;
 				return -1;
 			}
+			record_flip(t_req);	/* 直切也算一次上屏，别漏样本 */
 		}
 	}
 	if (g.prev_bo && g.prev_bo != bo) {
@@ -1235,7 +1356,7 @@ static int mk_dumb(unsigned w, unsigned h, int bpp, int *fd_out,
 	return fd;
 }
 
-static int gen_testcard(unsigned w, unsigned h, int *fy, int *fc,
+int gen_testcard(unsigned w, unsigned h, int *fy, int *fc,
 			unsigned *sy_out, unsigned *sc_out)
 {
 	void *my = NULL, *mc = NULL;
@@ -1332,9 +1453,7 @@ int main(int argc, char **argv)
 		}
 	}
 	fps = i / (now_s() - t0);
-	if (getenv("GLTIME"))
-		printf("GLOUT: 绘制 %.2f ms/帧, swap %.2f ms/帧\n",
-		       g.t_sum * 1000 / i, g.tsum * 1000 / i);
+	glout_perf_print();
 	printf("GLOUT: %u 帧, %.1f fps (源 %ux%u → 屏 %ux%u)\n",
 	       i, fps, w, h, g.dw, g.dh);
 	return 0;

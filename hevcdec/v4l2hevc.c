@@ -28,14 +28,18 @@
 #include <drm/drm_fourcc.h>
 #endif
 
-#ifdef USE_GLOUT
-/* glout.c：NV12 dmabuf → panfrost GLES3 上屏（HDR10→SDR tone map） */
-void glout_set_drm_fd(int fd);
-int glout_init(unsigned sw, unsigned sh);
-int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
-		unsigned ypitch, unsigned cpitch);
-void glout_reset(void);
-#endif
+/* 一个播放器，两种 Renderer：上屏方式在 render_*.c 里，播放器不认识它们 */
+#include "render.h"
+
+/* 内容信号（SEI 里的 maxCLL / mastering display）。这个 TU 出强定义，
+ * glout.c 只引用——它的 LUT 也要跟着真实峰值走，不再是写死 1000。 */
+#define CSIG_OWNER
+#include "spscolor.h"
+#include "csig.h"
+/* 定义在 SPS 解析之后（那里已经用到这条链路），AU 循环里要提前用 */
+static void csig_sei(const unsigned char *nal, size_t n);
+static size_t rbsp_un(unsigned char *dst, size_t cap,
+		      const unsigned char *src, size_t n);
 
 #define DEV "/dev/video0"
 #define NBUF_CAP_MAX 32
@@ -51,6 +55,28 @@ static volatile sig_atomic_t g_reinit;	/* 定义在下方，xioctl 要先看到 
  * 否则交给上层整链重启会闪屏。
  */
 static int g_err_rec;
+
+/* ---- 重建请求：两个 bit 装不下"这次要做多狠"（§3.2.2）----
+ * 请求位只记录"要不要重建 + 最高档"，真正的动作由事务（tx_run）执行。
+ * 规则：**只升级不降级**——一次 STALL 叠一次 seek，按 HARD 走；排队等于
+ * 先做一次无用功再毁一次。
+ *   档位：L1 REARM（门控重置）/ L2 REBUILD（重开设备）/ L3 HARD（+整块复位）
+ *   L0（还没到要动会话）和 L4（放弃，交上层整链重启）不进事务。
+ */
+enum vev { VEV_NEWSTREAM, VEV_SEEK, VEV_ABORT, VEV_STALL,
+	   VEV_SRCCHANGE, VEV_RAP, VEV_SELFTEST };
+enum { LVL_L1 = 1, LVL_L2, LVL_L3 };
+static volatile sig_atomic_t g_req_lvl;	/* 当前请求档位（0=没有请求） */
+static volatile sig_atomic_t g_req_why;	/* 抬高档位的那个原因 */
+
+static void tx_request(int lvl, enum vev why)
+{
+	if (lvl > g_req_lvl) {		/* 只升级不降级 */
+		g_req_lvl = lvl;
+		g_req_why = (int)why;
+	}
+	g_reinit = 1;
+}
 
 static int xioctl(int fd, unsigned long req, void *arg)
 {
@@ -84,12 +110,146 @@ static double now_s(void)
 	return t.tv_sec + t.tv_nsec / 1e9;
 }
 
-static struct {
+static double env_d(const char *k, double d)
+{
+	const char *e = getenv(k);
+
+	return e && *e ? atof(e) : d;
+}
+
+static int env_i(const char *k, int d)
+{
+	const char *e = getenv(k);
+
+	return e && *e ? atoi(e) : d;
+}
+
+/* ---- RAP 门控状态机（§1.14）------------------------------------------
+ * 重建会话后必须从一个"能自解码"的随机接入点起播，但片源是 open GOP
+ * （实测 10 个 RAP 里 9 个是 CRA，见 §1.3），所以判据不能只是布尔量。
+ * 三个状态 + 一张超时表，每个转移都由下一帧的类型或计时器触发：
+ *
+ *   PLAY --(信号/abort/超时)--> WAIT --(可接受 RAP)--> {PLAY | RASL}
+ *   RASL --(非 RASL 帧)--> PLAY ;  RASL --(预算超支)--> WAIT --(累计超支)--> 退出
+ *
+ * 超时（都可 env 覆盖，0=不限）：
+ *   RAPSTRICT   3.0s   WAIT 里 strict 模式等 16..20 的预算，超过就降级收 CRA
+ *   IRAPWAIT   60.0s   WAIT 的绝对上限，超过判死 → 重建（计入 ERRREC）
+ *   RAPRASLMAX    8    RASL 段最多丢几个 AU（x265 的 leading picture 会有 3~4 个）
+ *   RAPRASLSEC  1.5s   RASL 段的时长上限
+ *   STALLSEC   12.0s   仅 PLAY 态：无新帧判死（门控态本来就不出帧，不适用）
+ */
+static int g_verbose;		/* VERBOSE：状态机/事件级日志 */
+enum { RAP_PLAY, RAP_WAIT, RAP_RASL };
+static int g_rap_st = RAP_WAIT;	/* 起播也要过闸门，语义统一 */
+static double g_rap_t0;		/* 进入当前状态的时刻 */
+static int g_rap_degraded;	/* strict 已降级成"CRA 也收"，每会话一次 */
+static int g_rap_rasl_n;	/* 本次 RASL 段已丢的 AU 数 */
+static int g_rap_rasl_over;	/* RASL 预算超支次数 */
+static int g_rap_drop;		/* 本会话被门控丢掉的 AU 总数（诊断） */
+static const char *g_rap_cause = "start";	/* 为什么进 WAIT */
+
+/* RAPMODE=cra（默认）| strict|idr（只认 16..20） */
+static int rap_strict(void)
+{
+	const char *e = getenv("RAPMODE");
+
+	return e && (!strcmp(e, "strict") || !strcmp(e, "idr"));
+}
+
+/* 这个 RAP 类型够不够开播。16..20（BLA/IDR 系）一定够；21(CRA) 是
+ * open GOP 的头，它后面的 RASL 帧参考 CRA 之前的帧——新会话里没有，
+ * 所以收 CRA 的代价是紧接着丢一个 RASL AU。默认收，strict 只在降级后收。
+ */
+static int rap_accept(int rap)
+{
+	if (rap >= 16 && rap <= 20)
+		return 1;
+	if (rap == 21)
+		return !rap_strict() || g_rap_degraded;
+	return 0;
+}
+
+static void rap_enter(int st, const char *why)
+{
+	static const char *nm[] = { "PLAY", "WAIT", "RASL" };
+
+	if ((g_verbose || getenv("RAPDBG")) && st != g_rap_st)
+		printf("RAP %s -> %s (%s) drop=%d\n",
+		       nm[g_rap_st], nm[st], why, g_rap_drop);
+	g_rap_st = st;
+	g_rap_t0 = now_s();
+	g_rap_rasl_n = 0;
+	if (st == RAP_WAIT) {
+		g_rap_cause = why;
+		g_rap_drop = 0;
+	}
+}
+
+/* 门控态的超时/降级。返回 0=没事，1=要重建会话，2=要退出。 */
+static int rap_tick(void)
+{
+	double el, lim;
+
+	if (g_rap_st == RAP_PLAY)
+		return 0;
+	el = now_s() - g_rap_t0;
+
+	/* strict 降级：只在 WAIT 里、每会话一次。降级后重算预算，
+	 * 否则下一个 tick 立刻撞 IRAPWAIT 的旧计时。 */
+	if (g_rap_st == RAP_WAIT && rap_strict() && !g_rap_degraded) {
+		lim = env_d("RAPSTRICT", 3.0);
+		if (lim > 0 && el > lim) {
+			g_rap_degraded = 1;
+			printf("RAP: strict 等了 %.1fs 没见 16..20（丢 %d AU）→ 降级收 CRA\n",
+			       el, g_rap_drop);
+			fflush(stdout);
+			g_rap_t0 = now_s();
+			el = 0;
+		}
+	}
+
+	/* RASL 段失控："CRA 后面只有 RASL"这个假设不成立（预算给到 8 AU /
+	 * 1.5s，正常 leading picture 最多 4 个）。退回 WAIT 重等，不许原地
+	 * 死循环——同一个会话里第二次超支就交给上层重建。 */
+	if (g_rap_st == RAP_RASL) {
+		int n = env_i("RAPRASLMAX", 8);
+		double sec = env_d("RAPRASLSEC", 1.5);
+
+		if ((n > 0 && g_rap_rasl_n > n) || (sec > 0 && el > sec)) {
+			fflush(stdout);
+			if (++g_rap_rasl_over <= 2) {
+				printf("RAP: RASL 段超预算（%d AU / %.1fs）→ 退回等 RAP\n",
+				       g_rap_rasl_n, el);
+				rap_enter(RAP_WAIT, "rasl-over");
+				return 0;
+			}
+			printf("RAP: RASL 超预算已 %d 次，判死\n", g_rap_rasl_over);
+			return 2;
+		}
+		return 0;
+	}
+
+	/* WAIT 绝对上限（原 IRAPWAIT 语义）。注意这一路是"流里根本没有合用
+	 * 的 RAP"，硬复位治不了，只做软重建，且计入 ERRREC 防死循环。 */
+	lim = env_d("IRAPWAIT", 60.0);
+	if (lim > 0 && el > lim) {
+		printf("RAP: 等 %.0fs 没有可用 RAP（丢 %d AU，%s）→ 重建会话\n",
+		       el, g_rap_drop, g_rap_cause);
+		return 1;
+	}
+	return 0;
+}
+
+struct capbuf {
 	void *mem[VIDEO_MAX_PLANES];
 	size_t len[VIDEO_MAX_PLANES];
 	int dmabuf[VIDEO_MAX_PLANES];	/* EXPBUF=1 时有效 */
 	void *mem2[VIDEO_MAX_PLANES];	/* dmabuf fd 另开的映射（测访问属性用） */
-} capbuf[NBUF_CAP_MAX];
+};
+static struct capbuf capbuf[NBUF_CAP_MAX];
+/* 这一块交给 Renderer 了、还没收到完成反馈：期间绝不能再 QBUF */
+static int cap_busy[NBUF_CAP_MAX];
 static unsigned cap_count;
 
 static struct { void *mem; size_t len; } outbuf[NBUF_OUT];
@@ -100,26 +260,53 @@ static size_t stream_size;
 static struct { size_t off, len; int key; } au[4096];
 static int n_au;
 
-static int fd;
+static int fd = -1;
+/* 会话生命周期三个入口（实现在下发码流解析之后）：一个进程同一时刻
+ * 只有一个会话，所有资源的生灭都只经过这三个函数。 */
+static int vdec_open(unsigned w, unsigned h);
+static int vdec_close(int hard_reset);
+static int vdec_resize(unsigned w, unsigned h);
 /* seek 时驱动没法在同一个 V4L2 会话里接新码流（meson-vdec 直接
  * "Unrecognized dec_status 0000000F / Aborting decoding session"），
- * 必须重开 /dev/video0。DRM/GL 那一路不碰，所以屏幕不黑。
+ * 必须重开 /dev/video0。Renderer 那一路不碰，所以屏幕不黑。
  */
-static void on_usr1(int sig) { (void)sig; g_reinit = 1; }
-#ifdef USE_GLOUT
-static int g_gl_ready;
-#endif
+static void on_usr1(int sig)
+{
+	/* 信号里不许调 printf，也调不动 tx_request 的语义分支：直接写请求位。
+	 * seek 只要 L2（换新码流），但若此前已经要 L3，就保持 L3。
+	 */
+	(void)sig;
+	if (g_req_lvl < LVL_L2) {
+		g_req_lvl = LVL_L2;
+		g_req_why = VEV_SEEK;
+	}
+	g_reinit = 1;
+}
 static unsigned g_w = 640, g_h = 360;
 static int got, resets, g_refeed;
-/* 重建会话后必须从 IRAP 重新起解：续喂到 GOP 中间，驱动 ref list 是空的，
- * 每一帧都 "Couldn't find ref. frame 0"，硬件把 ref 地址当地址 0 读，
- * 通常几帧内再次静默挂死（soak 实测重开后 8 帧就死）。
+/* 重建会话后必须从随机接入点重新起解：续喂到 GOP 中间，驱动 ref list
+ * 是空的，每一帧都 "Couldn't find ref. frame 0"，硬件把 ref 地址当地址 0
+ * 读，通常几帧内再次静默挂死（soak 实测重开后 8 帧就死）。
+ * 判据在 now_s() 下面的 RAP 门控状态机里（g_rap_st），这里不再单独存布尔量。
  */
-static int g_need_irap;
-/* 本次重建是否要连 VDEO 整块一起掉电复位（只有固件 hang 才需要，
- * seek 那种正常重建走一遍掉电太贵、还会多闪一次） */
-static int g_hard_reset_on_reinit;
-static double t_irap_wait;	/* 本会话开始等 IRAP 的时刻 */
+/* ---- 重建事务对象（§3.2.2）----
+ * 对外可见的状态只有两种：VS_RUN(sess=N) 或 VS_DOWN(fd<0)。事务就是那个
+ * "只在这两种状态之间搬东西"的过程，中间态不许被事务外的人看到。
+ */
+enum tx_phase { TX_IDLE, TX_PREPARE, TX_BODY, TX_COMMIT, TX_ABORT };
+
+struct vdec_tx {
+	unsigned id;		/* txid，日志对账用 */
+	enum vev why;
+	int level;		/* L1/L2/L3 */
+	unsigned sess_before;	/* 进入时的 g_sess：commit 之前不许变 */
+	int hard;		/* = (level == LVL_L3) */
+	double t0, deadline;	/* 预算按时间，不按次数 */
+	int tries;		/* 尝试计数（与会话代数分开记） */
+	enum tx_phase phase;
+};
+
+static struct vdec_tx g_tx = { .phase = TX_IDLE };
 static int g_force_reinit_at;	/* 0=未启用 */
 static int g_mark_first;	/* reinit 后等待首帧，打一行供脚本同步 */
 /* 计时：把"纯解码吞吐"从启动/收尾/写盘里剥出来 */
@@ -181,7 +368,218 @@ static void parse_au(void)
 		au[0].key = 1;
 }
 
-static void s_fmt_cap(unsigned w, unsigned h)
+/* ---- §4.3.6 交叉校验：VUI（原始语法）vs V4L2 capture format（驱动翻译过）----
+ * 只用来报警，一律以 VUI 为准：stateful vdec 驱动不一定填真值，常见是
+ * 只给默认值（REC709/full）。所以这四个数不参与任何计算，只喂 color_report()。
+ * -1 = 还没拿到格式（G/S_FMT 之前）。
+ */
+static int g_v4l_cs = -1, g_v4l_xf = -1, g_v4l_enc = -1, g_v4l_q = -1;
+
+static void v4l_color_read(const struct v4l2_format *f)
+{
+	g_v4l_cs = (int)f->fmt.pix_mp.colorspace;
+	g_v4l_xf = (int)f->fmt.pix_mp.xfer_func;
+	g_v4l_enc = (int)f->fmt.pix_mp.ycbcr_enc;
+	g_v4l_q = (int)f->fmt.pix_mp.quantization;
+}
+
+/* V4L2 枚举 → 码流枚举。对不上（没写/是 DEFAULT）返 0 = 不参与比较。
+ * DCI-P3 故意映射到 11 而不是 12：它和 Display P3 白点不同，并过去就成了
+ * "一致"，而实际上色域窄一截——宁可让日志说它不一致。 */
+static int v4l_prim(int cs)
+{
+	switch (cs) {
+	case V4L2_COLORSPACE_REC709:
+	case V4L2_COLORSPACE_SRGB:	return 1;
+	case V4L2_COLORSPACE_BT2020:	return 9;
+	case V4L2_COLORSPACE_DCI_P3:	return 11;
+	default:			return 0;
+	}
+}
+
+static int v4l_tf(int xf)
+{
+	switch (xf) {
+	case V4L2_XFER_FUNC_709:
+	case V4L2_XFER_FUNC_SRGB:	return 1;
+	case V4L2_XFER_FUNC_SMPTE2084:	return 16;
+	default:			return 0;
+	}
+}
+
+static int v4l_mat(int enc)
+{
+	switch (enc) {
+	case V4L2_YCBCR_ENC_709:	return 1;
+	case V4L2_YCBCR_ENC_BT2020:	return 9;
+	default:			return 0;
+	}
+}
+
+static int v4l_rng(int q)
+{
+	if (q == V4L2_QUANTIZATION_FULL_RANGE) return 1;
+	if (q == V4L2_QUANTIZATION_LIM_RANGE) return 0;
+	return -1;
+}
+
+static const char *v4l_cs_name(int cs)
+{
+	switch (cs) {
+	case V4L2_COLORSPACE_DEFAULT:		return "default";
+	case V4L2_COLORSPACE_SMPTE170M:		return "smpte170m";
+	case V4L2_COLORSPACE_SMPTE240M:		return "smpte240m";
+	case V4L2_COLORSPACE_REC709:		return "bt709";
+	case V4L2_COLORSPACE_BT878:		return "bt878";
+	case V4L2_COLORSPACE_470_SYSTEM_M:	return "470m";
+	case V4L2_COLORSPACE_470_SYSTEM_BG:	return "470bg";
+	case V4L2_COLORSPACE_JPEG:		return "jpeg";
+	case V4L2_COLORSPACE_SRGB:		return "srgb";
+	case V4L2_COLORSPACE_OPRGB:		return "oprgb";
+	case V4L2_COLORSPACE_BT2020:		return "bt2020";
+	case V4L2_COLORSPACE_RAW:		return "raw";
+#ifdef V4L2_COLORSPACE_DCI_P3
+	case V4L2_COLORSPACE_DCI_P3:		return "dcip3";
+#endif
+	default:				return "其它";
+	}
+}
+
+static const char *v4l_xf_name(int xf)
+{
+	switch (xf) {
+	case V4L2_XFER_FUNC_DEFAULT:	return "default";
+	case V4L2_XFER_FUNC_709:	return "bt709";
+	case V4L2_XFER_FUNC_SRGB:	return "srgb";
+	case V4L2_XFER_FUNC_OPRGB:	return "oprgb";
+	case V4L2_XFER_FUNC_SMPTE240M:	return "smpte240m";
+	case V4L2_XFER_FUNC_NONE:	return "none";
+	case V4L2_XFER_FUNC_DCI_P3:	return "dcip3";
+	case V4L2_XFER_FUNC_SMPTE2084:	return "pq";
+	default:			return "其它";
+	}
+}
+
+static const char *v4l_enc_name(int enc)
+{
+	switch (enc) {
+	case V4L2_YCBCR_ENC_DEFAULT:	return "default";
+	case V4L2_YCBCR_ENC_601:	return "601";
+	case V4L2_YCBCR_ENC_709:	return "709";
+	case V4L2_YCBCR_ENC_XV601:	return "xv601";
+	case V4L2_YCBCR_ENC_XV709:	return "xv709";
+	case V4L2_YCBCR_ENC_SYCC:	return "sycc";
+	case V4L2_YCBCR_ENC_BT2020:	return "bt2020";
+	case V4L2_YCBCR_ENC_BT2020_CONST_LUM: return "bt2020cl";
+	case V4L2_YCBCR_ENC_SMPTE240M:	return "smpte240m";
+	default:			return "其它";
+	}
+}
+
+static const char *v4l_q_name(int q)
+{
+	switch (q) {
+	case V4L2_QUANTIZATION_DEFAULT:		return "default";
+	case V4L2_QUANTIZATION_FULL_RANGE:	return "full";
+	case V4L2_QUANTIZATION_LIM_RANGE:	return "limited";
+	default:				return "其它";
+	}
+}
+
+static const char *cmx_mat_name(int m)
+{
+	switch (m) {
+	case 0:  return "GBR";
+	case 1:  return "BT.709";
+	case 9:  return "BT.2020NCL";
+	case 10: return "BT.2020CL";
+	case 14: return "ICtCp";
+	default: return "其它";
+	}
+}
+
+/* ---- §4.3.8：一条完整的 COLOR: 行 ----
+ * 只在内容信号真的变了才打印（四个 int + 三个 double 全比较）：
+ * 单片段全片一条，混剪片在切换点各一条——§4.3.8「切换点前后两帧 COLOR: 行不同、
+ * 无闪帧」就是靠这个判的。每帧成本是一次 memcmp，可以无条件每帧调。
+ */
+static struct ColorMetadata g_crep;
+static int g_crep_v4l[4] = { -2, -2, -2, -2 };
+static int g_crep_valid;
+
+static void color_report(void)
+{
+	struct ColorMetadata *c = &g_cm;
+	int v[4] = { g_v4l_cs, g_v4l_xf, g_v4l_enc, g_v4l_q };
+	const char *src;
+	int have, bad = 0;
+
+	if (g_crep_valid && !memcmp(&g_crep, c, sizeof(*c)) &&
+	    !memcmp(g_crep_v4l, v, sizeof(v)))
+		return;
+	g_crep = *c;
+	memcpy(g_crep_v4l, v, sizeof(v));
+	g_crep_valid = 1;
+
+	have = c->primaries || c->transfer || c->matrix ||
+	       c->max_cll > 0.0f || c->mastering_max_luminance > 0.0f;
+	if (!have) {
+		/* 回退值必须说出来：静默用默认=之前那个查不出来的老问题 */
+		printf("COLOR: 无元数据，回退默认（峰值兜底 1000nits，"
+		       "HDR 开关按 HDR=，色域按 709 透传）\n");
+		return;
+	}
+
+	if (getenv("TM_SRC_PEAK"))
+		src = "TM_SRC_PEAK";
+	else if (c->max_cll > 0.0f)
+		src = "SEI144 maxCLL";
+	else if (c->mastering_max_luminance > 0.0f)
+		src = "SEI137 母版";
+	else
+		src = "兜底";
+
+	/* 0 一律是"码流没写"，别借用枚举里的 0（matrix=0 是 GBR，
+	 * 但这里 0 的含义是"没标"，打印成 GBR 会误导）。 */
+	printf("COLOR: VUI=%s/%s/%s/%s %s (p=%d tf=%d mx=%d rng=%d)"
+	       " | 峰值=%.0f nits(%s) 母版=%.4g/%.4g nits",
+	       c->primaries ? cm_gamut() : "未标",
+	       cm_tf_name(),
+	       c->matrix ? cmx_mat_name(c->matrix) : "未标",
+	       c->range ? "full" : "limited",
+	       c->bit_depth ? (c->bit_depth == 10 ? "10bit" :
+			       c->bit_depth == 12 ? "12bit" : "8bit") : "bd未标",
+	       c->primaries, c->transfer, c->matrix, c->range,
+	       csig_peak() > 0.0 ? csig_peak() : 0.0, src,
+	       c->mastering_max_luminance, c->mastering_min_luminance);
+
+	if (g_v4l_cs < 0) {
+		printf(" | V4L2=未读到（G/S_FMT 之前）\n");
+		return;
+	}
+
+	/* §4.3.6 交叉校验：只报警，一律用 VUI（原始语法）。
+	 * 驱动字段是 DEFAULT/没写时映射成 0 = 不参与比较，不冤枉它。 */
+	if (c->primaries && v4l_prim(g_v4l_cs) && v4l_prim(g_v4l_cs) != c->primaries)
+		bad++;
+	if (c->transfer && v4l_tf(g_v4l_xf) && v4l_tf(g_v4l_xf) != c->transfer)
+		bad++;
+	if (c->matrix && v4l_mat(g_v4l_enc) && v4l_mat(g_v4l_enc) != c->matrix)
+		bad++;
+	if (v4l_rng(g_v4l_q) >= 0 && v4l_rng(g_v4l_q) != c->range)
+		bad++;
+
+	printf(" | V4L2=%s/%s/%s/%s（%s）\n",
+	       v4l_cs_name(g_v4l_cs), v4l_xf_name(g_v4l_xf),
+	       v4l_enc_name(g_v4l_enc), v4l_q_name(g_v4l_q),
+	       bad ? "不一致，用 VUI" : "一致");
+}
+
+/* ---- 会话内的每个步骤都返回 0 / -errno ----
+ * 生命周期（vdec_open/close）靠这些返回值决定"重试还是放弃"，
+ * 所以这里一律不许 die()，也不许自己吞错误继续往下走。
+ */
+static int s_fmt_cap(unsigned w, unsigned h)
 {
 	struct v4l2_format f = {0};
 
@@ -194,11 +592,16 @@ static void s_fmt_cap(unsigned w, unsigned h)
 	f.fmt.pix_mp.plane_fmt[0].sizeimage = w * h;
 	f.fmt.pix_mp.plane_fmt[1].sizeimage = w * h / 2;
 	f.fmt.pix_mp.plane_fmt[1].bytesperline = w / 2;
-	if (xioctl(fd, VIDIOC_S_FMT, &f) < 0) die("S_FMT cap");
+	if (xioctl(fd, VIDIOC_S_FMT, &f) < 0) {
+		printf("S_FMT CAP %ux%u 失败: %s\n", w, h, strerror(errno));
+		return -errno;
+	}
 	g_w = f.fmt.pix_mp.width;
 	g_h = f.fmt.pix_mp.height;
+	v4l_color_read(&f);
 	printf("S_FMT CAP : %ux%u pf=%08x sizeimage=%u\n", g_w, g_h,
 	       f.fmt.pix_mp.pixelformat, f.fmt.pix_mp.plane_fmt[0].sizeimage);
+	return 0;
 }
 
 static void g_fmt_cap(void)
@@ -209,7 +612,12 @@ static void g_fmt_cap(void)
 	if (xioctl(fd, VIDIOC_G_FMT, &f) < 0) return;
 	g_w = f.fmt.pix_mp.width;
 	g_h = f.fmt.pix_mp.height;
-	printf("G_FMT CAP : %ux%u\n", g_w, g_h);
+	v4l_color_read(&f);
+	/* §4.3.6 要实测的一行：meson vdec 到底填不填这四个字段？
+	 * 只打印，不参与计算（真值一律取 VUI）。 */
+	printf("G_FMT CAP : %ux%u cs=%s xf=%s enc=%s q=%s\n",
+	       g_w, g_h, v4l_cs_name(g_v4l_cs), v4l_xf_name(g_v4l_xf),
+	       v4l_enc_name(g_v4l_enc), v4l_q_name(g_v4l_q));
 }
 
 static void cap_release(void)
@@ -231,11 +639,28 @@ static void cap_release(void)
 	xioctl(fd, VIDIOC_REQBUFS, &rb);
 }
 
-static void cap_setup(void)
+/* 导出的 dmabuf fd 是**给别人的引用**（Renderer/fb），队列释放不会
+ * 回收它们；每一条 realloc / close 路径都必须自己关，否则每次 seek
+ * 漏 2×cap_count 个 fd。
+ */
+static void close_cap_dmabufs(void)
+{
+	unsigned i;
+	int p;
+
+	for (i = 0; i < cap_count; i++)
+		for (p = 0; p < 2; p++)
+			if (capbuf[i].dmabuf[p] >= 0) {
+				close(capbuf[i].dmabuf[p]);
+				capbuf[i].dmabuf[p] = -1;
+			}
+}
+
+static int cap_setup(void)
 {
 	struct v4l2_requestbuffers rb = {0};
 	unsigned i;
-	int p;
+	int p, r = 0;
 
 	unsigned want = NBUF_CAP_MAX;
 
@@ -249,7 +674,10 @@ static void cap_setup(void)
 	rb.type = CAP_T;
 	rb.memory = V4L2_MEMORY_MMAP;
 	rb.count = want;
-	if (xioctl(fd, VIDIOC_REQBUFS, &rb) < 0) die("REQBUFS cap");
+	if (xioctl(fd, VIDIOC_REQBUFS, &rb) < 0) {
+		printf("REQBUFS cap 失败: %s\n", strerror(errno));
+		return -errno;
+	}
 	cap_count = rb.count > want ? want : rb.count;
 	printf("cap buffers=%u\n", cap_count);
 
@@ -262,7 +690,11 @@ static void cap_setup(void)
 		b.index = i;
 		b.length = 2;
 		b.m.planes = pl;
-		if (xioctl(fd, VIDIOC_QUERYBUF, &b) < 0) die("QUERYBUF cap");
+		if (xioctl(fd, VIDIOC_QUERYBUF, &b) < 0) {
+			printf("QUERYBUF cap[%u] 失败: %s\n", i, strerror(errno));
+			r = -errno;
+			goto fail;
+		}
 		for (p = 0; p < 2; p++) {
 			capbuf[i].len[p] = pl[p].length;
 			capbuf[i].dmabuf[p] = -1;
@@ -273,7 +705,12 @@ static void cap_setup(void)
 			capbuf[i].mem[p] = mmap(NULL, pl[p].length,
 						PROT_READ | PROT_WRITE, MAP_SHARED,
 						fd, pl[p].m.mem_offset);
-			if (capbuf[i].mem[p] == MAP_FAILED) die("mmap cap");
+			if (capbuf[i].mem[p] == MAP_FAILED) {
+				capbuf[i].mem[p] = NULL;
+				printf("mmap cap[%u] 失败: %s\n", i, strerror(errno));
+				r = -errno;
+				goto fail;
+			}
 		}
 		if (getenv("EXPBUF") || getenv("PLAY")) {
 			for (p = 0; p < 2; p++) {
@@ -283,36 +720,63 @@ static void cap_setup(void)
 				eb.index = i;
 				eb.plane = p;
 				eb.flags = O_CLOEXEC;
-				if (xioctl(fd, VIDIOC_EXPBUF, &eb) < 0)
-					die("EXPBUF cap");
+				if (xioctl(fd, VIDIOC_EXPBUF, &eb) < 0) {
+					printf("EXPBUF cap[%u/%d] 失败: %s\n",
+					       i, p, strerror(errno));
+					r = -errno;
+					goto fail;
+				}
 				capbuf[i].dmabuf[p] = eb.fd;
 			}
 			if (i == 0)
 				printf("dmabuf: buf0 Y=%d C=%d\n",
 				       capbuf[0].dmabuf[0], capbuf[0].dmabuf[1]);
 		}
-		if (xioctl(fd, VIDIOC_QBUF, &b) < 0) die("QBUF cap");
+		if (xioctl(fd, VIDIOC_QBUF, &b) < 0) {
+			printf("QBUF cap[%u] 失败: %s\n", i, strerror(errno));
+			r = -errno;
+			goto fail;
+		}
 	}
+	return 0;
+fail:	/* 半初始化的 CAPTURE 队列不许留给调用方：整组还回去 */
+	close_cap_dmabufs();
+	cap_release();
+	return r;
 }
 
-static void out_setup(void)
+/* OUTPUT 侧映射整组撤掉。幂等：vdec_close 与 out_setup 都调它，
+ * 事务 ABORT 之后断言 n_out==0/out_nfree==0 才能成立（§3.2.4）。
+ */
+static void out_release(void)
 {
-	struct v4l2_requestbuffers rb = {0};
 	int i;
 
-	out_nfree = 0;		/* 重开设备时会被二次调用，不清就会重复入队 */
 	for (i = 0; i < NBUF_OUT; i++)
 		if (outbuf[i].mem) {
 			munmap(outbuf[i].mem, outbuf[i].len);
 			outbuf[i].mem = NULL;
 		}
+	out_nfree = 0;		/* 重开设备时会被二次调用，不清就会重复入队 */
+	n_out = 0;
+}
+
+static int out_setup(void)
+{
+	struct v4l2_requestbuffers rb = {0};
+	int i, r = 0;
+
+	out_release();
 	rb.type = OUT_T;
 	rb.memory = V4L2_MEMORY_MMAP;
 	rb.count = 0;
 	xioctl(fd, VIDIOC_REQBUFS, &rb);
 
 	rb.count = OUT_DEPTH();
-	if (xioctl(fd, VIDIOC_REQBUFS, &rb) < 0) die("REQBUFS out");
+	if (xioctl(fd, VIDIOC_REQBUFS, &rb) < 0) {
+		printf("REQBUFS out 失败: %s\n", strerror(errno));
+		return -errno;
+	}
 	n_out = rb.count;
 	printf("out buffers=%u\n", rb.count);
 	for (i = 0; i < (int)rb.count; i++) {
@@ -324,22 +788,54 @@ static void out_setup(void)
 		b.index = i;
 		b.length = 1;
 		b.m.planes = pl;
-		if (xioctl(fd, VIDIOC_QUERYBUF, &b) < 0) die("QUERYBUF out");
+		if (xioctl(fd, VIDIOC_QUERYBUF, &b) < 0) {
+			printf("QUERYBUF out[%d] 失败: %s\n", i, strerror(errno));
+			r = -errno;
+			goto fail;
+		}
 		outbuf[i].len = pl[0].length;
 		outbuf[i].mem = mmap(NULL, outbuf[i].len, PROT_READ | PROT_WRITE,
 				     MAP_SHARED, fd, pl[0].m.mem_offset);
-		if (outbuf[i].mem == MAP_FAILED) die("mmap out");
+		if (outbuf[i].mem == MAP_FAILED) {
+			outbuf[i].mem = NULL;
+			printf("mmap out[%d] 失败: %s\n", i, strerror(errno));
+			r = -errno;
+			goto fail;
+		}
 		out_free[out_nfree++] = i;
 	}
+	return 0;
+fail:
+	{	/* 映射过的 OUTPUT 缓冲就地撤掉，别留半套 */
+		int k;
+
+		for (k = 0; k < NBUF_OUT; k++)
+			if (outbuf[k].mem) {
+				munmap(outbuf[k].mem, outbuf[k].len);
+				outbuf[k].mem = NULL;
+			}
+	}
+	out_nfree = 0;
+	return r;
 }
 
-static void start_stream(void)
+static int start_stream(void)
 {
 	int t = CAP_T;
 
-	if (xioctl(fd, VIDIOC_STREAMON, &t) < 0) die("STREAMON cap");
+	if (xioctl(fd, VIDIOC_STREAMON, &t) < 0) {
+		printf("STREAMON cap 失败: %s\n", strerror(errno));
+		return -errno;
+	}
 	t = OUT_T;
-	if (xioctl(fd, VIDIOC_STREAMON, &t) < 0) die("STREAMON out");
+	if (xioctl(fd, VIDIOC_STREAMON, &t) < 0) {
+		/* 一半在跑等于没跑：CAPTURE 必须先停下再交还失败 */
+		printf("STREAMON out 失败: %s\n", strerror(errno));
+		t = CAP_T;
+		xioctl(fd, VIDIOC_STREAMOFF, &t);
+		return -errno;
+	}
+	return 0;
 }
 
 static void stop_stream(void)
@@ -390,7 +886,7 @@ static void qbuf_au(const unsigned char *data, size_t len, int key)
 	got_queued++;
 }
 
-static int eos_seen, g_verbose;
+static int eos_seen;
 static int handle_event(void)
 {
 	struct v4l2_event ev;
@@ -414,12 +910,13 @@ static int handle_event(void)
 			printf("too many resets\n");
 			exit(1);
 		}
-		stop_stream();
-		s_fmt_cap(nw, nh);
-		cap_setup();
-		out_nfree = 0;
-		out_setup();
-		start_stream();
+		/* 同一个会话内换分辨率：缓冲整组重建（定义在下方） */
+		if (vdec_resize(nw, nh) < 0) {
+			/* 就地改不动说明会话已经不好使了，交给主循环整会话重建 */
+			printf("SOURCE_CHANGE: 就地上分辨率失败，转整会话重建\n");
+			tx_request(LVL_L2, VEV_SRCCHANGE);
+			return 0;
+		}
 		g_refeed = 1;     /* main() 从 AU 0 重喂 */
 		return 0;
 	}
@@ -436,15 +933,17 @@ static int handle_event(void)
  * 只会在会话已经 close 掉之后写（驱动 cur_sess 为空才接受，否则 -EBUSY，
  * 因为驱动收尾是 workqueue 异步做的，所以带重试）。
  */
-static void vdec_block_reset(void)
+static int vdec_hard_reset(void)
 {
 	const char *p = "/sys/module/meson_vdec/parameters/hard_reset";
 	const char *e = getenv("HARDRESET");
-	int f, i;
+	int f, i, n = 150;	/* 150 × 20ms = 3s 等驱动 workqueue 收尾 */
 
-	if (e && atoi(e) == 0)
-		return;
-	for (i = 0; i < 25; i++) {
+	if (e && atoi(e) == 0) {
+		printf("HARDRESET: 被 HARDRESET=0 关掉（固件 hang 只能靠上层重启）\n");
+		return 0;
+	}
+	for (i = 0; i < n; i++) {
 		ssize_t w;
 
 		f = open(p, O_WRONLY);
@@ -454,13 +953,17 @@ static void vdec_block_reset(void)
 			if (w == 1) {
 				printf("HARDRESET: VDEC 整块掉电复位 OK（第 %d 次尝试）\n", i + 1);
 				fflush(stdout);
-				return;
+				return 0;
 			}
 		}
 		usleep(20000);
 	}
-	printf("HARDRESET: 失败（%s 不可写或驱动未收尾）\n", p);
+	/* 旧版这里只打一行就往下走，等于"明知硬件没复位还照旧开流"——
+	 * 后面每一帧都会失败，自愈循环一轮一轮刷屏。必须显式失败。
+	 */
+	printf("HARDRESET: 失败（%s 不可写或驱动 %dms 内未收尾）\n", p, n * 20);
 	fflush(stdout);
+	return -1;
 }
 
 static unsigned capw, caph;
@@ -606,7 +1109,22 @@ static unsigned char *s_buf;
 static size_t s_cap, s_len;	/* 缓冲区容量 / 有效字节 */
 static size_t s_pos;		/* 扫描位置 */
 static size_t s_au_start;	/* 当前 AU 起点 */
-static int s_au_open, s_cur_vcl, s_eof, s_release, s_au_irap;
+static int s_au_open, s_cur_vcl, s_eof, s_release;
+/* 本 AU 的随机接入点 NAL 类型：0=无，16..21=BLA/IDR/CRA。
+ * 存实际类型而不是布尔量：CRA(21) 在空 DPB 上不可恢复（open GOP 的
+ * RASL 参考 CRA 之前的帧），必须能和 IDR/BLA 区分开。见 design §1.10。
+ */
+static int s_au_rap;
+/* 本 AU 含 RASL(8/9)：只在 CRA 之后出现，新会话里不可解码，需丢弃。 */
+static int s_au_rasl;
+/* 上一个交出的 AU 的 RAP 信息（s_au_rap/s_au_rasl 在 return 前清零，
+ * 调用侧要判策略只能读这两个）。 */
+static int s_au_last_rap, s_au_last_rasl;
+/* 本 AU 里第一个 prefix SEI 的偏移（0 = 没有）。SEI 解析放在 AU 收口处做：
+ * 只有那时才知道这条 NAL 的结束位置，不用为了找 NAL 尾巴再扫一遍码流。 */
+static size_t s_au_sei;		/* 已废弃，留着不动数据布局 */
+static size_t s_sei_pl;		/* 当前 SEI NAL 起点；0=没有待解析的 SEI */
+static size_t s_sps_pl;		/* 当前 SPS NAL 起点；0=没有待解析的 SPS */
 static size_t g_stream_bytes;	/* 已消费字节，用于码率统计 */
 static int g_stream_au;		/* 已产出 AU 数 */
 
@@ -665,6 +1183,60 @@ static void s_compact(void)
 	s_release = 0;
 }
 
+/* 可恢复随机接入点：空 DPB（新会话）上能直接起解。
+ * CRA(21) 例外——open GOP 的 RASL(8/9) 参考 CRA 之前的帧，那些帧在新会话里
+ * 不存在，续喂会让驱动 "Couldn't find ref. frame" 并在几帧内静默挂死。
+ * 所以 CRA 是否算"能起播"由调用侧的策略（RAPMODE）决定，不在这里拍。
+ * 见 design_player.md §1.10。
+ */
+static int rap_recoverable(int t)
+{
+	return t >= 16 && t <= 20;
+}
+
+/* 内容信号是否变了：只比四个"决定怎么算颜色"的 VUI 字段。
+ * 变了一位就算新片段——分母、矩阵、色域全不一样，旧片段的 SEI 峰值
+ * 也必然失效（混剪片 SDR→HDR→SDR 时，不重置就会把 HDR 段的 1000nits
+ * 带进后面那段 SDR，日志里表现为峰值来源还写着 SEI144）。 */
+static int csig_same(const struct ColorMetadata *a, const struct ColorMetadata *b)
+{
+	return a->primaries == b->primaries && a->transfer == b->transfer &&
+	       a->matrix == b->matrix && a->range == b->range;
+}
+
+/* 把一条 SPS NAL（含 2 字节头）的 VUI 应用到 g_cm。
+ * 播放器起播前那条路径走 sps_size()，但那只是"窗口里第一条 SPS"；
+ * 混剪片中途换段时 SPS 会重发，必须每 AU 都看，否则第二段的 VUI
+ * 永远读不到——这正是之前"解析侧就绪但实际不生效"的原因。 */
+static int sps_color_apply(const unsigned char *nal, size_t n)
+{
+	static unsigned char rb[8192];
+	static const int ptls[] = { 88, 96, 92, 100, 104 };
+	struct ColorMetadata cm;
+	size_t len;
+	unsigned k;
+
+	if (n < 12 || n > (size_t)1 << 20)
+		return 0;
+	len = rbsp_un(rb, sizeof(rb), nal + 2, n - 2);
+	memcpy(&cm, &g_cm, sizeof(cm));
+	for (k = 0; k < sizeof(ptls) / sizeof(ptls[0]); k++) {
+		if (!sps_color_parse(rb, len, ptls[k], &cm))
+			continue;
+		if (!csig_same(&cm, &g_cm)) {
+			cm.max_cll = 0.0f;
+			cm.max_fall = 0.0f;
+			cm.mastering_max_luminance = 0.0f;
+			cm.mastering_min_luminance = 0.0f;
+			if (getenv("SPSDBG"))
+				printf("COLOR: 内容信号变化 -> 旧 SEI 峰值作废\n");
+		}
+		memcpy(&g_cm, &cm, sizeof(cm));
+		return 1;
+	}
+	return 0;
+}
+
 /* 取出下一个 AU：1=有，0=结束。*out 在下一次调用前有效。 */
 static int stream_next_au(const unsigned char **out, size_t *outlen)
 {
@@ -682,15 +1254,36 @@ static int stream_next_au(const unsigned char **out, size_t *outlen)
 			sc = (s_pos >= 1 && s_buf[s_pos - 1] == 0) ? s_pos - 1 : s_pos;
 			pl = s_pos + 3;
 			t = nal_type(&s_buf[pl]);
+			/* 一个 AU 里可以有多个 SEI NAL（x265 就是 144 一个、137 一个），
+			 * 所以必须逐个解析：只记第一个会丢掉母版亮度（SEI 137）。
+			 * 范围也必须正好是这个 NAL（到下一个起始码为止）——之前给的是
+			 * "到 AU 结束"，把后面的 VCL 也当 SEI 扫，读出一堆假 payload。 */
+			if (s_sei_pl) {
+				csig_sei(s_buf + s_sei_pl, sc - s_sei_pl);
+				s_sei_pl = 0;
+			}
+			if (t == 39)
+				s_sei_pl = pl;
+			if (s_sps_pl) {	/* 同理：VUI 也要逐段解析 */
+				sps_color_apply(s_buf + s_sps_pl, sc - s_sps_pl);
+				s_sps_pl = 0;
+			}
+			if (t == 33)
+				s_sps_pl = pl;
 			vcl = (t <= 31);
 			iru = (t == 32 || t == 33 || t == 34 || t == 35 ||
 			       t == 39 || t == 41);
-
+			/* 注意顺序：SEI 属于"将要开始的 AU"，不能在这里记。
+			 * 之前就在这里赋值，AU 收口时拿到的是下一个 AU 的 SEI 偏移，
+			 * sc - s_au_sei 变成巨大的 size_t，csig_sei() 就把整段压缩数据
+			 * 当 SEI 扫，随机命中 type 137/144，读出 280149 nits 这种值。 */
 			if (!s_au_open) {
 				s_au_start = sc;
 				s_au_open = 1;
 				s_cur_vcl = 0;
-				s_au_irap = 0;
+				s_au_rap = 0;
+				s_au_rasl = 0;
+				s_au_sei = 0;
 			} else if ((vcl && s_cur_vcl) || (iru && s_cur_vcl)) {
 				size_t len = sc - s_au_start;
 
@@ -705,34 +1298,62 @@ static int stream_next_au(const unsigned char **out, size_t *outlen)
 				s_pos = sc;
 				s_au_start = sc;
 				s_cur_vcl = 0;
+				s_au_sei = (t == 39) ? pl : 0;	/* 归新 AU */
 				s_release = 1;
 				{
-					int k = s_au_irap;
+					int k = s_au_rap;
+					int rasl = s_au_rasl;
 
-					s_au_irap = 0;
+					s_au_last_rap = k;
+					s_au_last_rasl = rasl;
+					s_au_rap = 0;
+					s_au_rasl = 0;
+					if (k && getenv("RAPDBG"))
+						printf("RAPDBG au=%d rap=%d rec=%d rasl=%d\n",
+						       g_stream_au, k,
+						       rap_recoverable(k), rasl);
 					return k ? 2 : 1;	/* 2 = 关键帧 */
 				}
 			}
 			if (vcl) {
 				s_cur_vcl = 1;
 				if (t >= 16 && t <= 21)
-					s_au_irap = 1;
+					s_au_rap = t;
+				if (t == 8 || t == 9)	/* RASL：CRA 之后、不可解码 */
+					s_au_rasl = 1;
 			}
 			s_pos = pl + 1;
 		}
 		if (s_eof) {
 			if (s_au_open && s_len > s_au_start) {
 				size_t len = s_len - s_au_start;
-				int k = s_au_irap;
+				int k = s_au_rap;
+				int rasl = s_au_rasl;
 
+				if (s_sei_pl) {
+					csig_sei(s_buf + s_sei_pl, s_len - s_sei_pl);
+					s_sei_pl = 0;
+				}
+				if (s_sps_pl) {
+					sps_color_apply(s_buf + s_sps_pl,
+							s_len - s_sps_pl);
+					s_sps_pl = 0;
+				}
 				*out = s_buf + s_au_start;
 				*outlen = len;
 				g_stream_bytes += len;
 				g_stream_au++;
 				s_au_start = s_len;
 				s_au_open = 0;
-				s_au_irap = 0;
+				s_au_last_rap = k;
+				s_au_last_rasl = rasl;
+				s_au_rap = 0;
+				s_au_rasl = 0;
 				s_release = 1;
+				if (k && getenv("RAPDBG"))
+					printf("RAPDBG au=%d rap=%d rec=%d rasl=%d (eof)\n",
+					       g_stream_au, k,
+					       rap_recoverable(k), rasl);
 				return k ? 2 : 1;
 			}
 			return 0;
@@ -781,9 +1402,20 @@ static int sps_size(unsigned *ow, unsigned *oh)
 				return 0;
 			for (k = 0; k < sizeof(ptls) / sizeof(ptls[0]); k++) {
 				if (sps_try(buf, n, ptls[k], ow, oh)) {
+					struct ColorMetadata cm;
+
+					/* 宽高定了，顺手把 VUI 的颜色描述补上：
+					 * 这里失败不算错（很多码流没写 VUI），
+					 * 所以只覆盖成功解析出来的部分 */
+					memcpy(&cm, &g_cm, sizeof(cm));
+					if (sps_color_parse(buf, n, ptls[k], &cm))
+						memcpy(&g_cm, &cm, sizeof(cm));
 					if (getenv("SPSDBG"))
-						printf("SPSDBG ptl=%d -> %ux%u\n",
-						       ptls[k], *ow, *oh);
+						printf("SPSDBG ptl=%d -> %ux%u 色域=%s(%d) tf=%d mx=%d rng=%d bd=%d\n",
+						       ptls[k], *ow, *oh, cm_gamut(),
+						       g_cm.primaries, g_cm.transfer,
+						       g_cm.matrix, g_cm.range,
+						       g_cm.bit_depth);
 					return 1;
 				}
 			}
@@ -792,6 +1424,92 @@ static int sps_size(unsigned *ow, unsigned *oh)
 		i = pl + 2;
 	}
 	return 0;
+}
+
+/* ---- 内容信号：HEVC prefix SEI（NAL 39）→ 真实内容峰值 ----
+ * 只认两条 payload：
+ *   144 content_light_level_info   maxCLL / maxFALL（nits，就是内容峰值）
+ *   137 mastering_display_colour_volume  母版监视器峰值/最小亮度（×0.0001）
+ * 其余 payload 一律跳过。不做完整 SEI 库，只取色调映射需要的两个数。
+ */
+static size_t rbsp_un(unsigned char *dst, size_t cap,
+		      const unsigned char *src, size_t n)
+{
+	size_t i, o = 0;
+
+	for (i = 0; i < n && o < cap; i++) {
+		/* 去掉防竞争字节 0x03（00 00 03 → 00 00） */
+		if (o >= 2 && dst[o - 1] == 0 && dst[o - 2] == 0 && src[i] == 3)
+			continue;
+		dst[o++] = src[i];
+	}
+	return o;
+}
+
+/* nal 指向 2 字节 NAL 头，n 是整个 NAL 的字节数（含头） */
+static void csig_sei(const unsigned char *nal, size_t n)
+{
+	static unsigned char rb[2048];
+	size_t i = 0, len;	/* rb 已经是 nal+2 之后的 RBSP，别再跳 2 字节头 */
+	int found = 0;
+
+	/* 一个 SEI NAL 不可能超过 1MB。超了就是调用侧的偏移错了，
+	 * 宁可不解析也不能把压缩数据当 SEI 扫（历史事故：280149 nits）。 */
+	if (n < 4 || n > (size_t)1 << 20)
+		return;
+	len = rbsp_un(rb, sizeof(rb), nal + 2, n - 2);
+	while (i + 2 <= len) {
+		unsigned type = 0, size = 0;
+
+		while (i < len && rb[i] == 0xff) { type += 255; i++; }
+		if (i >= len) break;
+		type += rb[i++];
+		while (i < len && rb[i] == 0xff) { size += 255; i++; }
+		if (i >= len) break;
+		size += rb[i++];
+		if (getenv("SEIDBG2"))
+			printf("SEIDBG2 payload type=%u size=%u i=%zu len=%zu\n",
+			       type, size, i, len);
+		if (i + size > len) break;	/* 截断的 SEI，别越界读 */
+		if (type == 137 && size >= 24) {
+			const unsigned char *p = rb + i;
+			double prim[3][2], wp[2];
+			int c, id;
+
+			/* 前 16 字节：3 组原色 + 白点，单位 0.00002。
+			 * 只留"属于哪个色域"的结论（ColorMetadata.primaries 是枚举），
+			 * 坐标本身不存：存了也没人按坐标算，反而多一份会过期的状态。 */
+			for (c = 0; c < 3; c++) {
+				prim[c][0] = (((unsigned)p[c * 4 + 0] << 8) | p[c * 4 + 1]) * 0.00002;
+				prim[c][1] = (((unsigned)p[c * 4 + 2] << 8) | p[c * 4 + 3]) * 0.00002;
+			}
+			wp[0] = (((unsigned)p[12] << 8) | p[13]) * 0.00002;
+			wp[1] = (((unsigned)p[14] << 8) | p[15]) * 0.00002;
+			/* VUI 没写 colour_primaries 才用 SEI 的母版原色兜底：
+			 * 两者理论上一致，冲突时 VUI 更权威（SEI 描述的是母版监视器） */
+			id = cm_prim_from_sei(prim, wp);
+			if (!g_cm.primaries && id)
+				g_cm.primaries = id;
+
+			g_cm.mastering_max_luminance = (((unsigned)p[16] << 24) | ((unsigned)p[17] << 16) |
+							((unsigned)p[18] << 8) | p[19]) * 0.0001f;
+			g_cm.mastering_min_luminance = (((unsigned)p[20] << 24) | ((unsigned)p[21] << 16) |
+							((unsigned)p[22] << 8) | p[23]) * 0.0001f;
+		} else if (type == 144 && size >= 4) {
+			g_cm.max_cll = (float)(((unsigned)rb[i] << 8) | rb[i + 1]);
+			g_cm.max_fall = (float)(((unsigned)rb[i + 2] << 8) | rb[i + 3]);
+		}
+		found = 1;
+		i += size;
+	}
+	if (found && getenv("SEIDBG"))
+		printf("SEIDBG cll=%.0f/%.0f md=%.0f/%.0f 色域=%s(%d) tf=%d mx=%d rng=%d bd=%d\n",
+		       g_cm.max_cll, g_cm.max_fall,
+		       g_cm.mastering_max_luminance, g_cm.mastering_min_luminance,
+		       cm_gamut(), g_cm.primaries, g_cm.transfer, g_cm.matrix,
+		       g_cm.range, g_cm.bit_depth);
+	if (found)
+		g_csig_seen++;
 }
 
 #ifdef USE_DRM
@@ -850,7 +1568,8 @@ out:
  *
  * 环境变量：
  *   TM=0|1|off|on|clip|curve|reinhard|hable   （默认：HDR=1 时开，curve 曲线）
- *   TM_SRC_PEAK=1000   内容峰值亮度 nits（HDR10 常见 1000，MasteringDisplay 可 4000）
+ *   TM_SRC_PEAK=<nits> 覆盖内容峰值；不给就从码流 SEI 的 maxCLL 读（见 csig.h），
+ *                      都没有才用 1000 兜底并在日志里标"默认"
  *   TM_TARGET=200      SDR 屏峰值/参考白 nits（面板亮就把这个调大）
  *   TM_SAT=0.85        BT.2020 → BT.709 色域压缩系数（1=不压，偏艳）
  *   TM_KNEE=0.7        拐点位置（0..1，越小越早压缩、越"电影感"）
@@ -862,7 +1581,14 @@ out:
 #define TM_HABLE 3
 
 struct tmctx {
-	int on, curve, diag, built, full, noop, time_it;
+	int on, curve, diag, built, full, noop, time_it, gmode;
+	int src_env;		/* TM_SRC_PEAK 显式给了：用户说了算，不再自动跟 SEI */
+	int src_auto;		/* 峰值是 SEI/兜底来的，SEI 到了要自己重建 LUT */
+	int sat_env;		/* TM_SAT 显式给了：用户说了算，不跟色域走 */
+	int pri;		/* 编表时用的 colour_primaries，变了要重算 sat 并重建 */
+	int tf;			/* 编表时用的 transfer（HG_TF_*），变了要重建 */
+	int tf_env;		/* TM= 显式给了：用户指定，不再按 VUI 自动开关 */
+	int mat;		/* 色度走 2020→709 3x3（2020/未标源），0=标量增益 */
 	double src_peak, target, sat, knee;
 	unsigned char lut[256];		/* Y 单通道码值映射 */
 	unsigned short gain[256];	/* Q10 增益：1024 = 1.0，给 Cb/Cr 用 */
@@ -871,80 +1597,102 @@ struct tmctx {
 };
 static struct tmctx tm;
 
-/* ST 2084 (PQ) EOTF：码值 n∈[0,1] → 绝对亮度 nits */
-static double pq_eotf(double n)
-{
-	const double m1 = 0.1593017578125, m2 = 78.84375;
-	const double c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
-	double np = pow(n, 1.0 / m2), num = np - c1, den = c2 - c3 * np;
+/* 色彩数学统一在 hdrcolor.inc（glout.c 和 hdr-selftest.c 吃同一份文本） */
+#include "hdrcolor.inc"
 
-	if (num <= 0.0) return 0.0;
-	return 10000.0 * pow(num / den, 1.0 / m1);
+static void tm_to_hc(const struct tmctx *t, struct hdrcolor *c)
+{
+	c->on = t->on;
+	c->curve = t->curve;		/* TM_* 与 HC_* 数值一致 */
+	c->src_peak = t->src_peak;
+	c->target = t->target;
+	c->sat = t->sat;
+	c->knee = t->knee;
+	c->full = t->full;
+	c->gain_mode = t->gmode;
+	c->transfer = t->tf;
 }
 
-/* 线性光 d∈[0,1]（1.0 = 屏幕白）→ BT.709 OETF → 有限范围码值 */
-static double bt709_encode(double d)
+/* 把当前 tm 参数编成 256 项表并打一行日志（重建也走这条） */
+static void tm_compile(void)
 {
-	double e;
+	struct hdrcolor c;
 
-	if (d <= 0.0) return 16.0;
-	if (d >= 1.0) return 235.0;
-	e = (d < 0.018) ? 4.5 * d : 1.099 * pow(d, 0.45) - 0.099;
-	return 16.0 + 219.0 * e;
-}
-
-static double tm_hable(double x)
-{
-	const double A = 0.15, B = 0.50, C = 0.10, D = 0.20, E = 0.02, F = 0.30;
-	double f1 = (x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F);
-	double fw = (1.0 * (A * 1.0 + C * B) + D * E) / (1.0 * (A * 1.0 + B) + D * F);
-
-	return f1 / fw;
-}
-
-/* 归一化亮度 x（1.0 = 目标白）→ 屏上线性光 d∈[0,1] */
-static double tm_curve(double x)
-{
-	switch (tm.curve) {
-	case TM_CLIP:
-		return x > 1.0 ? 1.0 : x;
-	case TM_REINHARD:
-		return 2.0 * x / (1.0 + x);
-	case TM_HABLE:
-		return tm_hable(x);
-	default: {			/* 拐点以上指数软膝，以下不动 */
-		double k = tm.knee, t;
-
-		if (x <= k) return x;
-		t = (x - k) / (1.0 - k);
-		return k + (1.0 - k) * (1.0 - exp(-t));
-	}
-	}
+	tm_to_hc(&tm, &c);
+	hc_build(&c, tm.lut, tm.gain);
+	tm.built = 1;
+	printf("TM: on tf=%s curve=%s gain=%s mat=%s peak=%.0fnits(%s) target=%.0fnits sat=%.2f knee=%.2f\n",
+	       hc_tf_name(tm.tf),
+	       tm.curve == TM_CLIP ? "clip" : tm.curve == TM_REINHARD ? "reinhard" :
+	       tm.curve == TM_HABLE ? "hable" : "curve",
+	       tm.gmode == HC_GAIN_LIN ? "lin" : "code",
+	       tm.mat ? hc_mat_name(tm.pri) : "无",
+	       tm.src_peak, tm.src_env ? "env" : csig_peak() > 0.0 ? "sei" : "默认",
+	       tm.target, tm.sat, tm.knee);
+	if (!tm.sat_env && tm.sat < 0.999)
+		printf("TM: sat=%.2f 来自色域 %s（宽色域→709 压缩），TM_SAT 可覆盖\n",
+		       tm.sat, cm_gamut());
 }
 
 static void tm_build(void)
 {
 	const char *e = getenv("TM");
 	const char *hdr = getenv("HDR");
-	int v;
 
 	memset(&tm, 0, sizeof(tm));
 	tm.curve = TM_CURVE;
-	tm.src_peak = getenv("TM_SRC_PEAK") ? atof(getenv("TM_SRC_PEAK")) : 1000.0;
 	tm.target = getenv("TM_TARGET") ? atof(getenv("TM_TARGET")) : 200.0;
-	tm.sat = getenv("TM_SAT") ? atof(getenv("TM_SAT")) : 0.85;
+	/* 峰值不再写死：优先码流自己的 maxCLL（csig.h 从 prefix SEI 读），
+	 * 没有 mastering display 时退回母版峰值，两者都没有才用 1000 兜底，
+	 * 而且打印出来说明是兜底——静默用假峰值就是之前那个长期问题。
+	 * TM_SRC_PEAK 仍然可以显式覆盖，此时完全按用户的值，不跟 SEI。
+	 */
+	if (getenv("TM_SRC_PEAK")) {
+		tm.src_peak = atof(getenv("TM_SRC_PEAK"));
+		tm.src_env = 1;
+	} else if (csig_peak() > 0.0) {
+		tm.src_peak = csig_peak();
+		tm.src_auto = 1;
+	} else {
+		tm.src_peak = 1000.0;
+		tm.src_auto = 1;	/* 等 SEI 到，tm_refresh() 会重建 */
+	}
+	/* 饱和度跟着色域走，不再是独立旋钮（design_color.md §4.3.4）：
+	 * 2020 源才需要往 709 压，709 源 sat=1.0（一个像素都不动）。
+	 * TM_SAT 仍可覆盖，但那就是用户在“调味道”，日志里标 env。
+	 */
+	if (getenv("TM_SAT")) {
+		tm.sat = atof(getenv("TM_SAT"));
+		tm.sat_env = 1;
+	} else {
+		tm.sat = hc_sat_from_primaries(g_cm.primaries, 0.85);
+	}
+	tm.pri = g_cm.primaries;
+	tm.mat = hc_needs_mat(tm.pri);
 	tm.knee = getenv("TM_KNEE") ? atof(getenv("TM_KNEE")) : 0.7;
 	tm.diag = getenv("TMDIAG") != NULL;
 	tm.noop = getenv("TMNOOP") != NULL;	/* 只读写不做变换：量带宽上限 */
 	tm.time_it = getenv("TMTIME") != NULL;
 	tm.full = getenv("TM_FULL") != NULL;	/* 源是全范围（少见） */
+	{	/* TM_GAIN=code（默认/历史）| lin（线性光比值，暗部不掉色） */
+		const char *gm = getenv("TM_GAIN");
+
+		tm.gmode = (gm && (!strcmp(gm, "lin") || !strcmp(gm, "linear"))) ?
+			  HC_GAIN_LIN : HC_GAIN_CODE;
+	}
 	if (tm.src_peak < tm.target) tm.src_peak = tm.target;
 	if (tm.knee <= 0.05 || tm.knee >= 1.0) tm.knee = 0.7;
-	if (tm.sat <= 0.0 || tm.sat > 2.0) tm.sat = 0.85;
+	if (tm.sat <= 0.0 || tm.sat > 2.0)
+		tm.sat = tm.sat_env ? 0.85 : hc_sat_from_primaries(g_cm.primaries, 0.85);
 
-	/* 开关：显式 TM= 优先，否则看 HDR=1（play.sh 用 ffprobe 判出来） */
+	/* 开关：显式 TM= 优先；否则看码流自己的 VUI 传递函数（PQ/HLG 才映射，
+	 * SDR 一律关掉），VUI 没写才退回 HDR=1（play.sh 用 ffprobe 判出来）。
+	 * 之前只有 HDR= 一个来源，ffprobe 判错或者 SDR 片带了个 HDR 标记，
+	 * 整片就被当 PQ 压一遍——发灰，还查不出来。 */
 	if (e && (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "no"))) {
 		tm.on = 0;
+		tm.tf_env = 1;		/* 用户明说不管，就不跟 VUI 走 */
+		tm.tf = g_cm.transfer;
 		return;
 	}
 	if (e && (!strcmp(e, "clip"))) tm.curve = TM_CLIP;
@@ -953,45 +1701,91 @@ static void tm_build(void)
 	else if (e && (!strcmp(e, "curve") || !strcmp(e, "soft"))) tm.curve = TM_CURVE;
 	if (e && (!strcmp(e, "1") || !strcmp(e, "on") || !strcmp(e, "yes") ||
 		  !strcmp(e, "clip") || !strcmp(e, "curve") || !strcmp(e, "soft") ||
-		  !strcmp(e, "reinhard") || !strcmp(e, "hable")))
+		  !strcmp(e, "reinhard") || !strcmp(e, "hable"))) {
 		tm.on = 1;
-	else
-		tm.on = (hdr && (!strcmp(hdr, "1") || !strcmp(hdr, "on")));
+		tm.tf_env = 1;
+	} else {
+		int h = cm_is_hdr();
 
-	if (!tm.on) return;
-
-	for (v = 0; v < 256; v++) {
-		/* 源是 tv range（HDR10 都是），PQ 码值归一化 */
-		double n = tm.full ? v / 255.0 : (v - 16) / 219.0;
-		double L, x, d, out;
-		double nin;
-
-		if (n < 0.0) n = 0.0;
-		if (n > 1.0) n = 1.0;
-		L = pq_eotf(n);				/* nits */
-		x = L / tm.target;			/* 归一化到目标白 */
-		d = tm_curve(x);			/* 屏幕上线性光 0..1 */
-		out = bt709_encode(d);
-		tm.lut[v] = (unsigned char)(out + 0.5);
-
-		/* 色度增益：码值域输出/输入（保持饱和度），再压色域 */
-		nin = tm.full ? v / 255.0 : (v - 16) / 219.0;
-		if (nin > 0.002) {
-			double nout = (out - 16.0) / 219.0;
-			double g = (nout / nin) * tm.sat;
-
-			if (g < 0.0) g = 0.0;
-			if (g > 3.9) g = 3.9;
-			tm.gain[v] = (unsigned short)(g * 1024.0 + 0.5);
+		if (h == 1 && g_cm.transfer == 18) {
+			/* §4.3.7：HLG 只识别，不映射（同 tm_refresh） */
+			tm.on = 0;
+			printf("TM: VUI=HLG（transfer=18），本期不做 HLG 映射，"
+			       "回退 SDR 直显（TM=1 可强制）\n");
+			tm.tf = g_cm.transfer;
+			return;
+		} else if (h == 1) {
+			tm.on = 1;
+		} else if (h == 0) {
+			tm.on = 0;	/* VUI 说是 SDR：透传，别映射 */
+			printf("TM: VUI=%s 不是 HDR，映射关闭（透传）\n", cm_tf_name());
+			tm.tf = g_cm.transfer;
+			return;
 		} else {
-			tm.gain[v] = 0;
+			tm.on = (hdr && (!strcmp(hdr, "1") || !strcmp(hdr, "on")));
 		}
 	}
-	tm.built = 1;
-	printf("TM: on curve=%s src_peak=%.0fnits target=%.0fnits sat=%.2f knee=%.2f\n",
-	       tm.curve == TM_CLIP ? "clip" : tm.curve == TM_REINHARD ? "reinhard" :
-	       tm.curve == TM_HABLE ? "hable" : "curve",
-	       tm.src_peak, tm.target, tm.sat, tm.knee);
+	tm.tf = g_cm.transfer;		/* 0=未标，按 PQ 兜底（hc_is_hdr） */
+
+	if (!tm.on) return;
+	tm_compile();
+}
+
+/* 峰值或传递函数变了（SEI 后到 / VUI 后到 / 换片）就重建 256 项表：
+ * 不用重启，也不用等到下一帧才发现整片在按错的曲线压缩。每帧只多两次比较。
+ */
+static void tm_refresh(void)
+{
+	double p;
+	int tfc = tm.tf_env ? tm.tf : g_cm.transfer;
+
+	if (tfc != tm.tf) {		/* VUI 后到 / 换片：EOTF 换了 */
+		int h = cm_is_hdr();
+
+		if (!tm.tf_env && h == 1 && tfc == 18) {
+			/* §4.3.7：HLG 是场景光 OETF，跟 PQ 不是一条曲线族，
+			 * 本期只识别——压上去只会更灰，不如原样直显。 */
+			tm.on = 0;
+			printf("TM: VUI=HLG（transfer=18），本期不做 HLG 映射，"
+			       "回退 SDR 直显（TM=1 可强制走 PQ 曲线）\n");
+		} else if (!tm.tf_env && (h == 0 || h == 1)) {
+			tm.on = (h == 1);
+		}
+		tm.tf = tfc;
+		printf("TM: transfer→%s，%s（重建表）\n", hc_tf_name(tm.tf),
+		       tm.on ? "开启映射" : "透传");
+		if (tm.on)
+			tm_compile();
+		else {
+			tm.built = 1;	/* 透传不需要表，但别每帧再进来编译 */
+			return;
+		}
+	}
+	/* VUI 后到/换片：色域变了，sat 得跟着重算，否则会拿 709 的 1.0
+	 * 继续压 2020 片，或者反过来把 709 片当 2020 压掉色。 */
+	if (!tm.sat_env && g_cm.primaries != tm.pri) {
+		double s;
+
+		tm.pri = g_cm.primaries;
+		tm.mat = hc_needs_mat(tm.pri);
+		s = hc_sat_from_primaries(tm.pri, 0.85);
+		if (fabs(s - tm.sat) > 0.001) {
+			tm.sat = s;
+			printf("TM: 色域→%s，sat=%.2f 重算（重建表）\n",
+			       cm_gamut(), tm.sat);
+			if (tm.on) {
+				tm_compile();
+				return;	/* 表刚重建，峰值那步下帧再说 */
+			}
+		}
+	}
+	if (tm.src_env)
+		return;
+	p = csig_peak();
+	if (p <= 0.0 || fabs(p - tm.src_peak) <= 0.5)
+		return;
+	tm.src_peak = (p < tm.target) ? tm.target : p;
+	tm_compile();
 }
 
 /* 就地映射一块 NV12（NV12M 两块 plane） */
@@ -1004,6 +1798,7 @@ static void tm_apply(int idx, unsigned w, unsigned h)
 	double t0;
 
 	if (!tm.built) tm_build();
+	else tm_refresh();
 	if (!tm.on || !capbuf[idx].mem[0]) return;
 	yp = capbuf[idx].mem2[0] ? capbuf[idx].mem2[0] : capbuf[idx].mem[0];
 	cp = capbuf[idx].mem2[0] ? capbuf[idx].mem2[1] : capbuf[idx].mem[1];
@@ -1014,6 +1809,53 @@ static void tm_apply(int idx, unsigned w, unsigned h)
 	cstride = (cp && (h / 2) && capbuf[idx].len[1] % (h / 2) == 0) ?
 		  capbuf[idx].len[1] / (h / 2) : w;
 	t0 = (tm.diag || tm.time_it || tm.noop) ? now_s() : 0;
+
+	/* 色度：2x2 一块，用左上角 Y 的码值查增益。
+	 * 必须跑在 Y 平面被 LUT 改写之前 —— 表是按"输入码"编的：
+	 *   gain[v]  输入码 v 的色度增益
+	 *   lut[v]   输入码 v 该变成的输出码
+	 * 原来这段放在 Y 之后，ry[x] 已经是输出码，等于拿错行去查表
+	 * （输入 90 输出 150 的暗部会按 150 的增益去动色度）。
+	 */
+	if (cp) {
+		if (tm.mat) {
+			/* 源色域→709：色度域 3x3（hdrcolor.inc 的 hc_chroma709，
+			 * 和 GL 片元的 uGm 同一组系数）+ 绕亮度轴去饱和，
+			 * Y 保持 LUT 值。矩阵按 primaries 选，循环外取一次。 */
+			const double *gm = hc_mat(tm.pri);
+
+			for (y = 0; y + 1 < h; y += 2) {
+				unsigned char *cr = cp + (size_t)(y / 2) * cstride;
+				unsigned char *ry = yp + (size_t)y * ystride;
+
+				for (x = 0; x + 1 < w; x += 2) {
+					unsigned char src = ry[x];
+					double ou, ov;
+
+					hc_chroma709(tm.lut[src], cr[x], cr[x + 1],
+						     (double)tm.gain[src], tm.sat,
+						     gm, &ou, &ov);
+					cr[x] = (unsigned char)(ou + 0.5);
+					cr[x + 1] = (unsigned char)(ov + 0.5);
+				}
+			}
+		} else {
+			for (y = 0; y + 1 < h; y += 2) {
+				unsigned char *cr = cp + (size_t)(y / 2) * cstride;
+				unsigned char *ry = yp + (size_t)y * ystride;
+
+				for (x = 0; x + 1 < w; x += 2) {
+					unsigned g = tm.gain[ry[x]];
+					int u = cr[x], v = cr[x + 1];
+
+					u = 128 + (((u - 128) * (int)g) >> 10);
+					v = 128 + (((v - 128) * (int)g) >> 10);
+					cr[x] = (unsigned char)(u < 0 ? 0 : u > 255 ? 255 : u);
+					cr[x + 1] = (unsigned char)(v < 0 ? 0 : v > 255 ? 255 : v);
+				}
+			}
+		}
+	}
 
 #ifdef HAVE_NEON
 	/* Y 平面：ARMv8 TBL 一次查 64 字节表，4 条 TBL + 4 条 select 处理 16 像��。
@@ -1088,23 +1930,6 @@ static void tm_apply(int idx, unsigned w, unsigned h)
 			}
 		}
 	}
-	/* 色度：2x2 一块，用左上角 Y 的增益（够准，省一半查表） */
-	if (cp) {
-		for (y = 0; y + 1 < h; y += 2) {
-			unsigned char *cr = cp + (size_t)(y / 2) * cstride;
-			unsigned char *ry = yp + (size_t)y * ystride;
-
-			for (x = 0; x + 1 < w; x += 2) {
-				unsigned g = tm.gain[ry[x]];
-				int u = cr[x], v = cr[x + 1];
-
-				u = 128 + (((u - 128) * (int)g) >> 10);
-				v = 128 + (((v - 128) * (int)g) >> 10);
-				cr[x] = (unsigned char)(u < 0 ? 0 : u > 255 ? 255 : u);
-				cr[x + 1] = (unsigned char)(v < 0 ? 0 : v > 255 ? 255 : v);
-			}
-		}
-	}
 	if (tm.diag && (tm.calls < 3 || tm.calls % 96 == 0))
 		printf("TM: %ux%u stride=%u/%u Y in[%u..%u] mean=%.1f -> LUT out %.1fms\n",
 		       w, h, ystride, cstride, ymin, ymax,
@@ -1118,365 +1943,87 @@ static void tm_apply(int idx, unsigned w, unsigned h)
 			       (double)w * h * 1.5 / (now_s() - t0) / 1e9);
 	}
 }
+#endif	/* USE_DRM（色彩/tone mapping 与 DRM 探测到此为止） */
 
-/* ---------- 播放：NV12 dmabuf → plane 缩放 → pageflip ---------- */
-struct playctx {
-	int dfd, ev_pending;
-	uint32_t crtc_id, plane_id;
-	unsigned dw, dh;		/* 屏幕模式尺寸 */
-	uint32_t fb[NBUF_CAP_MAX];
-	/* 屏上正在扫描的那个 fb：seek 重建时不能删，否则当场黑屏 */
-	uint32_t cur_fb, prev_fb;
-	double t0;			/* 首帧节拍基准 */
-	int n;				/* 已翻页数 */
-	int flips, timeouts, drops;
-	double t_start;
-	unsigned refresh;	/* 屏幕刷新率，节拍基准 */
-	/* 目标矩形：按源宽高比算出的居中区域，两侧/上下留黑边 */
-	int dx, dy; unsigned dW, dH; int rect_ok;
-	unsigned rsw, rsh;
-	uint32_t vbl_base;	/* 首帧时的 vblank 序列号 */
-	int vbl_ok;		/* vblank 可用（否则退回 usleep） */
-	uint32_t vbl_now;
-};
-static struct playctx pc;
-
-static uint32_t play_addfb(int yfd, int cfd, unsigned sw, unsigned sh)
-{
-	struct drm_mode_fb_cmd2 fb = {0};
-	struct drm_prime_handle ph;
-
-	ph.fd = yfd; ph.handle = 0; ph.flags = 0;
-	if (ioctl(pc.dfd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) < 0) {
-		printf("PLAY: PRIME_FD_TO_HANDLE(Y fd=%d): %s\n", yfd, strerror(errno));
-		return 0;
-	}
-	fb.handles[0] = ph.handle;
-	ph.fd = cfd; ph.handle = 0; ph.flags = 0;
-	if (ioctl(pc.dfd, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) < 0) {
-		printf("PLAY: PRIME_FD_TO_HANDLE(C fd=%d): %s\n", cfd, strerror(errno));
-		return 0;
-	}
-	fb.handles[1] = ph.handle;
-
-	fb.width = sw; fb.height = sh;
-	fb.pixel_format = DRM_FORMAT_NV12;
-	fb.pitches[0] = sw; fb.pitches[1] = sw;
-	if (ioctl(pc.dfd, DRM_IOCTL_MODE_ADDFB2, &fb) < 0) {
-		printf("PLAY: ADDFB2 NV12 %ux%u pitch=%u/%u: %s\n", sw, sh,
-		       fb.pitches[0], fb.pitches[1], strerror(errno));
-		return 0;
-	}
-	return fb.fb_id;
-}
-
-static int play_setup(unsigned sw, unsigned sh)
-{
-	const char *dev = getenv("DRMDEV") ? getenv("DRMDEV") : "/dev/dri/card0";
-	struct drm_mode_card_res res = {0};
-	uint32_t crtcs[16], conns[16], encs[16];
-	uint32_t conn_id = 0, crtc_id = 0;
-	struct drm_mode_modeinfo mode = {0};
-	struct drm_mode_crtc set = {0};
-	int i, j;
-
-	pc.dfd = open(dev, O_RDWR | O_CLOEXEC);
-	if (pc.dfd < 0) { printf("PLAY: open %s: %s\n", dev, strerror(errno)); return -1; }
-
-	res.crtc_id_ptr = (uint64_t)(uintptr_t)crtcs; res.count_crtcs = 16;
-	res.connector_id_ptr = (uint64_t)(uintptr_t)conns; res.count_connectors = 16;
-	res.encoder_id_ptr = (uint64_t)(uintptr_t)encs; res.count_encoders = 16;
-	if (ioctl(pc.dfd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) return -1;
-
-	for (i = 0; i < (int)res.count_connectors && !conn_id; i++) {
-		struct drm_mode_get_connector gc = {0};
-		static struct drm_mode_modeinfo modes[64];
-		uint32_t enc = 0;
-
-		gc.connector_id = conns[i];
-		gc.modes_ptr = (uint64_t)(uintptr_t)modes;
-		gc.count_modes = 64;
-		gc.encoders_ptr = (uint64_t)(uintptr_t)&enc;
-		gc.count_encoders = 1;
-		if (ioctl(pc.dfd, DRM_IOCTL_MODE_GETCONNECTOR, &gc) < 0) continue;
-		if (gc.connection != 1 || !gc.count_modes) continue;
-		conn_id = gc.connector_id;
-		enc = gc.encoder_id;
-		/* 选能装下的最大模式，源更小时取等比最大不超过屏幕 */
-		for (j = 0; j < (int)gc.count_modes; j++) {
-			unsigned mw = modes[j].hdisplay, mh = modes[j].vdisplay;
-
-			if (mw > 4096 || mh > 4096) continue;
-			if (mw * (uint64_t)mh > (uint64_t)mode.hdisplay * mode.vdisplay)
-				mode = modes[j];
-		}
-		if (gc.encoder_id) {
-			struct drm_mode_get_encoder ge = {0};
-
-			ge.encoder_id = gc.encoder_id;
-			if (ioctl(pc.dfd, DRM_IOCTL_MODE_GETENCODER, &ge) == 0 && ge.crtc_id)
-				crtc_id = ge.crtc_id;
-		}
-	}
-	if (!conn_id || !mode.hdisplay) { printf("PLAY: no connected connector\n"); return -1; }
-	if (!crtc_id && res.count_crtcs) crtc_id = crtcs[0];
-	pc.crtc_id = crtc_id; pc.dw = mode.hdisplay; pc.dh = mode.vdisplay;
-	pc.refresh = mode.vrefresh ? mode.vrefresh : 60;
-	printf("PLAY: conn=%u crtc=%u mode=%ux%u@%u  src=%ux%u\n", conn_id, crtc_id,
-	       pc.dw, pc.dh, mode.vrefresh, sw, sh);
-
-	/* primary plane 只认 RGB（ARGB/ABGR/XRGB/XBGR/RGB888/RGB565），不收 NV12。
-	 * 所以点屏用一张全透明 ARGB8888：CRTC 起来、OSD 完全透明，
-	 * 视频画面由 overlay plane 的 SETPLANE 叠加到下层。
-	 */
-	{
-		struct drm_mode_fb_cmd2 dfb = {0};
-		struct drm_mode_create_dumb dd = {0};
-		struct drm_mode_map_dumb dm = {0};
-		void *map;
-
-		dd.width = pc.dw; dd.height = pc.dh; dd.bpp = 32;
-		if (ioctl(pc.dfd, DRM_IOCTL_MODE_CREATE_DUMB, &dd) < 0) {
-			printf("PLAY: CREATE_DUMB ARGB: %s\n", strerror(errno)); return -1;
-		}
-		dfb.width = pc.dw; dfb.height = pc.dh;
-		dfb.pixel_format = DRM_FORMAT_ARGB8888;
-		dfb.handles[0] = dd.handle; dfb.pitches[0] = dd.pitch;
-		if (ioctl(pc.dfd, DRM_IOCTL_MODE_ADDFB2, &dfb) < 0) {
-			printf("PLAY: ADDFB2 ARGB: %s\n", strerror(errno));
-			return -1;
-		}
-		/* dumb 内容未定义，必须显式清零成全透明 */
-		dm.handle = dd.handle;
-		if (ioctl(pc.dfd, DRM_IOCTL_MODE_MAP_DUMB, &dm) < 0) {
-			printf("PLAY: MAP_DUMB: %s\n", strerror(errno)); return -1;
-		}
-		map = mmap(NULL, dd.size, PROT_READ | PROT_WRITE, MAP_SHARED, pc.dfd, dm.offset);
-		if (map != MAP_FAILED) {
-			/* 必须全透明（alpha=0）：primary plane 在 meson 上
-			 * zpos 高于 overlay，填不透明色会把视频层整个盖黑。
-			 * 黑边交给 overlay 的 dst 矩形外区域（CRTC 未覆盖处）。*/
-			uint32_t *px = map;
-			size_t n = dd.size / 4, i;
-
-			for (i = 0; i < n; i++) px[i] = 0x00000000u;
-			munmap(map, dd.size);
-		}
-		else printf("PLAY: mmap ARGB: %s (可能残留脏像素)\n", strerror(errno));
-		set.crtc_id = crtc_id;
-		set.fb_id = dfb.fb_id;
-	}
-	set.mode = mode;
-	set.mode_valid = 1;	/* 少了这行，内核 mode=NULL -> EINVAL */
-	set.count_connectors = 1;
-	set.set_connectors_ptr = (uint64_t)(uintptr_t)&conn_id;
-	if (ioctl(pc.dfd, DRM_IOCTL_MODE_SETCRTC, &set) < 0) {
-		printf("PLAY: SETCRTC: %s\n", strerror(errno)); return -1;
-	}
-	/* 挑支持 NV12 的 plane（overlay），不能盲取 ids[0] */
-	{
-		struct drm_mode_get_plane_res pr = {0};
-		uint32_t ids[32];
-		int k;
-
-		pr.plane_id_ptr = (uint64_t)(uintptr_t)ids;
-		pr.count_planes = 32;
-		if (ioctl(pc.dfd, DRM_IOCTL_MODE_GETPLANERESOURCES, &pr) < 0) {
-			printf("PLAY: GETPLANERESOURCES: %s\n", strerror(errno)); return -1;
-		}
-		unsigned force = getenv("PLANE") ? (unsigned)atoi(getenv("PLANE")) : 0;
-		int listp = getenv("PLANELIST") != NULL;
-
-		for (k = 0; k < (int)pr.count_planes; k++) {
-			struct drm_mode_get_plane gp = {0};
-			uint32_t fmts[32];
-			int f, nv12 = 0;
-
-			gp.plane_id = ids[k];
-			if (ioctl(pc.dfd, DRM_IOCTL_MODE_GETPLANE, &gp) < 0) continue;
-			gp.format_type_ptr = (uint64_t)(uintptr_t)fmts;
-			gp.count_format_types = 32;
-			if (ioctl(pc.dfd, DRM_IOCTL_MODE_GETPLANE, &gp) < 0) continue;
-			for (f = 0; f < (int)gp.count_format_types; f++)
-				if (fmts[f] == DRM_FORMAT_NV12) nv12 = 1;
-			if (listp)
-				printf("PLAY: plane=%u crtc=%u fmts=%u nv12=%d\n",
-				       ids[k], gp.crtc_id, gp.count_format_types, nv12);
-			if (!nv12) continue;
-			if (force && ids[k] != force) continue;
-			if (pc.plane_id) continue;
-			pc.plane_id = ids[k];
-			printf("PLAY: plane=%u 收 NV12 (%u 种格式) crtc=%u\n",
-			       ids[k], gp.count_format_types, gp.crtc_id);
-			if (!listp) break;
-		}
-		if (!pc.plane_id) { printf("PLAY: 没有收 NV12 的 plane\n"); return -1; }
-	}
-	pc.t_start = now_s();
-	return 0;
-}
-
-/* 读当前 vblank 计数：RELATIVE 0 只回报 $sequence，不阻塞 */
-static uint32_t play_vbl_seq(int *ok)
-{
-	union drm_wait_vblank wv = {0};
-
-	wv.request.type = _DRM_VBLANK_RELATIVE;
-	wv.request.sequence = 0;
-	if (ioctl(pc.dfd, DRM_IOCTL_WAIT_VBLANK, &wv) < 0) {
-		if (ok) *ok = 0;
-		return 0;
-	}
-	if (ok) *ok = 1;
-	return wv.reply.sequence;
-}
-
-/* 缩放策略：SCALE=fit(默认，保比例+黑边) / fill(强制铺满，会变形) /
- * crop(保比例放大裁边). 目标矩形只跟源尺寸有关，算一次缓存。
+/* ---------- Renderer（上屏的唯一出口） ----------
+ * 播放器只认 render.h：解、喂、seek、会话重建、pts、缓冲生命周期都在这边，
+ * "这一帧怎么变成光"全在两个后端里。换 A/B 只是 RENDER=drm|gl。
  */
-static void play_rect(unsigned sw, unsigned sh)
+static struct renderer *rend;
+static int g_drop_owners;	/* 会话重建中：owner 已作废，别再往旧 fd 上 QBUF */
+static double g_play_fps = 24.0;	/* 播放配速；0 = 不限速（测吞吐） */
+static double g_play_lead = 6;		/* 解码最多领先上屏几帧（背压） */
+static int g_need_tm;			/* 后端不吃 HDR：播放器侧先 CPU 转 SDR */
+
+/* ---------- 上屏路径上报（给"上层"看） ----------
+ * 脚本/自检/遥控不该去 grep 日志猜：到底是 DRM 直挂 plane，还是 GLES 导入
+ * 纹理再色彩处理；HDR 是播放器 CPU 转还是 shader 转。只有播放器知道真相
+ * （RENDER=auto 时选了谁、caps 决定了 tonemap 落在哪），所以由它写一份可
+ * source 的状态文件，别的进程只读。先写 .tmp 再 rename，读侧永远看到完整的。
+ */
+static void render_dump_state(const struct render_stats *rs)
 {
-	int fill = 0, crop = 0;
-	const char *sm = getenv("SCALE");
+	const char *p = getenv("RENDERSTATE") ? getenv("RENDERSTATE")
+					     : "/tmp/tvplay.render";
+	char np[256], tmp[280];
+	FILE *f;
 
-	if (pc.rect_ok && pc.rsw == sw && pc.rsh == sh) return;
-	pc.rsw = sw; pc.rsh = sh;
-	if (sm && !strcmp(sm, "fill")) fill = 1;
-	else if (sm && !strcmp(sm, "crop")) crop = 1;
-
-	if (crop) {
-		/* 铺满屏幕，超出部分裁掉 */
-		pc.dx = 0; pc.dy = 0; pc.dW = pc.dw; pc.dH = pc.dh;
-	} else if (fill) {
-		pc.dx = 0; pc.dy = 0; pc.dW = pc.dw; pc.dH = pc.dh;
-	} else {
-		/* fit：等比缩到装得下，居中，剩下的是黑边 */
-		double s = (double)pc.dw / sw, sv = (double)pc.dh / sh;
-
-		if (sv < s) s = sv;
-		pc.dW = (unsigned)(sw * s + 0.5);
-		pc.dH = (unsigned)(sh * s + 0.5);
-		if (pc.dW > pc.dw) pc.dW = pc.dw;
-		if (pc.dH > pc.dh) pc.dH = pc.dh;
-		pc.dx = (int)(pc.dw - pc.dW) / 2;
-		pc.dy = (int)(pc.dh - pc.dH) / 2;
-	}
-	pc.rect_ok = 1;
-	printf("PLAY: scale=%s  src=%ux%u -> %ux%u @ +%d+%d (screen %ux%u)\n",
-	       crop ? "crop" : fill ? "fill" : "fit", sw, sh, pc.dW, pc.dH,
-	       pc.dx, pc.dy, pc.dw, pc.dh);
+	if (!rend)
+		return;
+	snprintf(np, sizeof(np), "%s", p);
+	snprintf(tmp, sizeof(tmp), "%s.tmp", np);
+	f = fopen(tmp, "w");
+	if (!f)
+		return;
+	fprintf(f, "RENDER=%s\n", render_name(rend));
+	fprintf(f, "MODE=%s\n",
+		!strcmp(render_name(rend), "drm") ? "direct" : "gles");
+	fprintf(f, "CAPS=%s%s\n", render_has_hdr(rend) ? "hdr" : "sdr",
+		render_has_pace(rend) ? ",pace" : "");
+	/* cpu = 播放器侧 tm_apply；shader = GL 片元里转；none = 没 HDR 要转 */
+	fprintf(f, "TONEMAP=%s\n", g_need_tm ? "cpu" :
+		(render_has_hdr(rend) ? "shader" : "none"));
+	fprintf(f, "SRC=%ux%u\n", capw, caph);
+	if (rs)
+		fprintf(f, "SCREEN=%ux%u@%u\n", rs->dw, rs->dh, rs->refresh);
+	fprintf(f, "PID=%d\n", (int)getpid());
+	fclose(f);
+	rename(tmp, np);
 }
 
-static int play_frame(int idx, int yfd, int cfd, unsigned sw, unsigned sh)
+/* 帧从 Renderer 回到 vdec —— 唯一的缓冲回收点。
+ * 回调跑在 render_pump 的调用线程里（就是我们自己），可以放心 ioctl。
+ */
+static void cap_recycle(int idx)
 {
-	struct drm_mode_set_plane sp = {0};
-	double due = 0, now, fps = 24.0;
+	struct v4l2_buffer b = {0};
+	struct v4l2_plane pl[2] = {{0}};
 
-	if (!pc.fb[idx]) {
-		pc.fb[idx] = play_addfb(yfd, cfd, sw, sh);
-		if (!pc.fb[idx]) { printf("PLAY: addfb idx=%d failed\n", idx); return -1; }
-	}
-	if (getenv("FPS")) fps = atof(getenv("FPS"));
-	now = now_s();
-	if (!pc.refresh) pc.refresh = 60;
-
-	/* 节拍=屏幕 vblank 序列，不用 usleep 猜时间：
-	 * 24fps@60Hz 天然是 2.5 个 vblank/帧，按累计 ticks 取整
-	 * 就是标准的 3:2 拉片，帧间隔在 2/3 之间交替，不会忽快忽慢。
-	 */
-	if (!pc.vbl_ok) {
-		int ok = 0;
-
-		pc.vbl_base = play_vbl_seq(&ok);
-		pc.vbl_ok = ok;
-		pc.t_start = now;
-		if (!ok) pc.t_start = now;	/* 没有 vblank 就退回时间节拍 */
-	} else if (pc.n == 0 && !pc.drops) {
-		pc.t_start = now;
-	}
-
-	if (pc.vbl_ok) {
-		uint32_t cur = play_vbl_seq(NULL);
-		long target = (long)pc.vbl_base +
-			      (long)(pc.n * (double)pc.refresh / fps + 0.5);
-
-		if ((long)cur < target) {
-			union drm_wait_vblank wv = {0};
-
-			/* 等绝对序列：一次 ioctl 到点就醒，不空转 */
-			wv.request.type = _DRM_VBLANK_ABSOLUTE;
-			wv.request.sequence = (uint32_t)target;
-			if (ioctl(pc.dfd, DRM_IOCTL_WAIT_VBLANK, &wv) < 0) {
-				pc.timeouts++;
-				pc.vbl_ok = 0;
-			}
-		} else if ((long)cur > target + 2L * (long)(pc.refresh / fps + 1)) {
-			/* 落后超过两帧：把锚点挪到当前，避免之后一路狂追/狂丢 */
-			pc.vbl_base = cur - (uint32_t)(pc.n * (double)pc.refresh / fps + 0.5);
-		}
-	} else {
-		/* 退化路径：按时间节拍，落后 0.5s 就丢帧并重锚 */
-		due = pc.t_start + pc.n / fps;
-		if (now < due)
-			usleep((useconds_t)((due - now) * 1e6));
-		else if (now > due + 0.5) {
-			pc.t_start = now - pc.n / fps;
-			pc.n++;
-			pc.drops++;
-			return 0;
-		}
-	}
-
-	sp.plane_id = pc.plane_id;
-	sp.crtc_id = pc.crtc_id;
-	sp.fb_id = pc.fb[idx];
-	pc.cur_fb = sp.fb_id;
-	play_rect(sw, sh);
-	{
-		/* DSTGEO=WxH+X+Y 强制目标矩形，用来单变量排查缩放/尺寸 */
-		static int done;
-		const char *g = getenv("DSTGEO");
-
-		if (g && !done) {
-			unsigned w, h; int x = 0, y = 0;
-			done = 1;
-			if (sscanf(g, "%ux%u+%d+%d", &w, &h, &x, &y) >= 2) {
-				pc.dW = w; pc.dH = h; pc.dx = x; pc.dy = y;
-				printf("PLAY: DSTGEO override -> %ux%u @ +%d+%d\n",
-				       w, h, x, y);
-			}
-		}
-	}
-	if (getenv("SCALE") && !strcmp(getenv("SCALE"), "crop")) {
-		/* crop: 源采样区按比例内缩，等价于放大后裁边 */
-		unsigned cw = sw, ch = sh;
-		double sa = (double)sw / sh, da = (double)pc.dw / pc.dh;
-
-		if (sa > da) cw = (unsigned)(sh * da + 0.5);	/* 源更宽：裁左右 */
-		else if (sa < da) ch = (unsigned)(sw / da + 0.5); /* 源更高：裁上下 */
-		sp.src_x = ((sw - cw) / 2) << 16;
-		sp.src_y = ((sh - ch) / 2) << 16;
-		sp.src_w = cw << 16; sp.src_h = ch << 16;
-	} else {
-		sp.src_w = sw << 16; sp.src_h = sh << 16;
-	}
-	sp.crtc_x = pc.dx; sp.crtc_y = pc.dy;
-	sp.crtc_w = pc.dW; sp.crtc_h = pc.dH;
-	if (getenv("DBGPLANE"))
-		printf("PLAY: setplane n=%u idx=%d src=%ux%u dst=%ux%u@%d,%d fb=%u\n",
-		       pc.n, idx, sw, sh, pc.dW, pc.dH, pc.dx, pc.dy, sp.fb_id);
-	if (ioctl(pc.dfd, DRM_IOCTL_MODE_SETPLANE, &sp) < 0) {
-		printf("PLAY: SETPLANE: %s\n", strerror(errno));
-		return -1;
-	}
-	pc.flips++;
-	pc.n++;
-	return 0;
+	if (idx < 0 || idx >= NBUF_CAP_MAX)
+		return;
+	cap_busy[idx] = 0;
+	if (g_drop_owners || fd < 0)
+		return;
+	b.type = CAP_T;
+	b.memory = V4L2_MEMORY_MMAP;
+	b.index = idx;
+	b.length = 2;
+	b.m.planes = pl;
+	if (ioctl(fd, VIDIOC_QBUF, &b) < 0 && errno != EINVAL)
+		perror("QBUF recycle(renderer)");
 }
-#endif
+
+static void on_frame_done(void *ctx, void *owner, double pts, uint32_t latch,
+			  int status)
+{
+	(void)ctx; (void)latch;
+	cap_recycle((int)((struct capbuf *)owner - capbuf));
+	if (status == RENDER_DROPPED && g_verbose)
+		printf("RENDER: drop pts=%.3f\n", pts);
+}
 
 /* OUTPUT 格式：一个 AU 一个 buffer。初次启动和 seek 重建会话共用。 */
-static void out_fmt_setup(void)
+static int out_fmt_setup(unsigned w, unsigned h)
 {
 	struct v4l2_format f = {0};
 	size_t max = getenv("MAXAU") ? atol(getenv("MAXAU")) : (6u << 20);
@@ -1484,14 +2031,537 @@ static void out_fmt_setup(void)
 	f.type = OUT_T;
 	f.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_HEVC;
 	f.fmt.pix_mp.num_planes = 1;
-	f.fmt.pix_mp.width = g_w;
-	f.fmt.pix_mp.height = g_h;
+	f.fmt.pix_mp.width = w;
+	f.fmt.pix_mp.height = h;
 	f.fmt.pix_mp.field = V4L2_FIELD_NONE;
 	f.fmt.pix_mp.plane_fmt[0].sizeimage = (max + 8191) & ~4095UL;
-	if (xioctl(fd, VIDIOC_S_FMT, &f) < 0) die("S_FMT out");
+	if (xioctl(fd, VIDIOC_S_FMT, &f) < 0) {
+		printf("S_FMT OUT 失败: %s\n", strerror(errno));
+		return -errno;
+	}
 	printf("S_FMT OUT : %ux%u sizeimage=%u (max AU %zu)\n",
 	       f.fmt.pix_mp.width, f.fmt.pix_mp.height,
 	       f.fmt.pix_mp.plane_fmt[0].sizeimage, max);
+	return 0;
+}
+
+/* ================= 解码器会话生命周期 =================
+ *
+ * 一个会话 = /dev/video0 的 fd + 它的 OUTPUT/CAPTURE 队列、映射、导出的
+ * dmabuf、事件订阅、流的开关状态。**只有下面两个函数动这些资源**，
+ * main/事件回调里再不许出现 stop_stream + close(fd) + REQBUFS 的自由组合
+ * （旧代码在 seek、SOURCE_CHANGE、退出三处各抄了一遍，谁漏一步就漏 fd、
+ * 漏 render_flush、或者把旧 owner QBUF 回新 fd）。
+ *
+ * 不变式：
+ *  1) fd >= 0 ⟺ 会话活着。任何失败路径都必须回到 fd = -1，
+ *     绝不留半初始化会话——带半套资源继续跑正是"自激重建"的源头。
+ *  2) 各步骤（S_FMT / REQBUFS / QBUF / STREAMON）返回 0 / -errno，
+ *     不许 die()，由 vdec_open 决定重试还是交还失败。
+ *  3) g_sess 是**提交计数**，不是尝试计数：只有 vdec_tx_commit() 才递增
+ *     （§3.2.3）。失败的尝试不占代数，否则日志里"重建 4 次"对不上账。
+ *     关闭时先作废 Renderer 手里的旧帧，再放队列、关 dmabuf、最后 close(fd)。
+ *  4) hard_reset 失败是硬错误：返回 -1，不许当没发生继续开流。
+ */
+static int g_sess;		/* 已提交的会话代数：只增不减，commit 时才 ++ */
+static int g_tx_attempt;	/* 事务里的 open 尝试数（含失败），和 g_sess
+				 * 一起构成"成功率 = g_sess 增量 / attempts" */
+
+/* 把 Renderer 手里属于旧缓冲的帧全部作废：清队会逐帧回调 ABORTED，
+ * 那些 owner 属于旧会话/旧 dmabuf，一律不许再 QBUF（g_drop_owners）。
+ */
+static void retire_capture_frames(void)
+{
+	if (rend) {
+		g_drop_owners = 1;
+		render_flush(rend);
+		g_drop_owners = 0;
+	}
+	memset(cap_busy, 0, sizeof(cap_busy));
+}
+
+/* 一次完整开流：open + S_FMT×2 + 队列 + 订阅 + STREAMON。
+ * 成功 0、会话可用；失败 -errno，且 fd 已回到 -1，可以直接重试。
+ */
+static int vdec_open(unsigned w, unsigned h)
+{
+	const char *dev = getenv("VDECDEV") ? getenv("VDECDEV") : DEV;
+	struct v4l2_event_subscription sub = { .type = V4L2_EVENT_SOURCE_CHANGE };
+	struct v4l2_control ctl = { .id = V4L2_CID_MIN_BUFFERS_FOR_CAPTURE };
+	int r;
+
+	if (fd >= 0)		/* 不变式 1：一个进程一个会话 */
+		vdec_close(0);
+
+	/* 换片 = 分辨率/码流身份变了：上一片的内容信号（峰值、色域、传递函数）
+	 * 必须先清掉，否则这一片没写 VUI/SEI 时会继续按上一片的峰值压缩。
+	 * 同一片内部的 seek 不清：seek 目标 GOP 未必带 SEI，保留原峰值更接近真相。 */
+	if (g_w && g_h && (w != g_w || h != g_h) &&
+	    (g_cm.max_cll > 0.0f || g_cm.mastering_max_luminance > 0.0f ||
+	     g_cm.transfer)) {
+		printf("CSIG: 换片 %ux%u→%ux%u，清空上一片的内容信息\n", g_w, g_h, w, h);
+		cm_reset();
+	}
+	g_w = w;
+	g_h = h;
+	fd = open(dev, O_RDWR | O_NONBLOCK);
+	if (fd < 0) {
+		r = -errno;
+		printf("VDEC: open %s 失败: %s\n", dev, strerror(errno));
+		return r;
+	}
+	/* 注意：这里**不**递增 g_sess —— 拿到 fd 不等于会话成立（§3.2.3）。
+	 * 号在 vdec_tx_commit() 里才给，失败的事务连号都占不到。
+	 */
+	r = out_fmt_setup(w, h);
+	if (!r) r = s_fmt_cap(w, h);
+	if (!r) r = cap_setup();
+	if (!r) r = out_setup();
+	if (!r && xioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0) {
+		printf("SUBSCRIBE_EVENT 失败: %s\n", strerror(errno));
+		r = -errno;
+	}
+	if (!r) r = start_stream();
+	if (r) {
+		printf("VDEC: 开流失败 (%s)，回落关闭会话\n", strerror(-r));
+		vdec_close(0);
+		return r;
+	}
+	capw = g_w;
+	caph = g_h;
+	if (!xioctl(fd, VIDIOC_G_CTRL, &ctl))
+		printf("min_buffers_for_capture(DPB)=%d\n", ctl.value);
+	printf("VDEC: 会话打开成功 %ux%u（cap=%u out=%u）\n",
+	       capw, caph, cap_count, n_out);
+	return 0;
+}
+
+/* 关会话，幂等：任何阶段都能调，重复调用是空操作。
+ * hard_reset=1 时在 close 之后做整块掉电复位（驱动 cur_sess 已空才接受）。
+ * 返回 0 成功，-1 表示硬复位没做成（硬件可能还挂着）。
+ */
+static int vdec_close(int hard_reset)
+{
+	int r = 0;
+
+	if (fd < 0)
+		return 0;
+
+	stop_stream();
+	/* 顺序要紧：先让 Renderer 交回/丢弃旧帧，再关它们引用的 dmabuf，
+	 * 最后才拆队列。反过来会把还在用的 dmabuf fd 关在纹理下面。
+	 */
+	retire_capture_frames();
+	close_cap_dmabufs();
+	cap_release();
+	out_release();		/* fd 关掉后这些映射就没人会用了，就地撤 */
+	close(fd);
+	fd = -1;		/* 不变式 1 */
+
+	/* 驱动是异步收尾的：close 后它才在 workqueue 里打完
+	 * "Aborting decoding session!"。紧接着 open 会把新会话开在
+	 * 还没收干净的旧状态上（实测 seek 偶发连试两次不出帧），
+	 * 所以留一个落定期。复位流程本身就在等，不必再等一遍。
+	 */
+	if (hard_reset) {
+		if (vdec_hard_reset() < 0)
+			r = -1;
+	} else {
+		usleep(80000);
+	}
+	printf("VDEC: 会话 #%d 已关闭%s\n", g_sess, hard_reset ? "（硬复位）" : "");
+	return r;
+}
+
+/* 同一个会话内换分辨率（SOURCE_CHANGE）：队列整组重建。
+ * 失败就把会话置回不可用状态（fd=-1），让调用方走整会话重建。
+ */
+static int vdec_resize(unsigned w, unsigned h)
+{
+	int r;
+
+	if (fd < 0)
+		return -EINVAL;
+	stop_stream();
+	retire_capture_frames();
+	close_cap_dmabufs();
+	cap_release();
+	g_w = w;
+	g_h = h;
+	r = s_fmt_cap(w, h);
+	if (!r) r = cap_setup();
+	if (!r) r = out_setup();
+	if (!r) r = start_stream();
+	if (r) {
+		printf("RESIZE: %ux%u 失败 (%s)，会话作废\n", w, h, strerror(-r));
+		stop_stream();
+		close_cap_dmabufs();
+		cap_release();
+		close(fd);
+		fd = -1;
+		return r;
+	}
+	capw = g_w;
+	caph = g_h;
+	printf("RESIZE: %ux%u 会话 #%d 已重建\n", capw, caph, g_sess);
+	return 0;
+}
+
+/* ================= 重建事务（§3.2）=================
+ *
+ * 补偿式事务，不是两阶段提交：驱动 cur_sess 是全局单例（§1.10），开不了
+ * 影子会话，所以"原子性"不表现为回到旧状态，而表现为
+ *
+ *   对外只承认两种状态：VS_RUN(sess=N) / VS_DOWN(fd<0)；
+ *   中间态（fd 在、队列半套、dmabuf 半套、owner 悬空）不许被外人看到。
+ *
+ * 三段：PREPARE（只读定档定预算）→ BODY（破坏性、可重试、全返回 -errno）
+ * → COMMIT（唯一写屏障：g_sess++ 与门控归位）／ABORT（无条件补偿到空态）。
+ * 旧代码把 s_len/s_pos/...清零放在 close/open 成功之前、g_sess++ 放在
+ * open 一进门，于是"失败的重建"也改了可见状态——这里两处都收进事务。
+ */
+
+static const char *tx_why_name(int why)
+{
+	static const char *nm[] = { "newstream", "seek", "abort", "stall",
+				    "srcchange", "rap", "selftest" };
+
+	return (why >= 0 && why < (int)(sizeof(nm) / sizeof(nm[0])))
+		       ? nm[why] : "?";
+}
+
+/* BODY 1：管道残留读空 + 码流扫描状态归零。
+ * 必须在 close/open 之前做完，但本身不改变"会话可见状态"——它是码流侧的
+ * 准备，重复做无副作用。EAGAIN 是终点，不算失败。
+ */
+static void tx_flush_pipe(void)
+{
+	if (s_fd >= 0) {
+		int fl = fcntl(s_fd, F_GETFL);
+
+		if (fl >= 0) {
+			fcntl(s_fd, F_SETFL, fl | O_NONBLOCK);
+			for (;;) {
+				unsigned char tmp[65536];
+
+				if (read(s_fd, tmp, sizeof tmp) <= 0)
+					break;
+			}
+			fcntl(s_fd, F_SETFL, fl & ~O_NONBLOCK);
+		}
+	}
+	s_len = 0;
+	s_pos = 0;
+	s_au_start = 0;
+	s_au_open = 0;
+	s_cur_vcl = 0;
+	s_eof = 0;
+	s_release = 0;
+	s_au_rap = 0;
+	s_au_rasl = 0;
+}
+
+/* 失败注入（§3.2.6）：REBUILD_FAIL=STEP:ERRNO，STEP∈{S_FMT,REQBUFS,
+ * STREAMON,hard_reset}。没有注入就没有事务——四条分支必须能被主动踩到，
+ * 否则"回滚清单"只是注释。REBUILD_FAILN 限注入次数（默认 0=一直失败）。
+ */
+static const char *tx_step = "open";
+
+static int tx_inject(const char *step)
+{
+	static const char *e;
+	static int used;
+	const char *c;
+	char buf[64];
+	size_t n;
+
+	if (!e)
+		e = getenv("REBUILD_FAIL");
+	if (!e || !*e)
+		return 0;
+	if (env_i("REBUILD_FAILN", 0) > 0 && used >= env_i("REBUILD_FAILN", 0))
+		return 0;
+	c = strchr(e, ':');
+	n = c ? (size_t)(c - e) : strlen(e);
+	if (n >= sizeof(buf))
+		n = sizeof(buf) - 1;
+	memcpy(buf, e, n);
+	buf[n] = 0;
+	if (strcmp(buf, step))
+		return 0;
+	used++;
+	tx_step = step;
+	if (!c || !c[1])
+		return -EIO;
+	/* 只认四个常用 errno，别把注入做成通用 errno 解析器 */
+	if (!strcmp(c + 1, "EBUSY"))   return -EBUSY;
+	if (!strcmp(c + 1, "EAGAIN"))  return -EAGAIN;
+	if (!strcmp(c + 1, "ENOMEM"))  return -ENOMEM;
+	if (!strcmp(c + 1, "EINVAL"))  return -EINVAL;
+	if (!strcmp(c + 1, "EPERM"))   return -EPERM;
+	if (!strcmp(c + 1, "ENODEV"))  return -ENODEV;
+	return -EIO;
+}
+
+/* errno 分类（§3.2.3 的表）。次数预算之外最省事的一步：同一个 EBUSY 值得
+ * 再等 200ms，同一个 EINVAL 再等一万次也不会变。
+ */
+enum tx_action { TXA_RETRY, TXA_ABORT };
+
+static enum tx_action tx_classify(int e, int *nohard)
+{
+	*nohard = 0;
+	switch (e) {
+	case EBUSY:
+	case EAGAIN:
+		return TXA_RETRY;	/* 驱动 workqueue 还没收完 */
+	case ENOMEM:
+	case ENOSPC:
+		*nohard = 1;		/* CMA 碎片：复位只会更糟（§2.5） */
+		return TXA_RETRY;
+	case ENOENT:
+	case EACCES:
+	case EINVAL:
+	case ENODEV:
+	case ENXIO:
+		return TXA_ABORT;	/* 重试只是把黑屏时间拉长 */
+	default:
+		return TXA_RETRY;
+	}
+}
+
+/* ABORT 之后的不变式断言（§3.2.4）。靠人眼看不出来，所以让它自己喊。 */
+static int tx_assert_clean(void)
+{
+	unsigned i;
+	int bad = 0, p;
+
+	if (fd >= 0) {
+		printf("TX-ASSERT: fd=%d 还开着\n", fd);
+		bad = 1;
+	}
+	if (cap_count) {
+		printf("TX-ASSERT: cap_count=%u 没还回去\n", cap_count);
+		bad = 1;
+	}
+	if (n_out || out_nfree) {
+		printf("TX-ASSERT: n_out=%d out_nfree=%d 没撤掉\n", n_out, out_nfree);
+		bad = 1;
+	}
+	if (g_drop_owners) {
+		printf("TX-ASSERT: g_drop_owners 没复位\n");
+		bad = 1;
+	}
+	for (i = 0; i < NBUF_CAP_MAX; i++) {
+		for (p = 0; p < 2; p++)
+			if (capbuf[i].dmabuf[p] >= 0) {
+				printf("TX-ASSERT: cap[%u/%d] dmabuf fd=%d 泄漏\n",
+				       i, p, capbuf[i].dmabuf[p]);
+				bad = 1;
+			}
+		if (capbuf[i].mem[0] || capbuf[i].mem[1]) {
+			printf("TX-ASSERT: cap[%u] mmap 未撤\n", i);
+			bad = 1;
+		}
+	}
+	printf("TX-ASSERT: %s（不变式 fd<0 cap=0 out=0 owners=0）\n",
+	       bad ? "FAILED" : "OK");
+	return bad;
+}
+
+/* PREPARE：定档、记快照、定预算、打 BEGIN。只读，不碰任何 fd。 */
+static void tx_begin(enum vev why, int level)
+{
+	static unsigned next_id;
+	double budget = env_d("REBUILDMS", 3000) / 1000.0;
+
+	memset(&g_tx, 0, sizeof(g_tx));
+	g_tx.id = ++next_id;
+	g_tx.why = why;
+	g_tx.level = level;
+	g_tx.hard = (level >= LVL_L3);
+	g_tx.sess_before = g_sess;
+	g_tx.t0 = now_s();
+	/* L3 单次硬复位实测 150×20ms=3s，所以预算按 3 倍给 */
+	g_tx.deadline = g_tx.t0 + budget * (g_tx.hard ? 3.0 : 1.0);
+	g_tx.phase = TX_PREPARE;
+	printf("TX#%u BEGIN why=%s level=L%d sess=%u budget=%.0fms\n",
+	       g_tx.id, tx_why_name(why), level, g_tx.sess_before,
+	       (g_tx.deadline - g_tx.t0) * 1000.0);
+	fflush(stdout);
+}
+
+/* 暂停（pkill -STOP）会把进程冻在 BODY 中间，而 CLOCK_MONOTONIC 照走：
+ * deadline 会在冻住时过期，resume 后第一轮就误判"重试超预算"去 L4。
+ * 修法与 STALL 同源：整体平移（不重置，保持已花的预算）。 */
+static void tx_shift_pause(double wall, double expect)
+{
+	double d = wall - expect;
+
+	if (d > 4.0) {
+		g_tx.t0 += d;
+		g_tx.deadline += d;
+		printf("TX#%u: 进程被冻住 %.1fs，预算整体平移（已花的不退）\n",
+		       g_tx.id, d);
+	}
+}
+
+static void tx_sleep(double sec)
+{
+	double a = now_s();
+
+	usleep((useconds_t)(sec * 1e6));
+	tx_shift_pause(now_s() - a, sec);
+}
+
+/* COMMIT：唯一的写屏障。只有 vdec_open()==0 才走到这里。 */
+static void tx_commit(const char *cause)
+{
+	double ms = (now_s() - g_tx.t0) * 1000.0;
+
+	g_tx.phase = TX_COMMIT;
+	g_sess++;		/* 提交计数：全程序唯一的递增点 */
+	rap_enter(RAP_WAIT, cause);
+	g_rap_degraded = 0;
+	g_rap_rasl_over = 0;
+	printf("TX#%u COMMIT why=%s sess=%u→%u %.0fms tries=%d\n",
+	       g_tx.id, tx_why_name(g_tx.why), g_tx.sess_before, g_sess,
+	       ms, g_tx.tries);
+	fflush(stdout);
+	g_tx.phase = TX_IDLE;
+}
+
+/* BODY + COMMIT/ABORT 全流程。
+ * flush=1：新码流（seek/重建）要先把管道残留读空；
+ * flush=0：进程启动，s_buf 里已经预读了 SPS，一滴都不能丢。
+ * 返回 0=已提交，-1=ABORT 且已回到干净空态（可以再来一次），-2=放弃(L4)。
+ */
+static int tx_run(int flush)
+{
+	int r, e = 0, nohard = 0;
+	enum vev why_again = (enum vev)g_req_why;
+
+	if (flush)
+		tx_flush_pipe();
+
+	tx_begin((enum vev)g_req_why, g_req_lvl ? g_req_lvl : LVL_L2);
+
+	for (;;) {
+		int hinj = 0;
+
+		g_tx.phase = TX_BODY;
+		tx_step = "hard_reset";
+		if (g_tx.hard)
+			hinj = tx_inject("hard_reset");	/* REBUILD_FAIL=hard_reset:EPERM */
+		tx_step = "close";
+		/* BODY 3：关。幂等；硬复位失败是硬错误，不许当没发生继续开流。 */
+		if (vdec_close(g_tx.hard && !hinj) < 0)
+			printf("TX#%u: 硬复位失败（step=hard_reset），会话已关，仍尝试重开\n",
+			       g_tx.id);
+		g_tx.hard = 0;		/* 复位的是硬件不是会话：只做一次 */
+		if (hinj) {
+			e = -hinj;
+			tx_step = "hard_reset";
+			printf("TX#%u: 硬复位失败（%s）→ L3 硬错误，直接 ABORT\n",
+			       g_tx.id, strerror(e));
+			goto abort;
+		}
+
+		/* 事务期间又来请求（seek 落在 BODY 里）：只升级档位，不打断，
+		 * 也不排队（排队 = 先做一次无用功再毁一次）。
+		 */
+		if (g_reinit) {
+			int nl = g_req_lvl;
+
+			g_reinit = 0;
+			g_req_lvl = 0;
+			g_req_why = 0;
+			if (nl > g_tx.level) {
+				printf("TX#%u: 期间收到新请求（L%d）→ 档位升级，继续本次事务\n",
+				       g_tx.id, nl);
+				g_tx.level = nl;
+				g_tx.hard = (nl >= LVL_L3);
+			}
+		}
+
+		/* BODY 5：开（注入先于真开：STEP 就是"假设它在这一步失败"，
+		 * 不必把注入点塞进 vdec_open 的每一行）。
+		 */
+		tx_step = "S_FMT";
+		r = tx_inject("S_FMT");
+		if (!r) {
+			tx_step = "REQBUFS";
+			r = tx_inject("REQBUFS");
+		}
+		if (!r) {
+			tx_step = "STREAMON";
+			r = tx_inject("STREAMON");
+		}
+		if (!r) {
+			tx_step = "open";
+			r = vdec_open(g_w, g_h);
+		}
+		g_tx.tries++;
+		g_tx_attempt++;
+		if (!r)
+			break;			/* → COMMIT */
+
+		e = -r;
+		/* SIGUSR1 打在事务中间：不算失败，也不吃预算（seek 是正常操作） */
+		if (e == EINTR) {
+			printf("TX#%u: EINTR（信号打断），不消耗预算，重试\n", g_tx.id);
+			continue;
+		}
+		if (tx_classify(e, &nohard) == TXA_ABORT) {
+			printf("TX#%u: step=%s errno=%s 是硬错误，立即 ABORT\n",
+			       g_tx.id, tx_step, strerror(e));
+			goto abort;
+		}
+		if (nohard && g_tx.level >= LVL_L3) {
+			/* CMA 碎片：降回 L2，别再往上加复位（§2.5 的教训） */
+			printf("TX#%u: %s（CMA 类），本次不再硬复位\n",
+			       g_tx.id, strerror(e));
+			g_tx.level = LVL_L2;
+			g_tx.hard = 0;
+		}
+		if (now_s() >= g_tx.deadline) {
+			printf("TX#%u: 预算耗尽（try %d，最后 errno=%s）\n",
+			       g_tx.id, g_tx.tries, strerror(e));
+			goto abort;
+		}
+		printf("TX#%u: try %d 失败（step=%s errno=%s），200ms 后重试（剩 %.0fms）\n",
+		       g_tx.id, g_tx.tries, tx_step, strerror(e),
+		       (g_tx.deadline - now_s()) * 1000.0);
+		tx_sleep(0.2);
+	}
+
+	tx_commit(flush ? "reinit" : "start");
+	return 0;
+
+abort:
+	g_tx.phase = TX_ABORT;
+	printf("TX#%u ABORT step=%s errno=%s(%d) tries=%d %.0fms\n",
+	       g_tx.id, tx_step, strerror(e), e, g_tx.tries,
+	       (now_s() - g_tx.t0) * 1000.0);
+	/* 补偿式：不追踪走到第几步，无条件再关一次（fd<0 是空操作） */
+	vdec_close(0);
+	tx_assert_clean();	/* §3.2.4 的不变式要能自己喊，不能靠人眼 */
+	/* 门控**不**回 PLAY，也不 rap_enter：ABORT 不动门控（§3.2.5） */
+	g_err_rec++;
+	if (g_err_rec > env_i("ERRREC", 4)) {
+		printf("TX#%u: 连续 %d 次自愈失败 → L4 GIVEUP（交上层整链重启）\n",
+		       g_tx.id, g_err_rec);
+		fflush(stdout);
+		g_tx.phase = TX_IDLE;
+		return -2;
+	}
+	g_tx.phase = TX_IDLE;
+	/* 会话已经是 VS_DOWN，但请求位在 BEGIN 时就清掉了：不重新挂一次请求，
+	 * 主循环会带着 fd<0 继续跑（poll(-1) 立刻 EINVAL）。重挂的档位回到 L2
+	 * ——硬复位刚失败过，再拿它开一轮只是白等一次 3s。
+	 */
+	tx_request(LVL_L2, why_again);
+	return -1;
 }
 
 int main(int argc, char **argv)
@@ -1500,12 +2570,10 @@ int main(int argc, char **argv)
 	setvbuf(stderr, NULL, _IONBF, 0);
 	const char *path = argc > 1 ? argv[1] : "/tmp/test.265";
 	struct stat st;
-	struct v4l2_control ctl;
-	struct v4l2_event_subscription sub = {0};
 	int sf, au_idx = 0, poll_timeouts = 0, drained = 0, stream_done = 0;
+	int i;
 	int idle_ticks = 0;	/* 连续没进展的轮次（喂不进也收不到帧） */
-	double play_pace = 0;
-	int lead = 0;
+	double t_play0 = 0;
 	int verbose = g_verbose;
 	double t0, t1, tq = 0, wall;
 	int expect = getenv("FRAMES") ? atoi(getenv("FRAMES")) : 0;
@@ -1525,9 +2593,8 @@ int main(int argc, char **argv)
 		sigaction(SIGUSR1, &sa, NULL);
 	}
 
-	fd = open(DEV, O_RDWR | O_NONBLOCK);
-	if (fd < 0) die("open " DEV);
-
+	/* 会话在 SPS 解析之后才开（vdec_open 需要真实分辨率去 S_FMT），
+	 * 这里只管把码流接上。 */
 	if (!strcmp(path, "-")) {
 		sf = STDIN_FILENO;	/* 管道直供：ffmpeg -f hevc - | player - */
 	} else {
@@ -1542,9 +2609,6 @@ int main(int argc, char **argv)
 	/* 只预读一小段：足够 SPS 即可，不整片读入 */
 	s_fill(getenv("PREFILL") ? atol(getenv("PREFILL")) : (1u << 20));
 	if (!s_len) die("stream 空");
-
-	/* OUTPUT: one AU per buffer */
-	out_fmt_setup();
 
 	{
 		unsigned sw = 0, sh = 0;
@@ -1581,36 +2645,61 @@ int main(int argc, char **argv)
 			printf("SPS: 未找到，按 %ux%u 打开\n", g_w, g_h);
 		}
 	}
-	s_fmt_cap(g_w, g_h);
-	capw = g_w;
-	caph = g_h;
-	ctl.id = V4L2_CID_MIN_BUFFERS_FOR_CAPTURE;
-	if (!xioctl(fd, VIDIOC_G_CTRL, &ctl))
-		printf("min_buffers_for_capture(DPB)=%d\n", ctl.value);
+	/* 会话建立走同一个事务（flush=0：s_buf 里预读的 SPS 一滴都不能丢）。
+	 * 上一次进程异常退出时驱动可能还在异步收尾，所以靠事务里的
+	 * EBUSY→退避重试撑过落定期，而不是外面再写一遍 3 次循环。
+	 */
+	for (i = 0; i < NBUF_CAP_MAX; i++) {
+		int p2;
 
-	cap_setup();
-	out_setup();
-
-#ifdef USE_GLOUT
-	if (getenv("PLAY")) {
-		if (play_setup(capw, caph) < 0)
-			die("play_setup");
-		/* 默认 24fps 配速；FPS=0 表示不限速（跑满解码器测吞吐） */
-		play_pace = getenv("FPS") ? atof(getenv("FPS")) : 24.0;
-		lead = getenv("LEAD") ? atoi(getenv("LEAD")) : 6;
-		if (getenv("NOPACE")) { play_pace = 0; lead = 0; }
+		for (p2 = 0; p2 < 2; p2++)
+			capbuf[i].dmabuf[p2] = -1;	/* ABORT 断言要求"未用 = -1" */
 	}
-#endif
+	g_req_lvl = LVL_L2;
+	g_req_why = VEV_NEWSTREAM;
+	{
+		int r = tx_run(0);
 
-	sub.type = V4L2_EVENT_SOURCE_CHANGE;
-	if (xioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0)
-		die("SUBSCRIBE_EVENT");
+		/* 启动时没有旧会话可回滚：失败就是失败，别在事务外再自旋 */
+		if (r) {
+			printf("FATAL: %ux%u 打不开解码器会话（%s），退出\n",
+			       g_w, g_h, r == -2 ? "L4" : "ABORT");
+			return 1;
+		}
+	}
 
-	start_stream();
+	if (getenv("PLAY")) {
+		/* 配速归播放器，Renderer 只按 pts 找上屏槽 */
+		g_play_fps = getenv("FPS") ? atof(getenv("FPS")) : 24.0;
+		g_play_lead = getenv("LEAD") ? atof(getenv("LEAD")) : 6;
+		if (getenv("NOPACE")) {
+			g_play_fps = 0;
+			g_play_lead = 0;
+		}
+		rend = render_open(getenv("RENDER") ? getenv("RENDER") : "auto",
+				   capw, caph, on_frame_done, NULL);
+		if (!rend)
+			die("render_open");
+		t_play0 = now_s();
+	}
+	if (getenv("PLAY") && !render_has_hdr(rend))
+		/* 这条后端不吃 PQ/BT.2020：HDR 源先在这边 CPU 转 SDR */
+		g_need_tm = 1;
+	if (getenv("PLAY")) {
+		/* 上屏路径定下来了，报给上层：drm 直显 / gles，tonemap 在谁手上 */
+		printf("RENDER: mode=%s tonemap=%s src=%ux%u\n",
+		       !strcmp(render_name(rend), "drm") ? "direct" : "gles",
+		       g_need_tm ? "cpu" : (render_has_hdr(rend) ? "shader" : "none"),
+		       capw, caph);
+		render_dump_state(NULL);
+	}
+
+	/* 事件订阅和 STREAMON 已经在 vdec_open 里做完了，这里只剩输出文件 */
 	out = getenv("NOWRITE") ? NULL : fopen(getenv("OUTYUV") ? getenv("OUTYUV")
 					       : "/tmp/out.yuv", "wb");
 	t0 = now_s();
 	g_verbose = getenv("VERBOSE") != NULL;
+	rap_enter(RAP_WAIT, "start");	/* 起播也走同一个闸门 */
 
 	for (;;) {
 		struct pollfd pf = { .fd = fd, .events = POLLIN };
@@ -1626,8 +2715,15 @@ int main(int argc, char **argv)
 		{
 			double tl = now_s();
 
-			if (t_loop > 0 && tl - t_loop > 4.0)
+			if (t_loop > 0 && tl - t_loop > 4.0) {
 				t_last_rx = tl - 2.0;
+				/* 门控态的计时也要一起挪，否则 resume 后
+				 * 第一批 poll 超时就会撞 RAPSTRICT/IRAPWAIT
+				 * 去重建会话（和 STALL 误判同源）。
+				 */
+				if (g_rap_st != RAP_PLAY)
+					g_rap_t0 = tl - 2.0;
+			}
 			t_loop = tl;
 		}
 
@@ -1646,122 +2742,43 @@ int main(int argc, char **argv)
 			}
 		}
 
-		/* 收到 SIGUSR1：换新码流。meson-vdec 不接受在旧会话上接新流
-		 * （整份新 SPS/DPB 撞进老状态，驱动直接 Aborting decoding session），
-		 * 所以关掉 /dev/video0 重开一遍；DRM master、crtc/plane 和
-		 * GL 上下文都在别的 fd 上，屏幕不会黑。
+		/* 重建请求（seek / POLLERR / STALL / RAP 缺失 / FORCEREINIT）。
+		 * 请求位是 g_reinit + g_req_lvl，真正动手的是 tx_run：开会话、
+		 * 清码流、跳帧、归位计数器全在事务里，失败要么回到干净空态，
+		 * 要么整体放弃（返回 3 让上层整链重启）。
 		 */
 		if (g_reinit) {
-			unsigned i;
-			int p;
+			int rr;
 
-			g_reinit = 0;
-			printf("REINIT: 重建 V4L2 会话（DRM/GL 保留）\n");
-			/* 管道里上一段流的残留全部丢掉，新流从 SPS 开始 */
-			if (s_fd >= 0) {
-				int fl = fcntl(s_fd, F_GETFL);
-
-				if (fl >= 0) {
-					fcntl(s_fd, F_SETFL, fl | O_NONBLOCK);
-					for (;;) {
-						unsigned char tmp[65536];
-
-						if (read(s_fd, tmp, sizeof tmp) <= 0)
-							break;
-					}
-					fcntl(s_fd, F_SETFL, fl & ~O_NONBLOCK);
-				}
+			printf("REINIT: 开始重建事务（DRM/GL 保留）\n");
+			rr = tx_run(1);
+			if (rr == -2) {
+				printf("REINIT: 事务放弃（L4），退出让上层重启\n");
+				fflush(stdout);
+				return 3;
 			}
-			s_len = 0;
-			s_pos = 0;
-			s_au_start = 0;
-			s_au_open = 0;
-			s_cur_vcl = 0;
-			s_eof = 0;
-			s_release = 0;
-			s_au_irap = 0;
-
-			stop_stream();
-			/* 旧 dmabuf 上的 fb / GL 纹理必须一起作废 */
-			for (i = 0; i < cap_count; i++)
-				for (p = 0; p < 2; p++)
-					if (capbuf[i].dmabuf[p] >= 0) {
-						close(capbuf[i].dmabuf[p]);
-						capbuf[i].dmabuf[p] = -1;
-					}
-			/* 屏上那一张留着（删了当场黑屏），其余回收；上一轮
-			 * 留下的那张此刻已不在屏上，一并删掉 —— 每次 seek
-			 * 最多只多挂一张 fb。
+			if (rr < 0) {
+				/* ABORT 已回到干净空态（fd<0），但码流位置已经
+				 * 前移到新流开头；下一轮重新发起事务。
+				 */
+				continue;
+			}
+			/* 本地状态清零：别把上一段流的收尾当成本流的结尾。
+			 * 门控状态/计数器在 tx_commit() 里已经归位（rap_enter），
+			 * 这里只管 main 自己的局部量。
 			 */
-			{
-				uint32_t onscreen = pc.cur_fb;
-
-				for (i = 0; i < NBUF_CAP_MAX; i++) {
-					if (!pc.fb[i])
-						continue;
-					if (pc.fb[i] != onscreen) {
-						uint32_t id = pc.fb[i];
-
-						ioctl(pc.dfd, DRM_IOCTL_MODE_RMFB, &id);
-					}
-					pc.fb[i] = 0;
-				}
-				if (pc.prev_fb && pc.prev_fb != onscreen) {
-					uint32_t id = pc.prev_fb;
-
-					ioctl(pc.dfd, DRM_IOCTL_MODE_RMFB, &id);
-				}
-				pc.prev_fb = onscreen;
-				pc.cur_fb = 0;
-			}
-#ifdef USE_GLOUT
-			if (getenv("PLAY"))
-				glout_reset();
-#endif
-			cap_release();
-			close(fd);
-			/* 软复位救不回的固件 hang，这里做整块掉电复位；
-			 * 必须排在 close 之后（驱动要求 cur_sess 为空）。 */
-			if (g_hard_reset_on_reinit) {
-				vdec_block_reset();
-				g_hard_reset_on_reinit = 0;
-			}
-			/* 驱动是异步收尾的：close 后它才在 workqueue 里打完
-			 * "Aborting decoding session!"。紧接着 open 会把新会话
-			 * 开在还没收干净的旧状态上，于是 seek 偶发连试两次都
-			 * 吐不出帧。留一个短落定期，代价 80ms，比闪一次屏便宜。
-			 */
-			usleep(80000);
-			fd = open(DEV, O_RDWR | O_NONBLOCK);
-			if (fd < 0) die("reopen " DEV);
-			out_fmt_setup();
-			s_fmt_cap(g_w, g_h);
-			cap_setup();
-			out_setup();
-			sub.type = V4L2_EVENT_SOURCE_CHANGE;
-			if (xioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0)
-				die("SUBSCRIBE_EVENT");
-			start_stream();
-
-			/* 本地状态清零：别把上一段流的收尾当成本流的结尾 */
-			pc.vbl_ok = 0;
-			pc.n = 0;
-			pc.drops = 0;
 			drained = 0;
 			stream_done = 0;
 			poll_timeouts = 0;
 			idle_ticks = 0;
 			eos_seen = 0;
 			g_refeed = 0;
-			s_eof = 0;
 			tq = 0;
 			au_idx = 0;
 			t_last_rx = now_s();
 			g_mark_first = 1;
-			g_need_irap = 1;	/* 新会话：必须等 IRAP 再喂 */
-			t_irap_wait = now_s();
-			pf.fd = fd;
-			printf("REINIT: ready (waiting IRAP)\n");
+			printf("REINIT: ready (waiting RAP, mode=%s)\n",
+			       rap_strict() ? "strict" : "cra");
 			continue;
 		}
 
@@ -1813,24 +2830,70 @@ int main(int argc, char **argv)
 			 * 决定，领先超过 LEAD 帧就别再喂，否则 20 个
 			 * capture buffer 一满就只能在显示前丢帧。
 			 */
-			if (play_pace > 0 && lead > 0 && au_idx - got >= lead)
+			if (g_play_fps > 0 && g_play_lead > 0 &&
+			    au_idx - got >= g_play_lead)
 				break;
 			r = stream_next_au(&ap, &al);
 			if (r < 0)
 				break;		/* seek 打断：回主循环处理重建 */
-			if (r == 0) { stream_done = 1; break; }
-			if (g_need_irap && r != 2) {
-				/* 等下一个关键帧，中间的 P/B 直接丢 */
-				idle_ticks = 0;
-				continue;
+			if (r == 0) {
+				if (g_rap_st != RAP_PLAY)
+					printf("RAP: 流结束仍没有可用 RAP（丢 %d AU，%s）\n",
+					       g_rap_drop, g_rap_cause);
+				stream_done = 1;
+				break;
 			}
-			if (r == 2) {
-				g_need_irap = 0;
+			/* 闸门（§1.14）：只有 rap_accept() 放行的 RAP 能开播；
+			 * 收 CRA 时还要连带丢掉它后面那串 RASL——那些帧参考的
+			 * 是 CRA 之前的图，新会话里根本不存在。
+			 */
+			if (g_rap_st != RAP_PLAY) {
+				if (r == 2 && rap_accept(s_au_last_rap)) {
+					int idr = s_au_last_rap <= 20;
+
+					rap_enter(idr ? RAP_PLAY : RAP_RASL,
+						  idr ? "IDR" : (g_rap_degraded
+								 ? "CRA/degraded" : "CRA"));
+					t_last_rx = now_s();
+				} else if (g_rap_st == RAP_RASL && !s_au_last_rasl) {
+					rap_enter(RAP_PLAY, "rasl-done");
+					t_last_rx = now_s();
+				} else {
+					if (g_rap_st == RAP_RASL)
+						g_rap_rasl_n++;
+					g_rap_drop++;
+					idle_ticks = 0;
+					continue;
+				}
+			} else if (r == 2) {
 				t_last_rx = now_s();
 			}
 			qbuf_au(ap, al, r == 2);
 			au_idx++;
 			idle_ticks = 0;
+		}
+
+		/* 门控态的超时/降级：每轮都算，不依赖 poll 是否超时
+		 * （丢 AU 时事件照样来，走不到 pr==0 的分支）。
+		 */
+		{
+			int rr = rap_tick();
+
+			if (rr == 1) {
+				fflush(stdout);
+				if (++g_err_rec <= env_i("ERRREC", 4))
+					tx_request(LVL_L2, VEV_RAP);	/* 软重建：RAP 缺失不是固件问题 */
+				else {
+					printf("RAP: 连续 %d 次没等到可用 RAP，退出\n",
+					       g_err_rec);
+					break;
+				}
+				continue;
+			}
+			if (rr == 2) {
+				fflush(stdout);
+				break;
+			}
 		}
 
 		pr = poll(&pf, 1, drained ? 50 : (out_nfree ? 2000 : 100));
@@ -1865,20 +2928,12 @@ int main(int argc, char **argv)
 			 * 127 分钟后 poll(/dev/video0) 空转，vdec irq 计数不动）。
 			 * 距上一帧超过 STALLSEC 秒就判死并重建会话自愈。
 			 */
-			if (!drained) {
-				double limit, base;
-
-				/* 等 IRAP 期间本来就没有帧，不能按"无新帧"判死，
-				 * 否则 GOP 比 STALLSEC 长就死循环重建；给个独立的
-				 * 更长预算（默认 60s），超了才算真没关键帧。
-				 */
-				if (g_need_irap) {
-					limit = getenv("IRAPWAIT") ? atof(getenv("IRAPWAIT")) : 60.0;
-					base = t_irap_wait;
-				} else {
-					limit = getenv("STALLSEC") ? atof(getenv("STALLSEC")) : 12.0;
-					base = t_last_rx;
-				}
+			/* 门控态（等 RAP / 跳 RASL）本来就不该出帧，超时归
+			 * rap_tick() 管；这里只看正常播放，否则等一个长 GOP
+			 * 就会被 STALLSEC 判死，反复重建。
+			 */
+			if (!drained && g_rap_st == RAP_PLAY) {
+				double limit = env_d("STALLSEC", 12.0), base = t_last_rx;
 				{
 				double quiet2 = now_s() - base;
 
@@ -1887,8 +2942,7 @@ int main(int argc, char **argv)
 					       quiet2, au_idx, out_nfree, n_out, got);
 					fflush(stdout);
 					if (++g_err_rec <= (getenv("ERRREC") ? atoi(getenv("ERRREC")) : 4)) {
-						g_reinit = 1;
-						g_hard_reset_on_reinit = 1;
+						tx_request(LVL_L3, VEV_STALL);
 					} else {
 						printf("STALL: 连续 %d 次自愈失败，退出\n", g_err_rec);
 						break;
@@ -1908,8 +2962,7 @@ int main(int argc, char **argv)
 			 * 重建后仍拿不到帧才真正放弃。
 			 */
 			if (++g_err_rec <= (getenv("ERRREC") ? atoi(getenv("ERRREC")) : 4)) {
-				g_reinit = 1;
-				g_hard_reset_on_reinit = 1;
+				tx_request(LVL_L3, VEV_ABORT);
 				stream_done = 0;
 				drained = 0;
 				continue;
@@ -1929,6 +2982,7 @@ int main(int argc, char **argv)
 		for (;;) {
 			struct v4l2_buffer b = {0};
 			struct v4l2_plane pl[2] = {{0}};
+			int rendered = 0;
 
 			b.type = CAP_T;
 			b.memory = V4L2_MEMORY_MMAP;
@@ -1957,47 +3011,56 @@ int main(int argc, char **argv)
 					pl[0].data_offset, pl[1].data_offset);
 			if ((g_verbose || got == 0) && capbuf[b.index].mem[0])
 				dump_frame(b.index, pl);
+			/* §4.3.8 每次内容信号变化打一条完整 COLOR: 行。
+			 * 放在 g_need_tm 之外：SDR 片（on=0/透传）也得有这条，
+			 * 否则"709 片不被误压"和"无元数据回退"两栏没法验。 */
+			color_report();
 			if (out && pl[0].bytesused && capbuf[b.index].mem[0]) {
 				double tw = now_s();
 
 				write_nv12(b.index, capw, caph);
 				t_write_acc += now_s() - tw;
 			}
-			if (getenv("PLAY")) {
-				double tt = now_s();
+			if (rend) {
+				int rc;
 
-#ifdef USE_GLOUT
-				if (getenv("GLPLAY")) {
-					/* meson vdec 的 NV12M 是紧排：Y pitch=w，交织 CbCr pitch=w
-					 * （DRM fb 路径同样用 pitches={w,w}，已验证不歪）
-					 */
-					unsigned ys = capw, cs = capw;
+				if (g_need_tm) {
+					double tt = now_s();
 
-					if (!g_gl_ready) {
-						glout_set_drm_fd(pc.dfd);	/* 共用 master fd */
-						if (glout_init(capw, caph) < 0) die("glout_init");
-						g_gl_ready = 1;
-					}
-					if (glout_frame(capbuf[b.index].dmabuf[0],
-							capbuf[b.index].dmabuf[1],
-							capw, caph, ys, cs) < 0)
-						die("glout_frame");
-				} else
-#endif
-#if defined(USE_GLOUT) || (defined(USE_DRM) && defined(USE_TM))
-				{
 					tm_apply(b.index, capw, caph);
-					play_frame(b.index, capbuf[b.index].dmabuf[0],
-						   capbuf[b.index].dmabuf[1], capw, caph);
+					t_tm_acc += now_s() - tt;
 				}
-#endif
-				t_tm_acc += now_s() - tt;
+				/* 时间轴在播放器手里：首帧锚点 + 帧号/配速。
+				 * pts 只用来让 Renderer 找上屏槽（它不改解码状态）。
+				 */
+				/* 先标在飞再提交：后端可能就地回调（丢帧/同步后端），
+				 * 回调里 cap_recycle 会把它清掉，撤不回来就永远别再 QBUF。
+				 */
+				cap_busy[b.index] = 1;
+				rc = render_submit(rend, capbuf[b.index].dmabuf,
+						   capw, caph, capw, capw,
+						   g_play_fps > 0 ? t_play0 + got / g_play_fps : 0,
+						   &capbuf[b.index]);
+				if (rc >= 0) {
+					rendered = 1;	/* 交接成功：回收权归 Renderer */
+				} else {
+					cap_busy[b.index] = 0;
+					printf("RENDER: submit 失败 (%d)\n", rc);
+				}
 			}
 #ifdef USE_DRM
 			if (getenv("EXPBUF") && getenv("DRMFB") && got == 1)
 				drm_import_test(capbuf[b.index].dmabuf[0],
 						capbuf[b.index].dmabuf[1], capw, caph);
 #endif
+			/* 后端没有节拍器（同步后端不会自己等）：配速归播放器 */
+			if (rend && g_play_fps > 0 && !render_has_pace(rend)) {
+				double due = t_play0 + got / g_play_fps;
+				double nn = now_s();
+
+				if (due > nn)
+					usleep((useconds_t)((due - nn) * 1e6));
+			}
 			got++;
 			/* 自愈路径的确定性验证开关：FORCEREINIT=300 在第 300 帧
 			 * 主动走一遍"固件 hang → 整块复位 → 等 IRAP"流程，
@@ -2010,15 +3073,20 @@ int main(int argc, char **argv)
 				printf("FORCEREINIT: 第 %d 帧主动重建\n", got);
 				fflush(stdout);
 				g_force_reinit_at = -1;
-				g_reinit = 1;
-				g_hard_reset_on_reinit = 1;
+				tx_request(LVL_L3, VEV_SELFTEST);
 				break;
 			}
-			if (xioctl(fd, VIDIOC_QBUF, &b) < 0) {
+			if (rendered) {
+				/* 等 Renderer 的完成回调来回收（cap_busy 已置位） */
+			} else if (xioctl(fd, VIDIOC_QBUF, &b) < 0) {
 				perror("QBUF recycle");
 				break;
 			}
 		}
+
+		/* 推队列：按 pts 找槽、到点才翻。超时给 5ms，等 vblank 不空转 */
+		if (rend)
+			render_pump(rend, 5);
 
 		/* recycle output buffers */
 		for (;;) {
@@ -2041,16 +3109,29 @@ int main(int argc, char **argv)
 	if (out) fclose(out);
 	printf("RESULT decoded=%d / %d AUs, resets=%d, %ux%u\n", got, g_stream_au,
 	       resets, g_w, g_h);
-#ifdef USE_GLOUT
-	if (getenv("PLAY")) {
-		double el = now_s() - pc.t_start;
+	if (rend) {
+		/* 收尾：把在飞的帧等回来（否则 QBUF 没还、下一段流开场少 buffer），
+		 * 再以 Renderer 自己的账报一次统计 —— 两个后端同一张表。
+		 */
+		struct render_stats rs;
+		double el;
 
-		printf("PLAY: screen=%ux%u src=%ux%u flips=%d drops=%d vblank_fail=%d "
-		       "elapsed=%.2fs -> %.1f fps (pace %.1ffps)\n",
-		       pc.dw, pc.dh, capw, caph, pc.flips, pc.drops, pc.timeouts, el,
-		       el > 0 ? pc.flips / el : 0.0, play_pace);
+		render_wait_shown(rend, 500);
+		render_stats(rend, &rs);
+		render_dump_state(&rs);	/* 结束时补上屏幕模式，上层才看得到全貌 */
+		el = rs.t_last - rs.t_first;
+		printf("PLAY: renderer=%s screen=%ux%u@%u src=%ux%u fps=%.2f\n",
+		       rs.name, rs.dw, rs.dh, rs.refresh, rs.sw, rs.sh, g_play_fps);
+		printf("PLAY: submit=%d shown=%d drop=%d abort=%d pending=%d "
+		       "miss=%d late=%d(%.1fms) elapsed=%.2fs -> %.1f fps\n",
+		       rs.submitted, rs.shown, rs.dropped, rs.aborted, rs.pending,
+		       rs.misses, rs.late, rs.late_ms_max, el,
+		       el > 0 ? rs.shown / el : 0.0);
+		if (rs.draw_ms_sum > 0)
+			printf("PLAY: draw avg=%.2fms max=%.2fms swap=%.2fs\n",
+			       rs.draw_ms_sum / (rs.shown ? rs.shown : 1),
+			       rs.draw_ms_max, rs.swap_ms_sum);
 	}
-#endif
 	{
 		/* 纯解码吞吐：只看首帧到末帧，排除启动、收尾(tail)和写盘 */
 		double active = t_last_rx - t_first_rx;
@@ -2075,8 +3156,9 @@ int main(int argc, char **argv)
 		       wall > 0 ? got / wall : 0.0,
 		       wall > 0 ? g_stream_bytes / wall / 1e6 : 0.0);
 	}
-	stop_stream();
-	close(fd);
+	/* 退出也走同一条关闭路径（幂等）：停流、作废在飞的帧、关 dmabuf、
+	 * 拆队列、close(fd)。硬复位不做——正常退出不该动硬件。 */
+	vdec_close(0);
 	/* 退出把控制台还回去：DRM master 释放后 fbcon 有时仍停在
 	 * FB_BLANK_POWERDOWN（屏黑但 CRTC 是开的），这里主动解黑。
 	 */

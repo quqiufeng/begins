@@ -42,7 +42,7 @@ do_sample() {
 		b=$(awk '/^Total/{print $2}' /sys/kernel/debug/dma_buf/bufinfo 2>/dev/null)
 		# 注意: pgrep -c 无匹配时仍打印 0 但退出码为 1，不能写 "|| echo 0"
 		# （会把输出拼成两行，坏掉整个采样文件的列对齐）
-		p=$(pgrep -c -f 'v4l2hevc-gl-aarch64|ffmpeg -hide_banner' 2>/dev/null) || p=0
+		p=$(pgrep -c -f 'v4l2hevc-aarch64|ffmpeg -hide_banner' 2>/dev/null) || p=0
 		echo "$ts ${f:-0} ${t:-0} $a $r $((a - r)) ${b:-0} ${p:-0}" >> "$SAMP"
 		sleep 1
 	done

@@ -33,7 +33,7 @@ snap() {
 			esac
 		done
 	} > $d/kstacks.txt 2>&1
-	P=$(pgrep -f "v4l2hevc-gl-aarch64" | head -1)
+	P=$(pgrep -f "v4l2hevc-aarch64" | head -1)
 	if [ -n "$P" ]; then
 		{
 			echo "pid=$P"; cat /proc/$P/wchan 2>/dev/null; echo

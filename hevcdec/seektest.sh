@@ -10,4 +10,4 @@ grep -E '^(OFF|START|PAUSE_AT)=' /tmp/tvplay.state
 echo "== 日志 =="
 tail -6 /tmp/tvplay.log
 echo "== 进程 =="
-pgrep -fa 'v4l2hevc-gl-aarch64|ffmpeg .*-f hevc|mpv --no-config' | grep -v pgrep | cut -c1-90
+pgrep -fa 'v4l2hevc-aarch64|ffmpeg .*-f hevc|mpv --no-config' | grep -v pgrep | cut -c1-90

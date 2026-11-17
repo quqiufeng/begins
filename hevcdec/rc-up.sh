@@ -25,7 +25,7 @@ setsid nohup /tmp/rcinputd-aarch64 >>/tmp/tvplay-rc.log 2>&1 </dev/null &
 sleep 0.5
 
 echo "--- 进程 ---"
-pgrep -fa 'v4l2hevc-gl-aarch64|ffmpeg .*-f hevc|mpv|rcinputd' | grep -v pgrep
+pgrep -fa 'v4l2hevc-aarch64|ffmpeg .*-f hevc|mpv|rcinputd' | grep -v pgrep
 echo "--- state ---"
 cat /tmp/tvplay.state 2>/dev/null
 echo "--- rc log ---"

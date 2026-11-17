@@ -3,7 +3,7 @@
 # 只补文件 + 拉起 rcinputd，不动正在播的东西。
 set -u
 SRC=/root/rcup
-for f in rcinputd-aarch64 tvplay-node.sh v4l2hevc-gl-aarch64; do
+for f in rcinputd-aarch64 tvplay-node.sh v4l2hevc-aarch64; do
 	[ -f "$SRC/$f" ] || continue
 	if ! cmp -s "$SRC/$f" "/tmp/$f" 2>/dev/null; then
 		cp -f "$SRC/$f" "/tmp/$f"

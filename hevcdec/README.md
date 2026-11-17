@@ -51,6 +51,27 @@ ssh root@<box> /tmp/v4l2hevc-aarch64 /tmp/test720.265
 - **capture plane0 按 64 行对齐**（720 → 768），必须按 stride 逐行取；整块
   `fwrite(len[0])` 会把 padding 写进文件，色度整体错位（表现为亮度对、颜色全错）。
 
+### 解码器会话生命周期（vdec_open / vdec_close / vdec_resize）
+
+一个会话 = `/dev/video0` 的 fd + 它的 OUTPUT/CAPTURE 队列、mmap、导出的
+dmabuf、事件订阅、流开关。**只有这三个函数动这些资源**，其它地方（主循环、
+SOURCE_CHANGE 回调、退出路径）一律不许自己拼 `stop_stream + close(fd) + REQBUFS`。
+
+- 不变式：`fd >= 0` ⟺ 会话活着。任何失败都必须回到 `fd = -1`；半初始化的
+  会话（队列在、流没开、dmabuf 半套）是"自激重建"的源头，一律不允许留下。
+- 每个步骤（`S_FMT` / `REQBUFS` / `QUERYBUF` / `QBUF` / `STREAMON`）返回
+  `0 / -errno`，不 `die()`；由调用方决定重试还是放弃。启动 3 轮、seek 重建
+  8 轮，全失败才退出让上层重启。
+- 关闭顺序固定：`STREAMOFF` → 作废 Renderer 手里的旧帧（`g_drop_owners`
+  + `render_flush`）→ 关导出的 dmabuf fd → `REQBUFS(0)` → `close(fd)`。
+  顺序反了就是把还在被纹理用的 dmabuf 关在脚下。
+- 导出的 dmabuf fd 队列释放不会回收，每条 realloc/close 路径必须自己关，
+  否则每次 seek 漏 `2 × cap_count` 个 fd。
+- 硬复位（`/sys/module/meson_vdec/parameters/hard_reset`）只在会话 close
+  之后写，重试 150×20ms=3s 等驱动 workqueue 收尾；**失败是硬错误**（旧版
+  只打一行就照旧开流，后面每帧都失败，自愈循环刷屏）。
+- 会话代数 `g_sess` 单调递增，日志里能一眼看出重建了几次。
+
 ## 踩过的坑
 
 1. **SPS `conformance_window` 顺序**：`crop_left/right/top/bottom` 必须紧跟

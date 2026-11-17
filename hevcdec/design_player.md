@@ -1,10 +1,11 @@
-# design_player.md — X96Max HEVC 硬解播放器：两条上屏方案 + 遥控器控制
+# design_player.md — X96Max HEVC 硬解播放器：一个播放器，两种 Renderer
 
 记录 `hevcdec/` 这套播放链的实现细节。范围：
 
 - 前半段（两条方案共用）：`ffmpeg -re` 供流 → AU 切分 → meson-vdec V4L2 M2M 硬解
-- **方案 A**：DRM overlay plane 零拷贝直上屏（NV12 fb + vblank 节拍器）
-- **方案 B**：EGL/GBM + panfrost GLES3 着色器做 HDR10→SDR 后上屏
+- **Renderer A（`drm`）**：NV12 dma-buf 直挂 KMS overlay plane，零拷贝 + vblank 节拍器（`vout.c`）
+- **Renderer B（`gl`）**：EGL/GBM + panfrost GLES3，dmabuf 当纹理，shader 里做 HDR10→SDR（`glout.c`）
+- 两者同一接口 `render.h`，运行期 `RENDER=drm|gl` 切换；**不存在两套播放器**
 - **遥控器控制**：`rcinputd` → `tvplay-node.sh key` → 暂停/拖动/音量/退出
 
 硬件：Amlogic S905X2（X96Max）/ meson-vdec `/dev/video0` / panfrost G31 /
@@ -18,11 +19,12 @@ DPU 主平面只收 RGB / HDMI 2560x1440@60（`video=HDMI-A-1:2560x1440@60`）�
 ffmpeg -re -ss START -i URL -c:v copy -f hevc -     ← 解封装 + 按片源节拍供流
       │ pipe (Annex-B)
       ▼
-v4l2hevc-gl-aarch64 -                               ← 本仓库
+v4l2hevc-aarch64 -                                  ← 本仓库（一个二进制，两个后端）
       ├─ AU 切分 → /dev/video0 (V4L2 M2M OUTPUT)
-      ├─ 方案 A：capture dmabuf → DRM PLANE 直显（PLAY=1，不带 GLPLAY）
-      └─ 方案 B：capture dmabuf → GLES3 着色器 → GBM surface → eglSwapBuffers
-                                                      （PLAY=1 GLPLAY=1）
+      ├─ 解 / 时间轴 / 配速 / 缓冲生命周期     （播放器，唯一一份）
+      └─ Renderer（render.h，二选一，PLAY=1）
+           ├─ drm  capture dmabuf → KMS PLANE 直显         （RENDER=drm，auto 优先）
+           └─ gl   capture dmabuf → GLES3 → eglSwapBuffers （RENDER=gl）
 
 mpv --no-video --ao=alsa ... --start=START           ← 只出声（独立进程）
 rcinputd                                            ← EVIOCGRAB 独占遥控器
@@ -31,20 +33,158 @@ rcinputd                                            ← EVIOCGRAB 独占遥控�
 音画同步靠"两边都用同一个 `-ss START`"粗对齐，视频侧由 `-re` 提供长期节拍；
 HEVC 链里没有 A/V clock 交互（见 §5.3 限制）。
 
+### 0.1 分界线：播放器管时间，Renderer 管"变成光"
+
+`render.h` 是唯一接口，播放器（`v4l2hevc.c`）里没有一行 DRM/EGL 代码：
+
+| 归播放器 | 归 Renderer |
+|---|---|
+| AU 切分、喂/收、seek、会话重建 | 拿 dmabuf、决定怎么画到屏上 |
+| 时间轴（锚点 + 帧号/配速）、背压 | 按 pts 找上屏槽、自己决定要不要排队 |
+| capture buffer 生命周期 | 只在完成回调里把 owner 还回来 |
+
+三道契约，两个后端都必须守：
+
+1. **一次 submit 恰好一次 done 回调**（SHOWN / DROPPED / ABORTED），
+   播放器在回调里才 QBUF → dma-buf 不会被解码器提前改写。
+2. **能力用 caps 声明，不用 `if (后端==X)`**：`gl` 声明 `RENDER_CAP_HDR`
+   （shader 里做色调映射），`drm` 不声明 → 播放器才在 CPU 上跑 `tm_apply`。
+3. **同步/异步由后端自己如实表达**：`gl` 是同步（submit 返回即已 swap，
+   回调就地触发，`pump/wait_shown` 空转）；`drm` 有队列和 vblank 节拍
+   （`RENDER_DEPTH`，默认 3）。播放器不假设是哪一种。
+
 ---
 
 ## 1. 共同部分：解封装、AU 切分、V4L2 M2M 解码
 
-### 1.1 供流
+### 1.1 Demux：职责劈在两处
+
+一句话：**容器归 ffmpeg，码流归 hevcdec，而两者的交界处（管道）把边界信息全丢了。**
+
+| 环节 | 谁做 | 产出 |
+|---|---|---|
+| 容器解析（MP4 / MKV / TS / HTTP） | ffmpeg | 裸 HEVC |
+| 选流、定位、节流 | ffmpeg `-map 0:v:0 -ss -re` | Annex-B 字节流 |
+| 起始码扫描、AU 切分 | hevcdec `stream_next_au()` | `(指针, 长度, 是否 IRAP)` |
+| 参数集解析、真实宽高 | hevcdec `sps_size()` | `g_w / g_h` |
+
+为什么把 demux 甩给 ffmpeg 而不是链 libavformat：
+
+- 交叉编译（aarch64 静态链 libavformat 加一票依赖）比写一条命令贵太多；
+- 只有一条视频流，`-c:v copy` 让 ffmpeg 退化成"转封装器"，CPU 接近 0，4K 也不掉帧；
+- 代价是**容器级的元数据（PTS/DTS、duration、章节、音轨）随管道一起蒸发** ——
+  见 §1.5，这是整个设计最大的一笔技术债，不是可以后补的细节。
+
+这笔交易逐条称过价了：**§1.11**（不链的实际成本、真 PTS 能白拿什么、什么条件下翻案）。
+
+### 1.2 供流命令与三个硬约束
+
+```
+ffmpeg -hide_banner -loglevel warning -re -ss "$START" \
+       -i "$URL" -map 0:v:0 -c:v copy -f hevc -     | hevcdec -
+```
+
+- `-f hevc` → 裸 Annex-B。**没有容器 = 没有帧边界、没有时间戳**，hevcdec 只能自己扫起始码。
+- `-c:v copy` → 不重编码，只转封装。ffmpeg 因此也不做任何时基修复或帧率重排，
+  它只是"按原始时序把字节吐出来"。
+- `-re` → 唯一节拍源。GL 路径没有 vblank 节拍器（§3.5），解码跑多快就播多快；
+  DRM 路径自己有 vblank 节拍，`-re` 只是为了不把管道和 20 个 capture buffer 灌满。
+- `-ss` 放在 `-i` **前面** → 快速定位，靠重新解封装到目标 GOP 头，而不是解码后丢帧。
+  所以 seek 精度天然是 GOP 量级（实测 1–2 s），而且要整链重开（§5.4）。
+- 直接后果：暂停只能 `SIGSTOP` 整条链（§5.3），位置由 shell 的 `PAUSE_AT` 冻结计时来记。
+
+| 约束 | 原因 | 违反的后果 |
+|---|---|---|
+| 必须 `-c:v copy` | 4K 重编码跑不动 | CPU 打满、掉帧 |
+| 必须 `-re`（GL 路径） | 没有节拍器 | 4K 快 15%，1080p 直接飞 |
+| 必须一个 AU 一个 OUTPUT buffer | 驱动按 `vififo offset` 匹配 `sess->timestamps` | 帧号错位、花屏 |
+
+### 1.3 流式 AU 切分
+
+不整片读入：`s_buf / s_len / s_pos / s_au_start` 是一个**滑动窗口**，
+只保留"当前 AU + 尚未扫完的尾巴"，因此能播任意长片源、能接 stdin。
+
+- `s_fill()` 按需扩缓冲区（起始 4 MiB，不够就翻倍），单次 `read()` 最多要 1 MiB；
+- 扫到 `00 00 01` 解析 NAL 头 `(b>>1)&0x3f`；4 字节起始码靠"前一个字节是 0"识别（`sc = s_pos-1`）；
+- 切分判据：`vcl && 已见 VCL` 或 `iru && 已见 VCL` 就断 AU；
+  `iru` = {32,33,34,35,39,41}（VPS/SPS/PPS/AUD/前缀 SEI）；
+- AU 的随机接入点**存类型而不是布尔量**：`s_au_rap` = 0 或 16..21，`s_au_rasl` 记本 AU 是否含
+  RASL(8/9)；交出后转存 `s_au_last_rap / s_au_last_rasl` 供调用侧判策略（返回前的清零不改）。
+  返回 `2` 仍是"含 16..21"，主循环据此过闸门（§1.14 的状态机），
+  新会话里非 RAP 帧直接丢弃直到第一个可接受 RAP。为什么要区分类型见 §1.10 的 CRA 记录；
+- 交出 AU 后置 `s_release`，下一次调用 `s_compact()` 把前缀 `memmove` 掉。
+  ⇒ 峰值内存 ≈ 最大 AU + 1 MiB，与片长无关（4K 关键帧几 MB，实测 RSS 稳定在十几 MB）。
+  坑：`s_cap` 只增不减，遇到一次超大 AU 之后缓冲区不会缩回。
+
+实测（`RAPDBG=1` + 只跑切分的独立 harness，4 个测试片源一致）：**片源是 open GOP**。
+300 个 AU 里有 10 个 RAP：只有 AU#1 是 IDR(20)，其余 9 个（#30 #60 … #270）**全是 CRA(21)**，
+每个 CRA 后面紧跟 1 个含 RASL 的 AU（#31 #61 …），全片 RASL 共 9 个。
+⇒ "等一个 IDR"在这个语料上等于永远等不到；任何"只认 16..20"的严格策略都会一路退化到超时，
+所以 CRA 必须算可起播（代价是每个 seek 多丢 1 个 RASL AU），strict 只能当诊断开关。
+
+阻塞点是 `read()`，这也是 seek 的实现方式：`SIGUSR1` 打断 `read` 返回 `-1`，主循环转去重建会话。
+所以注册 `SIGUSR1` 时必须关掉 `SA_RESTART` —— `signal()` 默认会带上，
+否则 `read()` 被系统自动续上，seek 就变成"赌信号落在 poll 还是 read 上"的随机行为。
+
+### 1.4 AU 判据与规范不一致（唯一没修的正确性 bug）
+
+规范的 AU 边界由 slice header 首比特 `first_slice_segment_in_pic_flag` 决定，
+**一帧可以有多个 slice，也就是多个 VCL NAL**。这里的实现是"见到第二个 VCL 就断"，
+等于硬编码了单 slice 假设。
+
+现有 4 个测试片源全是单 slice（脚本统计每个文件都是 `first=300 / nonfirst=0`），
+所以一直没暴露。一旦片源开多 slice（x265 `--slices`、广播级 4K 常见），
+一帧会被切成 N 个 AU → N 个 OUTPUT buffer → 驱动按 AU 记 `timestamps`，
+帧号、POC、DPB 全部错位，表现是花屏/马赛克/丢帧，而不是"时间稍不准"。
+
+修法很便宜：进 AU 判据前读 slice header 首字节最高位，`1` 才是新图（3 行）。
+顺带两处小毛病：`t <= 31` 把 10–15、22–31 这些保留类型也算成 VCL；
+`iru` 里含 39（前缀 SEI），若 SEI 出现在多 slice 帧中间也会误切。
+
+### 1.5 没有 PTS 的连锁反应
+
+管道里只有字节，`stream_next_au()` 只产出 `(指针, 长度, 是否关键帧)`，
+时间维度只剩下一个 AU 序号。于是：
+
+- **音画同步做不了**：视频靠 `-re` 跟随 wall clock，音频走 mpv 独立解码（`--no-video`），
+  两路没有共享时钟，长片会缓慢漂移 —— 这是 §4.4 里的硬伤，根因在 demux 这一层。
+- 不能按 PTS 丢帧/重复帧来补时基，递送节奏只能整体信任上游 ffmpeg。
+- DRM 路径按 vblank 计数（§2.4），VFR 片源会越走越偏；GL 路径按 `-re` 的 wall clock，反而对 VFR 更稳。
+- seek 没有 PTS 可用 ⇒ 只能重新解封装，精度归 GOP 所有（§5.4）。
+
+想补 PTS 有两条路，都不便宜：
+① 让 ffmpeg 输出 mp4/ts 到 fifo，hevcdec 自己当 demuxer —— 等于把 ffmpeg 的活重做一遍；
+② 另起 `ffprobe -show_packets` 旁路，按 packet 序号对齐 —— 多一个进程 + 对齐失败风险，**不建议**。
+
+### 1.6 "上游死了"和"片尾了"无法区分
+
+```
+ffmpeg 崩/被杀 → pipe 关闭 → read() 返回 0 → s_eof=1 → stream_done → drain → exit 0
+```
+
+EOS 就是这么来的：**正常播完和 ffmpeg 挂掉走的是同一条路**。
+壳（`tvplay-node.sh`）只把 `| hevcdec` 的退出码当整条链的结果，拿不到前半段。
+表现是播到一半画面冻在最后一帧、`pos()` 还在走、遥控器"有反应但不生效"。
+
+反例更糟：ffmpeg 卡住不吐字节（HTTP 断流、磁盘 IO hang）时，主循环阻塞在 `read()` 里，
+而 `STALLSEC` 看门狗挂在 `poll()` 超时分支（§1.10），**永远走不到**，
+只能靠用户按 seek 触发 `EINTR` 才醒。这条"网络卡死 = 永久冻结"目前没有自愈路径。
+
+修法（都还没做，按性价比排序）：
+- 壳侧 `set -o pipefail`，ffmpeg 非 0 就 `restart_at $(pos)`；
+- hevcdec 在 `s_eof && got < 期望帧数` 时返回非 0，让壳有据可依；
+- `s_fill()` 改 `O_NONBLOCK` + 12 s 超时，把看门狗从 `poll` 挪到 `read`。
+
+### 1.7 参数集探测（SPS）
 
 - 输入 `argv[1]` 可以是文件，也可以是 `-`（stdin 管道，`tvplay-node.sh` 用的就是这条）。
-- 只预读一小段（`PREFILL`，默认 1 MiB）用于求 SPS；管道里读不到 SPS 时再预读 4 MiB 重试。
+- 只预读一小段（`PREFILL`，默认 1 MiB）用于求 SPS；管道里还没读到 SPS 时再预读 4 MiB 重试一次。
 - `sps_size()` 自己解析 VPS/SPS/PPS 取真实宽高，失败才用 `argv[2]/argv[3]` 或默认 640x360。
-  坑：`conformance_window` 的 `crop_left/right/top/bottom` 必须紧跟 flag 读，
+  坑：`conformance_window` 的 `crop_left/right/top/bottom` 必须**紧跟 flag** 读，
   放到 `bit_depth`/`poc` 之后会读到错位比特（宽度被误裁 8 像素）。
-- `stream_next_au()` 按 Annex-B 起始码切 AU，返回 `2` 表示这个 AU 带 IRAP（关键帧）。
+- 探测走的是全局 `stream/stream_size`，预读窗口期间临时指向 `s_buf/s_len`，用完立刻置回 NULL。
 
-### 1.2 OUTPUT / CAPTURE 队列
+### 1.8 OUTPUT / CAPTURE 队列
 
 - 一个 AU 一个 OUTPUT buffer，`MAXAU` 默认 6 MiB，`sizeimage` 4 KiB 对齐；
   驱动用 `vififo offset` 匹配 `sess->timestamps` 里的帧，所以**不能合并多个 AU**。
@@ -57,7 +197,7 @@ HEVC 链里没有 A/V clock 交互（见 §5.3 限制）。
 - capture plane0 按 64 行对齐（720 → 768），任何按行 dump 的地方必须按 stride 走，
   整块 `fwrite(len[0])` 会把 padding 写进文件，色度整体错位。
 
-### 1.3 背压（只服务于"播放"，不服务"测吞吐"）
+### 1.9 背压（只服务于"播放"，不服务"测吞吐"）
 
 只有 `PLAY=1` 时启用：
 
@@ -71,7 +211,7 @@ HEVC 链里没有 A/V clock 交互（见 §5.3 限制）。
 ——解码器能跑 100 fps，但显示节拍由屏幕决定，领先太多只会把 20 个 capture
 buffer 填满、在显示前丢帧。
 
-### 1.4 自愈：`g_reinit` 重建 V4L2 会话
+### 1.10 自愈：`g_reinit` 重建 V4L2 会话
 
 meson-vdec 的硬约束：**同一个 V4L2 会话里不能换码流**，seek/分辨率跳变/驱动 abort
 都会 `"Unrecognized dec_status 0000000F / Aborting decoding session"`。
@@ -81,14 +221,20 @@ meson-vdec 的硬约束：**同一个 V4L2 会话里不能换码流**，seek/分
 重建流程要点：
 
 1. 把管道里上一段流的残留读空（临时切 `O_NONBLOCK` 读到 `EAGAIN`），`s_len/s_pos/s_au_*` 清零。
-2. `g_need_irap = 1`：必须等下一个 IRAP 才喂。续喂到 GOP 中间，驱动 ref list 是空的，
+2. 进 `RAP_WAIT`（§1.14）：必须等下一个可接受 RAP 才喂。续喂到 GOP 中间，驱动 ref list 是空的，
    每帧报 `"Couldn't find ref. frame 0"`，几帧内静默挂死（清零后实测 8 帧就死）。
+   坑：①切分层只报类型（16..21），**收不收 CRA 是策略**；而 CRA 是 open GOP 的头，
+   它后面的 RASL 帧参考 CRA 之前的帧 —— 新会话里没有那些帧，等于把上面的挂死重新走一遍。
+   实测片源的 RAP 分布见 §1.3（10 个 RAP 里 9 个是 CRA），所以这不是理论问题，是常态路径。
+   ② CRA 的 NAL 头里其实有 `HandleCraAsBlaFlag` 可用，但驱动不吃这个协商；能做的只有
+   "跳过 RASL AU"（§1.3 已能识别）或"退回找 16..20"。策略与代价见 §6。
 3. 只有固件真 hang 才走 `g_hard_reset_on_reinit`（VDEO 整块掉电复位）；seek 不付这个代价。
 4. 触发源：
    - `SIGUSR1` → seek（`sa_flags = 0`，**不能带 SA_RESTART**，否则信号被延到下一帧数据，
      seek 白等几秒；`xioctl()` 里 `g_reinit` 时直接返回 `EINTR` 让主循环处理）；
    - `POLLERR` → 驱动 abort，自愈上限 `ERRREC`（默认 4），出帧后 `g_err_rec` 归零；
-   - STALL 检测：`STALLSEC`（默认 12s）/ 等 IRAP 时 `IRAPWAIT`（默认 60s）无新帧；
+   - STALL 检测：`STALLSEC`（默认 12s）无新帧；门控态（等 RAP / 跳 RASL）的超时
+     归状态机自己管（§1.14 的超时表），不走这一路；
    - `FORCEREINIT=N` 在第 N 帧主动走一遍自愈，用于确定性验证。
 
 **暂停识别**：`tvplay` 的"暂停"是 `pkill -STOP` 整条链。进程被冻住期间
@@ -97,13 +243,265 @@ meson-vdec 的硬约束：**同一个 V4L2 会话里不能换码流**，seek/分
 做法：每轮记 `t_loop`，若本轮间隔 > 4s（正常最多一个 poll 周期 2s），
 把 `t_last_rx` 重置为 `now-2.0`。
 
+### 1.11 为什么不链 libavformat（决策记录）
+
+§1.1 那句话说得很轻，实际是一笔明码标价的交易。结论：**当前不链；但这是可翻案的，
+翻案条件写在最后。**
+
+要自己 demux，就得把 ffmpeg 现在白送的这些重做一遍：
+
+| 现在 ffmpeg 白送 | 自己链 libavformat 要写 |
+|---|---|
+| 容器探测（MP4/MKV/TS/HTTP/RTSP） | `avformat_open_input` + 各协议注册，还要处理 HTTP 重连 |
+| 选流 | 扫 `fmt->streams[]` 找 `codecpar->codec_type==VIDEO` |
+| 起始码 → AU | 不用写（`av_read_frame` 一个 packet 一帧），这是**唯一省事的** |
+| `-ss` 定位 | `avformat_seek_file` + `avcodec_flush_buffers` + 等 IRAP |
+| `-re` 节流 | 自己算 `pts - last_pts` 睡，等价于重写 `-re` |
+| 送字节进管道 | 不用送，直接 `QBUF`，省掉一次拷贝和一整个进程 |
+| 音轨抽取 | `-map 0:a` 交给 mpv 的那部分也要自己做（或继续让 mpv 直读 URL） |
+
+四条现实成本，按"疼"排序：
+
+**① 交叉编译环境里根本没有 libav。**
+实测：`/usr/aarch64-linux-gnu/lib` 与 `/usr/aarch64-linux-gnu/include` 下
+没有任何 `libav*`（连头文件都没有），只有 x86_64 的。所以"链 libavformat"的真实起点是
+**先给 aarch64 编一份 ffmpeg 静态库**：configure + 交叉工具链 + `zlib/bz2/lzma/ssl`
+一堆依赖，产物几十 MB。`crosslib/` 里现在躺着的 7 个 `.so` 是 EGL/GLES/gbm/drm/expat —— 
+GL 那摊已经为"静态链"付过一次这样的学费了。
+
+**② libavformat 给的是"字节 + PTS"，不是"上屏节拍"。**
+`-re` 那套限速是 ffmpeg CLI 的特性，库里没有。链了库仍要自己写节流循环，
+否则解码器照样跑满 —— 换句话说 **§3.5 的 `-re` 需求不会因为换 demux 而消失，只会换个人实现**。
+
+**③ 进程隔离会丢。** 现在 ffmpeg 崩了是它自己崩，hevcdec 只是读到 EOF；
+链成库之后 demux 崩 = 播放器崩，一个畸形 MKV 能带走整条链。
+
+**④ seek 从"杀进程重开"变成状态机。**
+现在是 `pkill` + `restart_at`（§5.4），逻辑粗糙但没有状态泄漏；
+库里得自己管 flush、DPB 残留、目标帧之前的丢弃 —— 正是 `X96Max-Player.md` §1.5
+要新建 `SEEKING/RESYNC` 两个状态的理由。
+
+那收益值不值？**真 PTS 这一项就够格，因为现在的窟窿是硬的**：
+
+- `v4l2hevc.c:379-380` 把 output buffer 的 timestamp 硬编码成 `g_au_seq / 25` —— 25 fps 是焊死的；
+- 而配速默认值在 `:1599` 是 `24.0`，`tvplay-node.sh` 又按 `FPS=` 传 0（=不限速）；
+- 也就是说**同一个片子，送帧时按 25 算、上屏时按 24 算或不限速**，两个数都跟片源无关。
+  1080p 以下看不出（24/25 差 4%），4K 就是 §3.5 记的"快 15%"那类漂移的放大器。
+- 附带白拿：`duration`（现在 `probe` 要 fork 一次 `ffprobe` 只为拿一个数，
+  且 `-ss` 之后这数就不对了）、色彩传递元数据（§3.3 的 HDR 判定现在靠 `HDR=1` 环境变量猜）、
+  以及多 slice 帧的 AU 边界（§1.4 那个补丁根本不用写）。
+
+**为什么现在不翻案**：上面四个成本里 ①③ 是一次性但很重，②④ 是持续维护成本；
+而当前离"能稳定看片"还差着 AU 判据和上游存活检测（§1.4/§1.6），
+先修那两处能把体验拉直，成本是几行。
+
+**翻案条件（任一触发就动手）**：
+- 需要音画同步（多音轨/VFR 片源进场）；
+- seek 精度要优于 GOP（现在是 1–2 s）；
+- 要放本地 MKV/内嵌字幕，或要做预取播放列表（`X96Max-Player.md` §1.4）。
+
+翻案不是重写，是替换 §1.1 表里的前两行：`X96Max-Player.md` §1.7 的 **B 步**
+（`demux.c` + 真 PTS，删 `-re`）就是这件事的最小切口，C 步接时钟。**B 之前一切同步都是猜，B 之后才是算。**
+
+顺带排除的中间态：**另起 `ffprobe -show_packets` 旁路补 PTS**。
+多一个进程、多一次全片扫描、还要按 packet 序号和管道字节对齐，
+对齐一旦失败就是静默的错帧 —— 比现状更差，不要走。
+
+### 1.12 音频：整段外包给 mpv（决策记录）
+
+一句话：**hevcdec 里没有一行音频代码**（`v4l2hevc.c` 全文 grep `audio|alsa` 为空），
+声音由第二条命令 `mpv --no-video --ao=alsa --audio-device=alsa/hw:0,0` 独立出声，
+两边唯一的约定是**同一个 `--start`**（`tvplay-node.sh:79-86`）。
+
+| 环节 | 谁做 |
+|---|---|
+| 解封装 + 音频解码 + 重采样 + 声道映射 | mpv（自己再开一次 URL） |
+| 音轨选择 | mpv `--aid=$TRACK`；注意 `TRACK` 是 mpv 的 aid，**不是列表游标** |
+| 输出 | ALSA `hw:0,0` 直出，无 dmix、无 plug |
+| 音量/静音 | `mpvctl` → `--input-ipc-server=/tmp/tvplay.sock` |
+| 暂停 | `pkill -STOP/-CONT`（视频 2 个 pattern + mpv 2 个 pattern） |
+| 位置 | **没人读 mpv 的 `time-pos`**；`pos()` 只算 wall clock |
+
+**为什么不自己出声**：`docs/playback.md:182` 的实测 —— 这块板子上 `ffmpeg -f alsa`
+单跑 8 秒就 15 次 xrun，属硬件 period 太浅（PLAN B §:160 同记）。这是硬证据不是偏好：
+在没有 dmix/大 period 之前，自己在进程内出音必然断断续续。
+
+**代价，按"用户能不能感觉到"排序**：
+
+**① 同一个 URL 被读两遍。** ffmpeg 供视频、mpv 供音频，各自打开 `$URL`：
+HTTP/WebDAV 源带宽 ×2、起播多一次握手，且 `--cache-secs=20` 让 mpv 的读位置
+和视频**彻底脱钩**——它可以先跑 20 s，也能落后 20 s，没人管。
+
+**② 同步是"对齐同一个 START"，不是时钟从动。** `-re` 按平均码率跟 wall clock，
+ALSA 跟采样时钟，两个独立晶振（§4.4、`X96Max-Player.md` §:411 已记"漂移无界"）。
+没有丢帧/补帧，只有缓慢分离；短片看不出，长片必然。
+
+**③ seek 是两条命令。** HEVC 链没有 IPC，只能 `restart_at` 整链重开（带新 `--start`）；
+`PLAYER=mpv` 时走 `mpvctl seek`。两个目标位置**只能靠人手保持一致**，
+`START/OFF/PAUSE_AT` 三个变量存在的唯一理由就是让 `pos()` 自洽（§5.4）。
+
+**④ 暂停必须两个进程一起打。** 只 STOP 视频 = 画面冻住声音照放；只 STOP mpv = 哑掉。
+`toggle` 的判据因此是 `pgrep v4l2hevc-aarch64` 而**不是 state**（实测 state 会撒谎：
+HEVC 链在放、state 写着 mpv，于是 toggle 发给一条空 socket，什么都没发生）。
+
+**⑤ 音量是一次 IPC 往返。** `mpvctl` 读 `get_property volume` 再 `set_property`：
+必须 `MPVCTL_ECHO=1`，否则回显为空、每次都按 100 算（实测连按减 12 次只掉到 90）；
+且必须夹 `0..100`，mpv 的 `add` 会累加，>100 削波（实测被连按到 130，晚上炸响）。
+
+**⑥ `AUDIO=0` 的片源没有钟。** 无声片只剩 `-re`，既无音频钟可依，也没有人检测
+"mpv 死了"（§1.6 那张表只覆盖上游 ffmpeg）。
+
+**为什么不翻案**：mpv 白送解码/重采样/音轨切换/声道映射/变速，代码 0 行；
+代价全部集中在上面三处用户可见的地方，且 §5.3/§5.4 已逐个堵过（合并 seek、双 pattern
+暂停、音量夹取）。自己出声要先把 ALSA 深缓冲解决，那是另一条独立战线。
+
+**翻案条件**：ALSA 缓冲问题被解决（dmix + 更大 period，或 mmap 大 period 直出），
+音频进同一进程/同一时钟域 —— 那时 "①双读 ②漂移 ③双 seek ④双暂停 ⑤IPC 音量" 一次性全消失。
+但顺序必须是**先修视频的钟**（§1.11 的 B 步、§3.5 的 `-re`）：两个错的钟做同步，
+得到的不是同步而是更精致的漂移。
+
+### 1.13 独立音频输出模块 `aout`（§1.12 的翻案第一步）
+
+§1.12 把翻案条件写成"ALSA 缓冲问题被解决"。这一节就是那一半：
+**不再让 mpv 出声，也不链 libasound**，自己写一个 400 行的 PCM 直出进程。
+文件：`aout.c` / `aoutctl.c`（静态 aarch64 二进制 790 KB + 700 KB，零动态依赖）。
+
+一句话定位：**`aout` 只做一件事——把 stdin 上的 PCM 灌进 `hw:0,0`，
+并回答"我播到第几毫秒了"。** 解码/重采样/音轨选择仍然外包（给 ffmpeg），不重复 §1.12 的工作量。
+
+```
+ffmpeg -i "$URL" -map 0:v:0 -c:v copy -f hevc pipe:3 \
+                -map 0:a:0 -ac 2 -ar 48000 -f s16le pipe:4  3> v.fifo  4>| aout
+```
+
+两个输出走 ffmpeg 的两个 fd（`pipe:N`，N>2 是 ffmpeg 支持的），所以
+**URL 只读一遍**——§1.12 的代价 ① 直接消失，顺便拿到"视频音频同一个 `-ss`"这个天然对齐。
+
+| 环节 | 谁做 | 说明 |
+|---|---|---|
+| 解封装 / 音频解码 / 重采样 / 下混 2.0 | ffmpeg（`-ac 2 -ar 48000 -f s16le`） | `aout` 要求输入已经是 48 kHz 立体声 s16le |
+| 打开硬件、period/buffer、xrun 恢复 | `aout`（裸 `SNDRV_PCM_IOCTL_*`） | 不经过 `plug`/`dmix`/`pulse` 任何插件层 |
+| 音量 | `aout` 内部整数增益 | 0..100，`vol +5` 的相对量**在模块内部算** |
+| 暂停 | `aout`，两级降级 | 先 `SNDRV_PCM_IOCTL_PAUSE`，dai 不认就写静音占住 dma |
+| 位置 | `aout` → `played_ms = (written - delay)/rate` | 从 `HWSYNC`+`DELAY` 读，不是推算 |
+
+**接口**（一行一条，应答一行 JSON）：
+
+```
+$ aoutctl status
+{"state":"RUNNING","pause":0,"played_ms":6198,"delay_ms":170,
+ "buffer_ms":170.7,"period_ms":42.7,"vol":100,"xrun":0,"rate":48000,"ch":2,"written":...}
+$ aoutctl vol +5      # 模块内部夹 0..100，绝不会像 mpv add 那样累到 130
+$ aoutctl toggle
+```
+
+环境变量：`AOUT_DEV`(默认 `/dev/snd/pcmC0D0p`) `AOUT_RATE` `AOUT_CH` `AOUT_FMT`
+`AOUT_BUFFER`(默认 8192 帧=170 ms) `AOUT_PERIOD`(默认 2048 帧=43 ms) `AOUT_SOCK` `AOUT_VOL`。
+
+**四个设计决定，都是为了不重犯 §1.12 的病**：
+
+1. **不链 libasound。** 板上只有 `libasound.so.2` 运行时（`/usr/lib/aarch64-linux-gnu/`），
+   没有头文件也没有交叉库；更要紧的是 `snd_pcm_set_params()` 会替你定 period ——
+   mpv 的 ao_alsa 就是这么拿到 200 ms 浅缓冲的。这里直接用内核 uapi
+   `sound/asound.h`（架构无关，交叉编译零成本），参数由 `AOUT_BUFFER/AOUT_PERIOD` 说了算。
+2. **阻塞写当时钟。** `SNDRV_PCM_IOCTL_WRITEI_FRAMES` 在 ring 满时阻塞，
+   等于内核按采样率节流：喂到第 N 帧 = 播到第 N 帧 - `delay`。不需要 `usleep` 自己算节拍，
+   也就不需要 `-re` 那种按平均码率猜的钟（§3.5 的病根）。
+3. **音量在样本上做，不在 IPC 上做。** §1.12 代价 ⑤ 的根因是 `mpvctl` 读旧值写新值；
+   这里 `vol +5` 一支命令、一次应答，连按 12 次就是 12 次 ±5，不会丢。
+4. **xrun 自己吞。** `EPIPE` → 计数 + `PREPARE` 重来，进程不退出、播放器不用管
+   （§1.6 那张表里"上游死了"和"片尾了"分不清的问题，音频侧不再制造新的噪声）。
+
+**板子实测（`aoutprobe`，见 `aoutprobe.c`）**：
+
+- `card0 = axg-sound-card X96-MAX`，三个 playback 设备，但 **`D1`/`D2` 打不开**
+  （`open` 返回 `EINVAL`，dai-link 无 pcm ops），实际只有 **`D0`** 能用 —— 与 mpv 用的 `hw:0,0` 一致。
+- `D0` 是**独占单 subdevice**，mpv 正在播时再 `open()` 不返回 `EBUSY` 而是**直接挂住**
+  （实测两次 `timeout 6` 被打断，stderr 一个字都没有，连 `SNDRV_PCM_IOCTL_INFO` 都没跑到）。
+  运维含义：**任何探测/切换前必须先停掉占用的进程**，别指望 `fuser` 看到就能优雅抢占。
+- 这个内核的 `/proc/asound/card0/` 下没有 `pcm0p/` 目录（只剩 `id`/`eld#7`），
+  想看 `hw_params`/`status` 只能自己 ioctl —— `aoutctl status` 就是为这个补的洞。
+
+**未验证 / 风险**（不在这一节吹牛）：
+
+- 大 buffer 能否真的压掉 `docs/playback.md:182` 的"8 s 15 次 xrun"——`aoutprobe` 已写好三种规模
+  （2048/512、8192/2048、32768/8192）对比，**必须在声卡空闲时跑**（上面那条挂住的坑）。
+- `SNDRV_PCM_IOCTL_PAUSE` 在 axg 上是否支持：不支持会自动降级为写静音，代价是
+  暂停期间 dma 仍在跑（功率、以及"暂停位置上 `hw_ptr` 还在前进"要靠 `g_frozen_ms` 冻结）。
+- 硬件是否给 32768 帧的 buffer（AXG fifo 深度通常只到几十 KB）；给了才有 170 ms 以上的
+  抖动余量，不给就把 `AOUT_BUFFER` 压回 8192 并接受更紧的调度。
+- **音画同步还没接。** `played_ms` 出去了，但视频侧还没拿它当从时钟（§1.11 B 步）。
+  现在只是把"能测的钟"造出来，从动逻辑仍归视频那边。
+
 ---
 
-## 2. 方案 A：DRM overlay plane 零拷贝直上屏
+### 1.14 RAP 门控状态机：转移、错误边、超时
 
-代码：`v4l2hevc.c` 的 `USE_DRM` 段（`play_setup/play_rect/play_frame`）。
-产物：`make drm` → `v4l2hevc-drm-aarch64`；`v4l2hevc-gl-aarch64` 也含这条路径。
-开启：`PLAY=1` 且不设 `GLPLAY`。
+§1.3 的结论是"类型要当策略输入"，一个 `g_need_irap` 布尔量不够用：它表达不了
+"收了 CRA 还得连带丢 RASL"、"strict 等不到 IDR 多久该降级"、"等 RAP 等多久算真没有"。
+所以门控做成三状态机（`v4l2hevc.c`：`RAP_PLAY / RAP_WAIT / RAP_RASL` +
+`rap_enter / rap_accept / rap_tick`）。
+
+**状态与不变式**
+
+| 状态 | 含义 | 不变式 |
+|---|---|---|
+| `PLAY` | 正常喂流 | 只有它会触发 `STALLSEC` 看门狗 |
+| `WAIT` | 新会话/seek 后等 RAP | 进来的 AU 全丢（`g_rap_drop++`），只有 `rap_accept()` 放行的 RAP 能出去 |
+| `RASL` | 已收 CRA，正在丢它后面的 RASL | 出现一个非 RASL AU 才回 `PLAY` |
+
+`rap_accept(rap)`：16..20（BLA/IDR）恒收；21(CRA) 在 `RAPMODE=cra`（默认）或已降级时收，
+`strict|idr` 只在降级后收；其余不接受。
+
+**正常转移（由下一帧的类型触发）**
+
+| 边 | 触发 | 动作 |
+|---|---|---|
+| `WAIT → PLAY` | 收到 16..20 | 喂这一帧 |
+| `WAIT → RASL` | 收到 21 且策略允许 | 喂 CRA，标记接下来丢 RASL |
+| `RASL → PLAY` | 非 RASL AU（`s_au_last_rasl == 0`） | 喂这一帧，转入正常播放 |
+| `PLAY → WAIT` | `g_reinit`（seek / POLLERR / STALL / FORCEREINIT） | 重建后必然回 `WAIT`，计数器归零 |
+
+**错误转移（不是"下一帧类型"能表达的那些）**
+
+| 边 | 触发条件 | 后果 |
+|---|---|---|
+| `WAIT → WAIT`（丢） | 收到 P/B，或 strict 下的 CRA | 只丢不重建；计时器**不**重算，避免"一直有垃圾数据流入"把超时无限推后 |
+| `RASL → WAIT` | RASL 段超预算（> `RAPRASLMAX` AU 或 > `RAPRASLSEC`） | "CRA 后只有 RASL"的假设不成立，退回重等；`g_rap_rasl_over++` |
+| `RASL → 退出` | 同一会话里第 3 次超预算 | 判死（`rap_tick` 返回 2），避免"退→等→又超"死循环 |
+| `WAIT → 重建` | 超过 `IRAPWAIT` | **软**重建（`g_hard_reset_on_reinit = 0`）：RAP 缺失是流的问题，掉电复位治不了；计入 `g_err_rec`，超过 `ERRREC` 退出 |
+| `任何 → 清计数` | 真出帧 | `g_err_rec = 0`（原有自愈归零语义不变） |
+| 流 EOF（`r == 0`）且不在 `PLAY` | 上游结束 | 打一行"流里没有可用 RAP（丢 N AU，原因）"再收尾，而不是静默等超时 |
+| seek（`r < 0`） | `SIGUSR1` 打断 `stream_next_au` | 状态**不动**（下一轮重建会 `rap_enter(WAIT)`），避免重建前误判 |
+
+**超时表**（全部可 env 覆盖，`0` = 不限）
+
+| 变量 | 默认 | 作用域 | 超时后 |
+|---|---|---|---|
+| `RAPSTRICT` | 3.0 s | `WAIT` + `RAPMODE=strict` | 每会话降级一次：接受 CRA，计时器重算 |
+| `IRAPWAIT` | 60 s | `WAIT` 的绝对上限 | 软重建（计入 `ERRREC`） |
+| `RAPRASLMAX` | 8 AU | `RASL` | 回 `WAIT`；累计 3 次判死 |
+| `RAPRASLSEC` | 1.5 s | `RASL` | 同上 |
+| `STALLSEC` | 12 s | 仅 `PLAY` | 硬复位重建（原语义） |
+
+两个必须一起改的地方，否则互相打架：
+
+1. **暂停（`pkill -STOP`）**：`t_loop` 间隔 > 4s 时除了把 `t_last_rx` 挪到 `now-2.0`，
+   还要把门控计时 `g_rap_t0` 一起挪（§1.10），否则 resume 后第一轮就撞
+   `RAPSTRICT/IRAPWAIT` 去重建（闪黑 + 掉 buffer）。
+2. **STALL 与门控互斥**：`STALLSEC` 只在 `PLAY` 生效。门控态按定义不出帧，
+   用"无新帧"判死会在长 GOP 上无限重建（GOP > 12s 的片源存在）。
+
+`RAPDBG=1`（或 `VERBOSE=1`）打印每条转移：`RAP WAIT -> RASL (CRA) drop=0`，
+配合 §1.3 的 `RAPDBG au=.. rap=.. rasl=..` 能把"丢了多少、为什么丢"对到具体 AU。
+
+---
+
+## 2. Renderer A（`drm`）：KMS overlay plane 零拷贝直上屏
+
+代码：`vout.c`（提交/队列/节拍/完成反馈）+ `render_drm.c`（薄适配）。
+产物：就是 `v4l2hevc-aarch64` 本身，`RENDER=drm`（`auto` 时优先）。
+播放器侧已无 DRM 代码：只有 `render_submit()` / `render_pump()` 两个调用点。
 
 ### 2.1 点屏：透明 primary + NV12 overlay
 
@@ -161,7 +559,62 @@ else if (cur > target + 2 帧)  vbl_base = cur - round(n*refresh/fps); // 落后
 > 注意：节拍器只存在于方案 A。方案 B（GL）路径没有 vblank 节拍，
 > 必须靠 `ffmpeg -re` 供流限速（见 §3.5）。
 
-### 2.5 无 GPU 时的 HDR 处理：就地软件色调映射
+### 2.5 统一帧队列：提交 / 队列 / 槽位 / 完成反馈（`vout.c`）
+
+老接口 `vout_frame()` 是同步的：等 vblank → SETPLANE → 返回。24 fps 下每帧
+被 vblank 卡住 16~41 ms，解码线程和上屏线程只能串行。四个概念拆开之后才对：
+
+| 概念 | 在哪 | 代价 |
+|---|---|---|
+| 提交 `vout_submit()` | `PRIME_FD_TO_HANDLE` + `ADDFB2` | 几十 µs，不等 vblank |
+| 队列（深度可配，默认 1） | 环形缓冲，只存 fb_id 引用 | 每多一帧多一帧显示延迟 |
+| 槽位 `pts_slot()` | `(pts-pts_base)*refresh` → 绝对 vblank 序号 | 一次 `WAIT_VBLANK(ABSOLUTE)` |
+| 完成反馈 `cb` | 下一轮 pump 核 `cur >= prev_latch` | 粒度 1 帧（legacy ioctl 拿不到 flip event） |
+
+**一次 submit 恰好换一次回调**（`VOUT_SHOWN` / `VOUT_DROPPED` / `VOUT_ABORTED`），
+这是调用方能安全回收 dma-buf 的唯一依据：submit 只拿 GEM handle 引用，fd 交回
+调用方没问题，但**内存不能被解码器 QBUF 回收改写**——`vdec` 复用那张 buffer，
+屏上就是花屏。所以深度 >1 时必须等回调再 `QBUF`；深度 1（同步）沿用老规矩，
+返回即可回收。清队/`flush`/`close` 都逐帧发 `VOUT_ABORTED`，绝不静默吞帧。
+
+**丢帧**分两处，都是"新的赢"：
+
+```c
+/* 提交时：目标槽已经过去 ≥2 个 vblank → 不上屏 */
+if ((long long)slot - (long long)cur <= -2) { drops++; stales++; return VOUT_DROPPED; }
+/* 入队时：队列满 → 丢最老的那张，给新帧腾位置 */
+if (qn >= qmax) { 丢 q[qh]; }
+```
+
+24 fps @ 60 Hz 每帧只吃 2~3 个槽，补一帧就连累后面一串，丢掉反而更稳
+（H.265 短 P 链少一帧很耐看）。队列满时丢最老而不是阻塞生产者，
+是为了不让延迟越攒越大——阻塞会让"慢 1 帧"变成"慢 1 秒"。
+
+**完成反馈怎么核**：`SETPLANE` 不会立即生效，要下一个 vblank 才接管扫描，
+所以目标槽 T 的帧真正开始扫描是 T+1。下一轮 pump 拿当前序号比：
+
+- `cur >= prev_latch` → 确实吃到了 vblank，回调 `VOUT_SHOWN` 并给出真序号；
+- `cur < prev_latch` → 两次 SETPLANE 挤进同一个 vblank，后一次盖掉前一次，
+  前帧**一帧都没被扫过** → `misses++`，按 `VOUT_DROPPED` 回报。
+
+这条 `miss` 计数就是"flips 在涨但人眼看不到"的唯一探针。要更细的时序就得换
+atomic（flip event），见 §2.1 / 文件头注释里的取舍。
+
+用法（`./vout-selftest queue` 会验这套账）：
+
+```c
+vout_set_queue(v, 2);
+vout_set_displayed_cb(v, on_shown, ctx);       /* 回调里 owner 还回 vdec */
+for (;;) {
+	vout_submit(v, fd, w, h, yp, cp, pts, buf);  /* 几十 µs */
+	vout_pump(v, 0);                             /* 非阻塞：该翻的翻，不等 */
+}
+vout_wait_shown(v, 200);                       /* 暂停/收流前把画面钉住 */
+```
+
+---
+
+### 2.6 无 GPU 时的 HDR 处理：就地软件色调映射
 
 `tm_apply(idx, w, h)`（`USE_DRM && USE_TM`）直接在已 mmap 的采集缓冲上原地改：
 
@@ -176,10 +629,10 @@ else if (cur > target + 2 帧)  vbl_base = cur - round(n*refresh/fps); // 落后
 
 ---
 
-## 3. 方案 B：EGL/GBM + GLES3 着色器（HDR10→SDR）
+## 3. Renderer B（`gl`）：EGL/GBM + GLES3 着色器（HDR10→SDR）
 
-代码：`glout.c` + `v4l2hevc.c`（`USE_GLOUT`）。产物：`make gl` → `v4l2hevc-gl-aarch64`。
-开启：`PLAY=1 GLPLAY=1`。
+代码：`glout.c`（绘制）+ `render_gl.c`（薄适配）。产物：同一个 `v4l2hevc-aarch64`。
+开启：`PLAY=1 RENDER=gl`（`auto` 只在这些后端里挑第一个可用的，不做"源是 HDR 就自动换"）。
 
 为什么上 GPU：meson DRM 没有 `GAMMA_LUT`/`CTM`（gamma 只在 DSI 通路），
 显示器（BenQ PD2500Q）不吃 HDR，CPU 又太慢 —— 只剩 panfrost。
@@ -262,6 +715,25 @@ LUT 上传成 `RGBA32F` 纹理（`GLLUT8=1` 可退成 RGBA8 省带宽）。
 最后 `eglSwapBuffers()` 提交；`flip_handler` + `wait_flip()` 可选地等 page flip 事件，
 `GLTIME=1` 时 `glFinish()` 并统计 `t_sum/t_max`（片元耗时）。
 
+#### 3.4.1 实测（`glselftest run`，2560x1440@60，Mali-G31 Panfrost）
+
+彩条，`GLTIME=1` 的绘制耗时与每帧墙钟（墙钟含 `wait_flip`，按 vblank 量化）：
+
+| 源尺寸 | 路径 | GPU 绘制 | 墙钟 | 实际帧率 | 判读 |
+|---|---|---|---|---|---|
+| 1280x720 | 两遍（默认） | 14.9 ms | 16.7 ms | 59.5 fps | 刚好装进一个 vblank，余量 1.8 ms |
+| 1280x720 | 单遍 `GL1PASS=1` | 33.2 ms | 33.4 ms | 30 fps | 整屏做完整色调映射 → 掉到 2 个 vblank |
+| 1920x1080 | 两遍 | 25.0 ms | 33.4 ms | 29.9 fps | pass1 超预算 50%，被量化成 2 个 vblank |
+| 3840x2160 | 两遍 | 26.5 ms | 33.4 ms | 29.6 fps | pass1 被 `GL1MAX` 卡在 1080p，和 1080p 源同价 |
+
+`eglSwapBuffers()` 本身只要 0.13 ms，其余时间全在 `wait_flip()` 里——所以 GL 通路
+**有显示侧节拍（每帧等 flip 完成），没有片源侧时钟（`glout_frame()` 连 pts 参数都没有）**。
+两者的差别就是"FPS 是假的"那句话的真意：它不丢帧，只会整条流水线一起慢。
+
+1080p 停在 33.4 ms 这一点很险：24fps 的预算是 41.7 ms，只剩 8 ms；
+上屏侧多蹭一个 vblank 就变 50 ms = 20fps。真实播放日志
+（`PERF tm = 33.57 ms/frame`，1080p24）与彩条几乎重合，说明瓶颈在 GPU 而不在测试卡。
+
 ### 3.5 为什么必须有 `-re`
 
 方案 B 没有 vblank 节拍器（`FPS` 对它无效），谁先出帧谁上屏。
@@ -271,13 +743,23 @@ LUT 上传成 `RGBA32F` 纹理（`GLLUT8=1` 可退成 RGBA8 省带宽）。
 ### 3.6 性能变体：GL 只做源分辨率映射，放大交给 DPU（未并入主干）
 
 `glscale.inc`：把 pass1 的目标从 surface 换成 **3 个轮转的 dumb buffer**
-（`NRT=3`，各 `EGLImage` + `FBO`），渲染完直接 `SETPLANE` 让 DPU 硬件放大到屏幕。
-片元数从屏分辨率降到源分辨率（720p 源 = 1/4 工作量），实测 **28 fps → 55 fps+**。
-独立实验代码，`glout.c` 目前没有 include 它。
+（`NRT=3`，各 `EGLImage` + `FBO`），渲染完直接 `drmModeSetPlane` 让 DPU 硬件放大到屏幕。
+片元数从屏分辨率降到源分辨率（720p 源 = 屏的 1/4）。
+
+**状态如实**：这份代码从未被编译进任何目标文件 —— 全仓库除自身外零引用
+（`grep -rn glscale` 无输出），`glout.c` 没有 include 它，文件内全是 `static` 函数。
+注释里"实测 28 fps → 55 fps+"是从 §3.4.1 两遍路径搬过来的数字，
+不是这条路径的实测值（两者机制的差别见 §4.1）。它自己能跑（`glFinish`(145) →
+`SetPlane`(154)，等比黑边 `dx/dy`(148-152) 都是完整的），缺的是接入时要解决的
+三件事：从未被 include、`S.cur` 盲轮转不等扫描输出(129)、以及 `pick_primary_plane()`
+抢的就是正常路径那张透明 primary —— 和 `eglSwapBuffers` 争同一个 crtc。逐条见 §4.1.1。
 
 ---
 
-## 4. 两条方案对比
+## 4. 渲染方案：A、B 与最终管线
+
+A / B 是两条已经跑通的实现，**都不是终点**：§4.1 是两者收敛后的目标形态
+（A 的上屏/节拍 + B 的色彩），A、B 各自的毛病记在 §4.2/§4.3，作为取舍依据保留。
 
 | 维度 | 方案 A（DRM plane） | 方案 B（GLES3） |
 |---|---|---|
@@ -289,17 +771,97 @@ LUT 上传成 `RGBA32F` 纹理（`GLLUT8=1` 可退成 RGBA8 省带宽）。
 | 4K 能力 | 受 CPU 色调映射限制（~800ms/帧） | 37~54ms/帧（pass1 限 1080p） |
 | seek 恢复 | DRM 不释放，**不黑屏** | 同（GL 上下文不随 V4L2 会话销毁） |
 | 依赖 | 裸 ioctl，无 libdrm | EGL/GLESv2/gbm/drm（交叉编译用 `crosslib/` 里的板端 .so） |
-| 缺点 | 无色彩处理 + 平台绑死（见 §4.1） | 无节拍 + 吃 GPU + 依赖重（见 §4.2） |
+| 缺点 | 无色彩处理 + 平台绑死（见 §4.2） | 无节拍 + 吃 GPU + 依赖重（见 §4.3） |
 | 典型用途 | 低分辨率/无 HDR 片源、逐帧一致性验证 | 实际观影（HDR10 4K） |
 
 一致性的结论（README）：与 ffmpeg 软解逐帧 md5 比对，640x360/720p/1080p
 各 ~300 帧全部 bit-exact；纯解码吞吐 105~140 fps（`NBUF_OUT=16 NOWRITE=1`）。
 
-### 4.1 方案 A 的缺点
+### 4.1 最终渲染管线
+
+**一句话**：片元只在**源分辨率**上跑，放大和上屏交给 DPU；GPU 唯一的活是把 HDR 变成 SDR。
+
+```
+vdec dmabuf (NV12) ──EGLImage──▶ 纹理 y/c
+                                     │
+                          FBO @ 源分辨率
+                     （逐通道 LUT 色调映射，§3.3）
+                                     │
+                        GBM surface 或 dumb buffer
+                                     │   fence（关键，见下）
+                                     ▼
+                     DPU plane 硬件放大 + 黑边 ──▶ 面板
+```
+
+#### 为什么是这条
+
+GPU 上真正必须做的只有色彩（§4.2 第 1 条：DPU 完全没有色彩管理，meson 无
+`GAMMA_LUT`/`CTM`）。缩放是 DPU 的免费能力（方案 A 已经在用）。而当前默认的两遍路径
+（§3.4）把缩放也放在 GPU 上做，于是第二遍要为**每一个屏像素**采样一次纹理 ——
+这一遍的全部作用只是"把图搬大"，纯属浪费。把它砍掉，片元数就只跟源走：
+
+| 源 → 2560x1440 | 单遍（`GL1PASS=1`） | 两遍 pass1 | 本方案 |
+|---|---|---|---|
+| 1280x720 | 100% | 25% + 100% | **25%** |
+| 1920x1080 | 100% | 56% + 100% | **56%** |
+| 3840x2160 | 100% | 56%(限 1080p) + 100% | **56%**(限 1080p) |
+
+结论只到"比两遍少一整遍整屏采样"，具体帧率**待测**（见 §4.1.4），不在这里填数。
+注意 1080p 源占屏 56% 而不是 25%：`glscale.inc:2` 注释里那组"1/4"
+只对 720p 成立，换成 1080p 片源时不要沿用那个预期。
+
+#### 4.1.1 三条硬约束（缺一条这条管线就不成立）
+
+1. **fence 是前提，不是优化**。`glscale.inc:145` 的 `glFinish()` 不是随手写的：
+   后面接的是 legacy `drmModeSetPlane`，它**没有 fence 参数**，内核不知道 panfrost
+   画完了没有，去掉 `glFinish` 就等于让 DPU 去读正在被渲染的显存。二选一：
+   留着 `glFinish`（CPU 每帧阻塞到 GPU 收工，省下的片元被等待吃掉），
+   或改 atomic、填 `IN_FENCE_FD`。目前仓库里 atomic 一条都没用
+   （`grep -rn AtomicCommit *.c` 无输出），但 `crosslib/libdrm.so.2` 导出了
+   `drmModeAtomicCommit`，能力上有。
+2. **缓冲轮转必须等扫描输出**。`glscale.inc:129` 的 `S.cur = (S.cur + 1) % NRT` 是盲轮转，不查上一帧是否
+   已经扫出去。渲染比扫描快时必然写回正在被 DPU 读的那块 —— 撕裂。
+   `vout.c` 的翻页机制解决的就是这件事，本方案不能绕过它。
+3. **呈现出口只留一个**。现状已有三个：`eglSwapBuffers`（`glout.c:1066`）、
+   `drmModePageFlip`（`glout.c:1108`）和 `SetCrtc` 兜底（`glout.c:1090`，重试失败转 `:1124`）。
+   `glscale` 的 `SetPlane` 会是第四个，且和 `eglSwapBuffers` 打同一个 crtc。
+
+#### 4.1.2 两种落地形态
+
+| | A：缩小 surface + `eglSwapBuffers` | B：atomic + `SetPlane` |
+|---|---|---|
+| 做法 | `gbm_surface_create(sw, sh)`（`glout.c:576` 已是一行之差） | 保留 dumb buffer 轮转，补 `IN_FENCE_FD` |
+| fence | **隐式**，EGL 自己带 | 手填，要按名字取属性 id |
+| 三缓冲/翻页 | 复用现有 `drmModePageFlip` + `flip_handler` + `wait_flip_to` 硬截止 | 自己实现，等于重写一遍 `vout.c` |
+| 宽高比 | 只能等屏宽高（page flip 无法指定 plane 子矩形） | 可 letterbox（`dest_x/dest_y/dest_w/dest_h`） |
+| 改动量 | 个位数 diff | 一个模块 |
+
+选哪条不由偏好定，由**需不需要 letterbox** 定：16:9 源配 16:9 屏就是 A；
+要任意宽高比的等比+黑边就只能 B。上盒子跑一次 `drmprops`（仓库里有）能看到
+primary plane 的属性表里有没有 `IN_FENCE_FD`、缩放上下限多少 —— 这是 A/B 的判据。
+
+#### 4.1.3 顺序约束：先管线，后 LUT
+
+逐通道三通道 LUT（§3.3 目标形态：现在按 Y 索引的单 LUT 换成分别索引 Y/U/V 的三张）
+会让取样次数翻倍。只有在源分辨率片元预算下这笔账才划算 —— 在屏分辨率上做，
+两遍路径立刻掉一个 vblank 档。所以**先把这条管线跑通并量到帧率，再换 LUT**。
+反过来做，一旦掉帧就分不清是计算域改坏了还是渲染架构没撑住。
+
+#### 4.1.4 验收（数字留空，实测后回填）
+
+| 项 | 怎么测 | 要求 |
+|---|---|---|
+| 帧率 | 同一彩条/同一片源，`GLTIME` 关（它插 `glFinish`，会抹掉异步收益） | 记 `frames/秒`，不记 `t_sum` |
+| 撕裂 | 1280x720 源（渲 25% 帧时间，远快于 60Hz）静置观察摇镜 | 无横向错位 |
+| 黑边 | 2.39:1 源 | 等比居中，四边等宽 |
+| 色彩 | 与 §3.4 两遍路径同帧对比 | 逐像素一致（同一套 LUT，只该换几何） |
+| CMA | `cma-watch.sh` 播放 5 分钟 | 不单调上涨 |
+
+### 4.2 方案 A 的缺点
 
 1. **完全没有色彩管理**。这是硬伤：DPU 这条路径只能把 YUV 原码值直送显示器，
    meson 又没有 `GAMMA_LUT`/`CTM`。HDR10 片源（PQ + BT.2020）出来就是灰蒙/过曝，
-   不是"效果差一点"，是**不可用**。唯一的补救是 §2.5 的 CPU 就地 LUT，
+   不是"效果差一点"，是**不可用**。唯一的补救是 §2.6 的 CPU 就地 LUT，
    4K 一帧 ~800 ms（~11 MB/s），只够当兜底和验证。
 2. **尺寸/性能二选一**。CPU 色调映射随像素线性增长，1080p 也已经很勉强；
    想开 HDR 映射就得降分辨率，想 4K 就只能不做色彩处理。
@@ -320,7 +882,7 @@ LUT 上传成 `RGBA32F` 纹理（`GLLUT8=1` 可退成 RGBA8 省带宽）。
 9. **平台绑死**。"NV12 紧排、Cb pitch = w"、"primary 只收 RGB"、"vdec 的
    `vififo offset` 匹配"全是 meson/amvdec 的特有行为，换 SoC 整段要重写。
 
-### 4.2 方案 B 的缺点
+### 4.3 方案 B 的缺点
 
 1. **没有帧级节拍**。所有平滑度都押在 `ffmpeg -re` 上：网络抖动 = 画面卡顿，
    `-re` 被去掉/源比实时快就按解码速度飞（实测 4K 快 15%）。
@@ -345,7 +907,7 @@ LUT 上传成 `RGBA32F` 纹理（`GLLUT8=1` 可退成 RGBA8 省带宽）。
    色彩配置联动，也没法让别的程序复用；想加真实 HDR 直通（换 HDR 显示器）
    得再写一条完全不同的路径。
 
-### 4.3 两条方案共同的缺点
+### 4.4 两条方案共同的缺点
 
 - **A/V 同步是粗对齐**：只靠两边同一个 `-ss`，没有音频时钟驱动视频丢帧/补帧，
   长片必然缓慢漂移；`-re` 本身也是按平均码率，不做音频对齐。
@@ -356,13 +918,13 @@ LUT 上传成 `RGBA32F` 纹理（`GLLUT8=1` 可退成 RGBA8 省带宽）。
 - **拖动精度受 GOP 限制**：`-ss` 落在关键帧前要等 IRAP，最长 60 s（`IRAPWAIT`）兜底。
 - **都没有 UI**：无 OSD、无进度条、无字幕选择，交互只有遥控器那几个动作和 ssh 协议。
 
-### 4.4 选型口径
+### 4.5 选型口径
 
 - 片源是 SDR / 低分辨率 / 要逐帧校验 → **A**：零拷贝、vblank 精确、依赖最少。
 - 片源是 HDR10 或 4K → **B**：宁可用 GPU 换正确色彩，接受 `-re` 的节拍风险。
-- 两条路都别指望"开箱即用"：A 卡在色彩，B 卡在节拍与依赖，
-  真正理想的形态是 **A 的上屏/节拍 + B 的色彩**（§3.6 的 `glscale.inc` 方向：
-  GL 只做源分辨率映射，放大和翻页交回 DPU），这条目前还没并入主干。
+- 两条路都别指望"开箱即用"：A 卡在色彩，B 卡在节拍与依赖。
+- 长期只留一条：**§4.1 的最终管线**（A 的上屏/节拍 + B 的色彩，GL 只做源分辨率映射）。
+  `glscale.inc` 是它的半成品原型，不是另一个方案；在它并入主干之前，A、B 两条都得留着兜底。
 
 ---
 
@@ -434,8 +996,8 @@ elapsed = (PAUSE_AT>0 ? PAUSE_AT : now) - START + OFF
 
 | 动作 | 实现 |
 |---|---|
-| `toggle` | 先判"实际在跑哪条链"（`pgrep v4l2hevc-gl-aarch64`），**不能只看 state**：HEVC 链的画面(v4l2hevc/ffmpeg)和声音(独立 mpv)是两个进程，只 toggle mpv 会哑掉声音、画面照跑 → 必须整条 `pkill -STOP/-CONT` |
-| 暂停 `pause_video` | `STOP` v4l2hevc-gl / ffmpeg / mpv，写 `PAUSE_AT=now` |
+| `toggle` | 先判"实际在跑哪条链"（`pgrep v4l2hevc-aarch64`），**不能只看 state**：HEVC 链的画面(v4l2hevc/ffmpeg)和声音(独立 mpv)是两个进程，只 toggle mpv 会哑掉声音、画面照跑 → 必须整条 `pkill -STOP/-CONT` |
+| 暂停 `pause_video` | `STOP` v4l2hevc / ffmpeg / mpv，写 `PAUSE_AT=now` |
 | 继续 `resume_video` | `CONT` 三者，把暂停时长并进 `START`（`START += now - PAUSE_AT`），`PAUSE_AT=0`，`pos()` 才连续 |
 | `fwd`/`back`/`fwdmore`/`backmore` | ±10s / ±60s。`PLAYER=mpv` 走 mpv IPC `seek`；HEVC 链只能 **整链重开**（~0.8s 黑屏） |
 | `volup`/`voldn` | `mpvctl` 读 `volume` 再 `set_property`，步进 ±10，**夹在 0..100**（mpv 的 `add` 会累加，>100 削波，实测被连按到 130 晚上炸响） |
@@ -491,18 +1053,18 @@ rc-up.sh [起始秒]     # 盒端：杀掉裸管道链 → node play → 拉起 
 ```sh
 ffmpeg -hide_banner -loglevel warning -re -ss "$START" -i "$URL" \
        -map 0:v:0 -c:v copy -f hevc - \
- | DSTGEO="$GEO+0+0" NOWRITE=1 PLAY=1 GLPLAY=1 /tmp/v4l2hevc-gl-aarch64 -
+ | DSTGEO="$GEO+0+0" NOWRITE=1 PLAY=1 RENDER=gl /tmp/v4l2hevc-aarch64 -
 ```
 
 - `NOWRITE=1` 必须：否则写 `/tmp/out.yuv`，4K 从 24 fps 掉到 10 fps。
 - 音频单独一条 `mpv --no-video --ao=alsa --audio-device=alsa/hw:0,0 --cache-secs=20`。
-  为什么不用 `ffmpeg -f alsa`：这块板子缓冲太浅（实测 8 s 内 15 次 xrun）。
+  为什么不用 `ffmpeg -f alsa`：这块板子缓冲太浅（实测 8 s 内 15 次 xrun）。完整决策与代价见 **§1.12**。
 - `DSTGEO` 只对方案 A 生效；方案 B 按 connector `modes[0]` 自行等比铺屏（两者都是 2560x1440）。
 
 ### 5.7 排查
 
 ```bash
-pgrep -fa 'v4l2hevc-gl-aarch64|ffmpeg .*-f hevc|mpv|rcinputd'
+pgrep -fa 'v4l2hevc-aarch64|ffmpeg .*-f hevc|mpv|rcinputd'
 cat /tmp/tvplay.state
 tail -5 /tmp/tvplay.log; tail -5 /tmp/tvplay-rc.log
 sh /tmp/tvplay-node.sh state
@@ -523,8 +1085,14 @@ IRAP 等不到。
 ## 6. 已知限制 / 下一步
 
 1. **A/V 同步是粗对齐**：只靠两边同一个 `-ss`，长片会有漂移，没有丢帧/补帧机制。
-2. **seek 会黑 0.8 s**：整链重开；`v4l2hevc` 的 `SIGUSR1` 热重建路径已实现，
-   让 `tvplay-node.sh` 改成发信号即可做到不黑屏。
+2. **seek 会黑 0.8 s**：整链重开。黑屏的因是 `restart_at()` 打死持 DRM master 的进程
+   （屏幕掉回控制台），**不是 V4L2 会话重建**——所以这一条与 `design_recover.md` §3.3
+   的软重置研究正交，不要等软重置。
+   但**不能**靠"让 `tvplay-node.sh` 发 `SIGUSR1`"解决：seek 要的是新字节位置，位置只在
+   `ffmpeg -ss` 参数里，而 `SIGUSR1` 只重建已有 fd 上的会话（`v4l2hevc.c:1908`）。
+   现在 `ffmpeg | v4l2hevc` 是兄弟进程，杀上游下游就 EOF。真正的改法是把 ffmpeg 收成
+   `v4l2hevc` 的子进程（C 侧 kill + 带新 `-ss` 重开），动的是进程模型，不是脚本。
+   验收拆两条互不依赖的轨，见 `design_recover.md` §3.3.7。
 3. **拖动精度受 GOP 限制**：`-ss` 落在关键帧前需等 IRAP（`IRAPWAIT` 60s 兜底）。
 4. **方案 B 无帧级节拍**，完全信任 `-re`；网络源抖动会直接体现为卡顿。
 5. `glscale.inc` 的 DPU 硬件放大变体（28→55 fps）尚未并入主干。
