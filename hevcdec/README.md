@@ -79,6 +79,35 @@ RENDER: mode=gles tonemap=cpu src=3840x1600
 head -4 /sys/kernel/debug/dri/0/state    # plane[40]: allocated by = v4l2hevc-aarch6
 ```
 
+### 用 `play.sh` 一条命令放片
+
+上面那条管道手打一次两次还行，天天用就该收进脚本。`play.sh` 只做四件事：
+拼管道、管进程组、清旧实例、把状态写进 `/tmp/play.*`。
+
+```bash
+./play.sh 片子.mkv                # 从头放，前台，Ctrl-C 停
+./play.sh 片子.mkv 600            # 从第 600 秒放
+./play.sh 片子.mkv 600 120        # 只放 2 分钟
+./play.sh -d 片子.mkv             # 后台放，之后用 status/pause/stop 控制
+./play.sh status | pause | resume | stop | log
+```
+
+| 选项 | 说明 |
+|---|---|
+| `-r gl\|drm\|auto` | 上屏后端 |
+| `-s fit\|fill\|crop` | 缩放（**只对 drm 路径生效**，GL 路径按 connector 模式铺屏） |
+| `-f <帧率>` | 强制节拍帧率（留空=播放器默认 24） |
+| `-a 0\|1` | 是否用 mpv 出声 |
+| `-B <路径>` | 播放器二进制，默认 `/tmp/v4l2hevc-aarch64` |
+
+脚本替你把几个"漏了就黑屏、还不报错"的坑堵住了：`PLAY=1` / `NOWRITE=1`
+必写；容器一律 `-c copy -f hevc` 转 Annex-B；裸流（`.265/.h265`）直接
+`cat` 喂且拒绝 seek（没有时间戳）。暂停/停止是对**整个进程组**发信号
+（ffmpeg + 播放器 + 音频 mpv），只停播放器会让 ffmpeg 把管道灌满。
+
+注意 `FPS`/`LEAD` 一旦被赋成空串，播放器那边 `atof("") = 0`，节拍就废了，
+所以脚本只在非空时才 export。
+
 ## 设计要点
 
 - 一个 AU 一个 OUTPUT buffer，驱动靠 `vififo offset` 与 `sess->timestamps` 匹配帧。

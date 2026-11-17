@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "render.h"
@@ -29,6 +30,15 @@ void glout_perf_print(void);
 void glout_stats(double *draw_sum, double *draw_max, double *swap_sum,
 		 unsigned *frames);
 #endif
+
+/* 和 v4l2hevc.c 的 now_s() 同一个时钟域，只为本文件记上屏时刻 */
+static double gl_now(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
 
 struct gl_priv {
 	int dfd;
@@ -79,7 +89,8 @@ static int gl_submit(struct renderer *r, const int fd[2], unsigned w, unsigned h
 	if (glout_frame(fd[0], fd[1], w, h, ypitch, cpitch) < 0)
 		return -1;		/* 没画上去：owner 留在调用方，它自己回收 */
 	if (!p->frames)
-		p->t_first = 0;
+		p->t_first = gl_now();
+	p->t_last = gl_now();
 	p->frames++;
 	p->latch++;
 	if (r->done)
@@ -134,6 +145,8 @@ static void gl_get_stats(struct renderer *r, struct render_stats *st)
 	st->shown = p->frames;
 	st->sw = p->sw;
 	st->sh = p->sh;
+	st->t_first = p->t_first;
+	st->t_last = p->t_last;
 	st->draw_ms_sum = p->draw_sum;
 	st->draw_ms_max = p->draw_max;
 	st->swap_ms_sum = p->swap_sum;

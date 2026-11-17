@@ -515,6 +515,14 @@ static struct {
 	double vbl_ms;		/* 一个刷新周期，判 vblank miss 的基准 */
 	double t_latch, t_latch_prev;
 	int latch_have;
+	/* 上屏分账（GLDBG=1 才逐段计时）：一帧 sub 到底花在哪
+	 *   swap    eglSwapBuffers
+	 *   lock    gbm_surface_lock_front_buffer（没空闲 bo 会在这里阻塞）
+	 *   flip    请求翻页 → flip 完成事件（含 SetCrtc 兜底）
+	 */
+	double s_swap, s_lock, s_flip;
+	unsigned s_n;
+	int split;
 	/* 每块 dmabuf 一纹理。EGLImage 必须一起存：Mali 上 img 拿着
 	 * dma_buf 的引用，只 glDeleteTextures 不销毁 img，旧 buffer 就
 	 * 释放不掉，会话重建后新 dmabuf 分配/复用会 EBUSY
@@ -606,6 +614,7 @@ static int kms_pick(void)
 		g.h_int.slot_unit = g.vbl_ms;	/* 上屏间隔几个周期 */
 		if (!g.perf)
 			printf("GLOUT: PERF=0，不做逐帧 glFinish，draw 只反映建命令时间\n");
+		g.split = getenv("GLDBG") ? atoi(getenv("GLDBG")) : 0;
 	}
 	return 0;
 }
@@ -1223,13 +1232,19 @@ swap:
 		}
 		dt = now_s() - ts;
 		g.tsum += dt;
+		g.s_swap += dt;
 		ps_add(&g.h_swap, dt * 1000.0);
 	}
 	if (0) {
 		printf("GLOUT: swap 失败 0x%x\n", eglGetError());
 		return -1;
 	}
-	bo = gbm_surface_lock_front_buffer(g.gs);
+	{
+		double tl = now_s();
+
+		bo = gbm_surface_lock_front_buffer(g.gs);
+		g.s_lock += now_s() - tl;
+	}
 	if (!bo) { printf("GLOUT: lock_front 失败\n"); g.drops++; return -1; }
 	fbr = gbm_bo_get_user_data(bo) ? *(uint32_t *)gbm_bo_get_user_data(bo) : 0;
 	if (!fbr) {
@@ -1240,6 +1255,9 @@ swap:
 		*slot = fbr;
 		gbm_bo_set_user_data(bo, slot, NULL);
 	}
+	{
+	double tf = now_s();
+
 	if (g.first) {
 		int tries = 0;
 
@@ -1291,12 +1309,21 @@ swap:
 			record_flip(t_req);	/* 直切也算一次上屏，别漏样本 */
 		}
 	}
+	g.s_flip += now_s() - tf;
+	}
 	if (g.prev_bo && g.prev_bo != bo) {
 		gbm_surface_release_buffer(g.gs, g.prev_bo);
 		g.prev_bo = NULL;
 	}
 	g.prev_bo = bo;
 	g.frames++;
+	if (g.split && ++g.s_n >= 60) {
+		printf("GLSPLIT swap=%.1f lock=%.1f flip=%.1f ms/帧 (n=%u)\n",
+		       g.s_swap / g.s_n * 1000.0, g.s_lock / g.s_n * 1000.0,
+		       g.s_flip / g.s_n * 1000.0, g.frames);
+		g.s_swap = g.s_lock = g.s_flip = 0;
+		g.s_n = 0;
+	}
 	return 0;
 }
 

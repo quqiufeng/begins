@@ -1,7 +1,9 @@
 // rcinputd.c — 2.4G 遥控器（evdev）→ tvplay 播放控制
 //
 //   rcinputd -t          dump 模式：把按键码打到 stdout（用于标定遥控器）
-//   rcinputd            守护模式：按键 → exec /tmp/tvplay-node.sh key <动作>
+//   rcinputd            守护模式：按键 → exec /tmp/play.sh key <动作>
+//                       （播放助手路径可用 RC_NODE 覆盖；老链路的
+//                        /tmp/tvplay-node.sh 也能吃同样的 "key <动作>"）
 //
 // 设备自动发现：扫 /dev/input/event*，取名字里含 RC_MATCH（默认 "XING WEI"）的；
 // 可用 RC_MATCH=xxx 覆盖，RC_MATCH=* 表示抓全部（含 meson-ir）。
@@ -22,7 +24,14 @@
 #include <linux/input.h>
 
 #define MAXDEV 16
-#define NODE "/tmp/tvplay-node.sh"
+#define NODE_DEFAULT "/tmp/play.sh"
+#define NODE NODE_DEFAULT	/* 兼容旧引用；实际用 node_path() */
+static const char *node_path(void)
+{
+	const char *p = getenv("RC_NODE");
+
+	return (p && *p) ? p : NODE_DEFAULT;
+}
 #define LOGF "/tmp/tvplay-rc.log"
 
 static int dump;
@@ -293,6 +302,7 @@ int main(int argc, char **argv)
 				last_act = act;
 				if (!fork()) {
 					char a[32];
+					const char *np = node_path();
 					int j;
 
 					snprintf(a, sizeof a, "%s", act);
@@ -300,7 +310,7 @@ int main(int argc, char **argv)
 					/* 双保险：CLOEXEC 之外再显式关掉，别让
 					 * 播放链继承设备 fd 把 grab 带走 */
 					for (j = 3; j < 256; j++) close(j);
-					execl(NODE, NODE, "key", a, (char *)NULL);
+					execl(np, np, "key", a, (char *)NULL);
 					_exit(127);
 				}
 				wait(NULL);

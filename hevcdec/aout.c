@@ -57,6 +57,7 @@ static snd_pcm_uframes_t g_buf = 8192, g_period = 2048;
 static const char *g_dev = "/dev/snd/pcmC0D0p";
 static const char *g_sock = "/tmp/aout.sock";
 static int g_quiet;
+static int g_in_fd = STDIN_FILENO;      /* PCM 来源：独立模式是 stdin，内嵌时由播放器给 */
 
 static volatile sig_atomic_t g_quit;
 static volatile int  g_paused;          /* 1 = 逻辑暂停 */
@@ -76,11 +77,22 @@ static double now_s(void)
 	return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
+#ifdef AOUT_EMBED
+/* 内嵌进播放器（player）时不能 exit()：音频出错只该没有声音，画面必须继续。
+ * 从播放线程里 pthread_exit 就是"这条线程收工"，主循环完全不受影响。 */
+static void die(const char *what)
+{
+	fprintf(stderr, "aout: %s: %s（内嵌模式：音频停，画面继续）\n",
+		what, strerror(errno));
+	pthread_exit(NULL);
+}
+#else
 static void die(const char *what)
 {
 	fprintf(stderr, "aout: %s: %s\n", what, strerror(errno));
 	exit(1);
 }
+#endif
 
 static void on_sig(int s)
 {
@@ -106,7 +118,7 @@ static int hw_setup(void)
 	int i, r;
 
 	pcmfd = open(g_dev, O_RDWR);
-	if (pcmfd < 0) die(g_dev);
+	if (pcmfd < 0) return -1;	/* 声卡被占用/不存在：由调用方决定是"没声音"还是"退出" */
 
 	memset(&p, 0, sizeof p);
 	for (i = 0; i <= SNDRV_PCM_HW_PARAM_LAST_MASK - SNDRV_PCM_HW_PARAM_FIRST_MASK; i++)
@@ -268,7 +280,7 @@ static void *play_thread(void *arg)
 			continue;
 		}
 
-		n = read(STDIN_FILENO, buf + have, chunk_bytes - have);
+		n = read(g_in_fd, buf + have, chunk_bytes - have);
 		if (n == 0) {                                 /* 上游 EOF = 播完 */
 			if (have >= g_frame_bytes) {          /* 尾巴不满一个 period 也要放出去 */
 				unsigned int tail = (unsigned int)(have / g_frame_bytes);
@@ -290,7 +302,7 @@ static void *play_thread(void *arg)
 		}
 		if (n < 0) {
 			if (errno == EINTR) continue;
-			fprintf(stderr, "aout: stdin: %s\n", strerror(errno));
+			fprintf(stderr, "aout: 输入: %s\n", strerror(errno));
 			break;
 		}
 		have += (size_t)n;
@@ -458,6 +470,7 @@ static int handle_line(int fd, char *line)
 	return 0;
 }
 
+#ifndef AOUT_EMBED
 static int ctl_serve(void)
 {
 	struct sockaddr_un sa;
@@ -491,6 +504,9 @@ static int ctl_serve(void)
 	return 0;
 }
 
+#endif /* !AOUT_EMBED */
+
+#ifndef AOUT_EMBED
 int main(int argc, char **argv)
 {
 	const char *e;
@@ -561,3 +577,122 @@ int main(int argc, char **argv)
 	close(pcmfd);
 	return 0;
 }
+#endif /* !AOUT_EMBED —— 独立模式到此为止 */
+
+/* ---------- 内嵌 API：播放器内建音频，盒上不再单独一个音频二进制 ----------
+ *
+ * 与独立模式的区别只有三点：PCM 从调用方给的 fd 来（不是 stdin）、
+ * 不自带控制口（播放器的 /tmp/play.sock 统一转发命令）、出错 pthread_exit
+ * 而不是 exit（没有声音也不能把画面带走）。
+ */
+#ifdef AOUT_EMBED
+static pthread_t g_th;
+static int g_th_on;
+
+int aout_open(int rate, int ch, const char *fmt, int buf, int period,
+	      int vol, int quiet)
+{
+	if (rate > 0)   g_rate = (unsigned)rate;
+	if (ch > 0)     g_ch = (unsigned)ch;
+	if (buf > 0)    g_buf = (snd_pcm_uframes_t)buf;
+	if (period > 0) g_period = (snd_pcm_uframes_t)period;
+	if (vol >= 0)   g_vol = vol;
+	g_quiet = quiet;
+
+	if (fmt) {
+		if (!strcmp(fmt, "s16le"))      g_fmt = SNDRV_PCM_FORMAT_S16_LE;
+		else if (!strcmp(fmt, "s32le")) g_fmt = SNDRV_PCM_FORMAT_S32_LE;
+		else if (!strcmp(fmt, "s24le")) g_fmt = SNDRV_PCM_FORMAT_S24_LE;
+		else return -2;
+	}
+	g_frame_bytes = g_ch * (g_fmt == SNDRV_PCM_FORMAT_S16_LE ? 2 : 4);
+	if (g_period == 0) g_period = g_buf / 4;
+	if (g_buf < g_period * 2) g_buf = g_period * 2;
+
+	/* 暂停要能打断 ioctl，得让 SIGALRM 不带 SA_RESTART */
+	{
+		struct sigaction sa;
+
+		memset(&sa, 0, sizeof sa);
+		sa.sa_handler = on_alarm;
+		sigemptyset(&sa.sa_mask);
+		sa.sa_flags = 0;
+		sigaction(SIGALRM, &sa, NULL);
+	}
+	signal(SIGPIPE, SIG_IGN);
+
+	if (hw_setup() < 0) {
+		if (pcmfd >= 0) { close(pcmfd); pcmfd = -1; }
+		return -1;
+	}
+	if (!g_quiet)
+		fprintf(stderr, "aout: 内嵌 %s %u Hz %uch buffer=%.0f ms(%lu 帧) period=%.0f ms\n",
+			g_dev, g_rate, g_ch, g_buf * 1000.0 / g_rate,
+			(unsigned long)g_buf, g_period * 1000.0 / g_rate);
+	return 0;
+}
+
+/* 起播放线程：从 infd 读 PCM。返回 0 成功。 */
+int aout_start(int infd)
+{
+	g_in_fd = infd;
+	if (!pcmfd) return -1;
+	if (g_th_on) return 0;
+	if (pthread_create(&g_th, NULL, play_thread, NULL) != 0) return -1;
+	g_th_on = 1;
+	return 0;
+}
+
+void aout_set_paused(int on) { set_pause(on); }
+int  aout_paused(void)
+{
+	int p;
+
+	pthread_mutex_lock(&lk);
+	p = g_paused;
+	pthread_mutex_unlock(&lk);
+	return p;
+}
+
+void aout_set_vol_abs(int v) { set_vol(v); }
+int  aout_vol(void)
+{
+	int v;
+
+	pthread_mutex_lock(&lk);
+	v = g_vol;
+	pthread_mutex_unlock(&lk);
+	return v;
+}
+
+/* 已播毫秒（hw_ptr 折算，不是推算）：视频侧可以拿它当从时钟 */
+long aout_played_ms(void)
+{
+	if (pcmfd < 0) return -1;
+	if (g_frozen_ms >= 0) return g_frozen_ms;
+	return played_frames() * 1000L / (long)g_rate;
+}
+
+int aout_xrun(void)
+{
+	int x;
+
+	pthread_mutex_lock(&lk);
+	x = g_xrun;
+	pthread_mutex_unlock(&lk);
+	return x;
+}
+
+int aout_running(void) { return pcmfd >= 0; }
+
+void aout_stop(void)
+{
+	if (pcmfd < 0) return;
+	g_quit = 1;
+	pthread_cond_broadcast(&cv);
+	if (g_th_on) { pthread_join(g_th, NULL); g_th_on = 0; }
+	ioctl(pcmfd, SNDRV_PCM_IOCTL_DROP, 0);
+	close(pcmfd);
+	pcmfd = -1;
+}
+#endif /* AOUT_EMBED */

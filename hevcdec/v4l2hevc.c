@@ -30,6 +30,8 @@
 
 /* 一个播放器，两种 Renderer：上屏方式在 render_*.c 里，播放器不认识它们 */
 #include "render.h"
+#include "aout.h"	/* 内嵌音频输出（-DAOUT_EMBED 编进来，不再单独一个二进制） */
+#include "pctl.h"	/* 内置控制口 /tmp/play.sock + evdev 遥控（替代 mpvctl/rcinputd） */
 
 /* 内容信号（SEI 里的 maxCLL / mastering display）。这个 TU 出强定义，
  * glout.c 只引用——它的 LUT 也要跟着真实峰值走，不再是写死 1000。 */
@@ -312,6 +314,12 @@ static int g_mark_first;	/* reinit 后等待首帧，打一行供脚本同步 */
 /* 计时：把"纯解码吞吐"从启动/收尾/写盘里剥出来 */
 static int got_queued;
 static double t_first_q, t_last_q, t_first_rx, t_last_rx, t_write_acc, t_tm_acc;
+/* 分解计时：谁在让流水线变慢——读码流(rd)/喂解码器(feed)/等出帧(dq)/
+ * 提交上屏(sub，含 Renderer 内部等 vblank 的配速时间)。
+ * 不算清楚这三项，一卡就只能靠猜是"硬解慢"还是"上屏慢"。
+ */
+static double t_rd_acc, t_dq_acc, t_sub_acc, t_qb_acc, t_poll_acc, t_pump_acc;
+static double t_slp_acc; static int n_slp; static double t_frame0;	/* 播放器自己配速睡觉的时间 */
 static double t_loop;	/* 上一轮主循环的时刻，用来识别"进程被冻住过" */
 
 static int nal_type(const unsigned char *p)
@@ -2016,6 +2024,105 @@ static double g_play_fps = 24.0;	/* 播放配速；0 = 不限速（测吞吐） 
 static double g_play_lead = 6;		/* 解码最多领先上屏几帧（背压） */
 static int g_need_tm;			/* 后端不吃 HDR：播放器侧先 CPU 转 SDR */
 
+/* ---------- 给控制面看的活值（/tmp/play.sock 的 status/pos）----------
+ * 时间轴：t_clock0 是"会话内 0 秒"的墙钟锚点，暂停期间要把它往后推，
+ * 所以真正的时钟是 t_clock0 + pctl_pause_seconds()。位置由这两个算，
+ * 不再是"心跳一行 10 秒"那种粗粒度（遥控器连按时位置不动的观感就是它）。
+ */
+static double g_t_clock0;
+static int    g_au_pub;			/* 已解出 AU 数（诊断用） */
+
+/* ---------- 播放时钟：音频是主钟，视频只从动 ----------
+ * 声音和画面在两个晶振上（ALSA 采样钟 vs 墙钟），拿墙钟按"假定 24fps"
+ * 推画面，长片必然漂 —— 差 0.1% 就是 10 分钟偏 0.6 秒。音频位置是采样级
+ * 的真值（aout_played_ms，hw_ptr 折算），所以画面只问它："第 got 帧该在
+ * 主钟走到哪一刻上屏"，再折回墙钟去睡（带节拍器的后端要一个绝对时刻排
+ * vblank 槽，不带的由这里睡够）。
+ *
+ * 起播锚定：音频线程通常比视频先跑几百毫秒（ffmpeg 先填满 ring），拿绝对
+ * 位置对齐会白丢一截画面。锚在第一帧上，之后才跟音频走。
+ *
+ * 暂停不平移锚点会出事：暂停期间 played_ms 冻住、墙钟照走，resume 后 due
+ * 已经落后一大截，画面会一口气追帧。所以锚点记下当时的累计暂停量，due
+ * 里再加回去。
+ *
+ * 停走保护：声卡 xrun / FIFO 断流时 played_ms 不动，画面不能陪着冻死；
+ * 超过 1s 没动就退回墙钟，等它再动起来重新锚定（不跳帧）。
+ */
+static long   g_pace_ms0 = -1;	/* 锚点：那一帧时的 played_ms */
+static long   g_pace_got0;	/* 锚点帧号 */
+static double g_pace_wall0;	/* 锚点墙钟 */
+static double g_pace_pause0;	/* 锚点时的累计暂停秒数 */
+static long   g_pace_seen;	/* 上次看到的 played_ms */
+static double g_pace_seen_t;	/* played_ms 上次变化的墙钟 */
+
+static double play_due(long got)
+{
+	long ms = aout_played_ms();
+	double now = now_s(), pause = pctl_pause_seconds();
+
+	if (ms >= 0) {
+		if (ms != g_pace_seen) {
+			g_pace_seen = ms;
+			g_pace_seen_t = now;
+		}
+		if (now - g_pace_seen_t <= 1.0) {
+			if (g_pace_ms0 < 0) {
+				g_pace_ms0 = ms;
+				g_pace_got0 = got;
+				g_pace_wall0 = now;
+				g_pace_pause0 = pause;
+			}
+			/* due 只由音频时钟推：锚点墙钟 + 音频走过的时长。
+			 * 早先这里还额外加了 (got-got0)/fps，等于把"帧号进度"
+			 * 和"音频进度"当两笔账一起记，dua 每帧要涨两份
+			 * （2/fps = 83ms @24fps），睡出来的间隔比帧间隔大一倍，
+			 * 24fps 的片子只能跑到 12fps；而且睡久了 ffmpeg 写视频
+			 * 管子被顶住，音频 FIFO 跟着断粮，played_ms 一次跳掉
+			 * 大半个 ring（实测 +100ms 的台阶），xrun 越滚越多。
+			 */
+			{
+				double due = g_pace_wall0 + (pause - g_pace_pause0)
+					     + (double)(ms - g_pace_ms0) / 1000.0;
+				double lim = 2.0 / g_play_fps;
+
+				/* 时钟跳变保护：xrun 恢复 / ring 一次预灌都会让
+				 * played_ms 台阶式前跳，绝对对齐就变成"等它
+				 * 追上来"，画面被硬拖慢。超前超过 2 帧就重锚，
+				 * 宁可少等也不要跟着跳。落后超过 0.3s（音频比
+				 * 画面慢一截）也重锚，避免接着一口气追帧。
+				 */
+				if (due > now + lim || due < now - 0.3) {
+					g_pace_ms0 = ms;
+					g_pace_got0 = got;
+					g_pace_wall0 = now;
+					g_pace_pause0 = pause;
+					return now;
+				}
+				return due;
+			}
+		}
+		g_pace_ms0 = -1;	/* 掉回墙钟，下次音频一动再锚 */
+	} else {
+		g_pace_ms0 = -1;
+	}
+	return g_t_clock0 + pause + got / g_play_fps;
+}
+
+static long pl_pos_ms(void)
+{
+	long ms = aout_played_ms();
+
+	if (g_t_clock0 <= 0) return 0;
+	/* 有音频就以音频位置为准：它才是"听到第几秒"，墙钟只是它的近似 */
+	if (ms >= 0 && g_pace_ms0 >= 0)
+		return (long)((g_pace_wall0 - g_t_clock0 - g_pace_pause0) * 1000.0)
+		       + (ms - g_pace_ms0);
+	return (long)((now_s() - g_t_clock0 - pctl_pause_seconds()) * 1000.0);
+}
+
+static int pl_au(void) { return g_au_pub; }
+
 /* ---------- 上屏路径上报（给"上层"看） ----------
  * 脚本/自检/遥控不该去 grep 日志猜：到底是 DRM 直挂 plane，还是 GLES 导入
  * 纹理再色彩处理；HDR 是播放器 CPU 转还是 shader 转。只有播放器知道真相
@@ -2625,10 +2732,61 @@ abort:
 	return -1;
 }
 
+/* 内建音频：ffmpeg 往 /tmp/play.afifo 写 PCM，这里读出来喂 ALSA。
+ * 声卡打不开不算致命——画面照放，只是没声音（和以前 mpv 起不来一致）。
+ *
+ * 必须在读码流之前就把 fifo 接上：ffmpeg 的多路输出是顺序写的，声音那个
+ * muxer 一开写就阻塞在"没人读的 fifo"上，视频那条被一起带停；而播放器这边
+ * 要先预读 1MB 才解析得出 SPS —— 两边互等，结果就是屏幕一直黑着。
+ * 幂等：调用多次只起一次。
+ */
+static void audio_boot(void)
+{
+	static int done;
+	const char *fifo;
+	int afd;
+
+	if (done) return;
+	done = 1;
+	if (!(getenv("AUDIO") && atoi(getenv("AUDIO")) == 1)) return;
+	fifo = getenv("AUDIO_FIFO");
+	if (!fifo || !*fifo) fifo = "/tmp/play.afifo";
+	/* O_RDWR 而不是 O_RDONLY：自己也算 writer，
+	 * "ffmpeg 还没开口"就不会被读成 EOF 把音频线程送走。
+	 */
+	afd = open(fifo, O_RDWR);
+	if (afd < 0) {
+		printf("AUDIO: 打不开 %s（%s），只放画面\n", fifo, strerror(errno));
+		return;
+	}
+	if (aout_open(48000, 2,
+		      getenv("AUDIO_FMT") ? getenv("AUDIO_FMT") : "s16le",
+		      env_i("AUDIO_BUF", 8192), env_i("AUDIO_PERIOD", 2048),
+		      getenv("AUDIO_VOL") ? atoi(getenv("AUDIO_VOL")) : 100,
+		      0) < 0) {
+		printf("AUDIO: 声卡打不开（被占用？），只放画面\n");
+		close(afd);
+		return;
+	}
+	if (aout_start(afd) < 0) {
+		printf("AUDIO: 音频线程起不来，只放画面\n");
+		close(afd);
+		return;
+	}
+	printf("AUDIO: 内建 aout 48000 Hz 2ch s16le（%s）\n", fifo);
+	atexit(aout_stop);
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	setvbuf(stderr, NULL, _IONBF, 0);
+	/* 客户端模式：player -c status|vol +10|toggle|... 就是 play.sh 的控制入口
+	 * （以前这是 mpvctl 的活）。必须先于一切设备操作，不碰 /dev/video0。
+	 */
+	if (argc > 2 && !strcmp(argv[1], "-c"))
+		return pctl_client(argc - 2, argv + 2);
+
 	const char *path = argc > 1 ? argv[1] : "/tmp/test.265";
 	struct stat st;
 	int sf, au_idx = 0, poll_timeouts = 0, drained = 0, stream_done = 0;
@@ -2663,6 +2821,10 @@ int main(int argc, char **argv)
 		if (sf < 0) die("open stream");
 	}
 	s_fd = sf;
+	/* 先接上声音 fifo 再去预读码流：ffmpeg 那边是顺序写多路输出的，
+	 * 没人读 PCM 就会卡在写 fifo 上，连视频一起停。
+	 */
+	audio_boot();
 	if (sf != STDIN_FILENO && !fstat(sf, &st))
 		printf("input: %s (%.2f GB)\n", path, st.st_size / 1073741824.0);
 	else
@@ -2742,6 +2904,19 @@ int main(int argc, char **argv)
 		if (!rend)
 			die("render_open");
 		t_play0 = now_s();
+		printf("PACE: render_has_pace=%d fps=%.2f lead=%.1f\n",
+		       render_has_pace(rend), g_play_fps, g_play_lead);
+		g_t_clock0 = t_play0;
+
+		/* 控制面起来：/tmp/play.sock（play.sh 用 `player -c ...` 说话）
+		 * + evdev 遥控。盒上不再有 mpvctl / rcinputd 两个常驻件。
+		 */
+		pctl_set_sources(pl_pos_ms, pl_au);
+		pctl_start();
+		atexit(pctl_stop);
+
+		/* 声音一般已经在 main 开头 audio_boot() 起好了；这里兜底一次 */
+		audio_boot();
 	}
 	if (getenv("PLAY") && !render_has_hdr(rend))
 		/* 这条后端不吃 PQ/BT.2020：HDR 源先在这边 CPU 转 SDR */
@@ -2765,6 +2940,15 @@ int main(int argc, char **argv)
 	for (;;) {
 		struct pollfd pf = { .fd = fd, .events = POLLIN };
 		int pr;
+
+		/* 暂停：不喂流也不上屏，音频由 pctl 同步停写。上游 ffmpeg 被管子
+		 * 顶住（-re 供流本来就是阻塞的）——不需要再 SIGSTOP 整个进程组，
+		 * 也就不会再有"冻住过"那种要靠 HERE 时钟猜的误判。
+		 */
+		if (pctl_paused()) {
+			usleep(20000);
+			continue;
+		}
 
 		/* 进程被冻住过的识别：tvplay 的"暂停"就是 pkill -STOP 整条链，
 		 * 冻住的这段时间 CLOCK_MONOTONIC 照走，而循环一轮都没转。
@@ -2894,7 +3078,12 @@ int main(int argc, char **argv)
 			if (g_play_fps > 0 && g_play_lead > 0 &&
 			    au_idx - got >= g_play_lead)
 				break;
-			r = stream_next_au(&ap, &al);
+			{
+				double tr = now_s();
+
+				r = stream_next_au(&ap, &al);
+				t_rd_acc += now_s() - tr;
+			}
 			if (r < 0)
 				break;		/* seek 打断：回主循环处理重建 */
 			if (r == 0) {
@@ -2929,7 +3118,12 @@ int main(int argc, char **argv)
 			} else if (r == 2) {
 				t_last_rx = now_s();
 			}
-			qbuf_au(ap, al, r == 2);
+			{
+				double tq2 = now_s();
+
+				qbuf_au(ap, al, r == 2);
+				t_qb_acc += now_s() - tq2;
+			}
 			au_idx++;
 			idle_ticks = 0;
 		}
@@ -2957,7 +3151,12 @@ int main(int argc, char **argv)
 			}
 		}
 
-		pr = poll(&pf, 1, drained ? 50 : (out_nfree ? 2000 : 100));
+		{
+			double tp = now_s();
+
+			pr = poll(&pf, 1, drained ? 50 : (out_nfree ? 2000 : 100));
+			t_poll_acc += now_s() - tp;
+		}
 		if (pr < 0) {
 			/* SIGUSR1 会打断 poll。以前这里直接 break 退主循环，
 			 * 表现是"seek 偶发卡 3s 后解码器消失"——信号恰好落在
@@ -3051,9 +3250,17 @@ int main(int argc, char **argv)
 			b.m.planes = pl;
 			double t_rx;
 
-			if (xioctl(fd, VIDIOC_DQBUF, &b) < 0)
-				break;
+			{
+				double td = now_s();
+				int qr;
+
+				qr = xioctl(fd, VIDIOC_DQBUF, &b);
+				t_dq_acc += now_s() - td;
+				if (qr < 0)
+					break;
+			}
 			t_rx = now_s();
+			t_frame0 = t_rx;
 			if (g_mark_first) {
 				g_mark_first = 0;
 				g_err_rec = 0;	/* 真的出帧了，自愈计数归零 */
@@ -3102,11 +3309,15 @@ int main(int argc, char **argv)
 				 * 回调里 cap_recycle 会把它清掉，撤不回来就永远别再 QBUF。
 				 */
 				cap_busy[b.index] = 1;
+				{
+				double ts = now_s();
 				rc = render_submit(rend, capbuf[b.index].dmabuf,
 						   capw, caph, capw, capw,
 						   (g_play_fps > 0 && render_has_pace(rend)) ?
-						   t_play0 + got / g_play_fps : 0,
+						   play_due(got) : 0,
 						   &capbuf[b.index]);
+				t_sub_acc += now_s() - ts;
+				}
 				if (rc >= 0) {
 					static int yn;
 					if (getenv("YSTAT") && yn < 5 &&
@@ -3147,11 +3358,20 @@ int main(int argc, char **argv)
 #endif
 			/* 后端没有节拍器（同步后端不会自己等）：配速归播放器 */
 			if (rend && g_play_fps > 0 && !render_has_pace(rend)) {
-				double due = t_play0 + got / g_play_fps;
+				double due = play_due(got);
 				double nn = now_s();
 
-				if (due > nn)
+				if (due > nn) {
 					usleep((useconds_t)((due - nn) * 1e6));
+					t_slp_acc += now_s() - nn;
+					n_slp++;
+				}
+				if (getenv("PACEDBG") && got < 40)
+					printf("PACEDBG got=%ld audio_ms=%ld due_now=%.3f "
+					       "sleep_ms=%.1f sub_ms=%.1f\n",
+					       (long)got, aout_played_ms(), due - nn,
+					       (due > nn ? (due - nn) * 1000.0 : 0.0),
+					       (now_s() - t_frame0) * 1000.0);
 			}
 			/* 每解出一帧就推一次：解码器一次 DQBUF 可能连吐多帧（DPB
 			 * 重排），pump 只在轮末调的话会把攒下的几帧在同一个 vblank
@@ -3159,6 +3379,7 @@ int main(int argc, char **argv)
 			if (rend)
 				render_pump(rend, 0);
 			got++;
+			g_au_pub = got;
 			/* 自愈路径的确定性验证开关：FORCEREINIT=300 在第 300 帧
 			 * 主动走一遍"固件 hang → 整块复位 → 等 IRAP"流程，
 			 * 用来确认重建后能真的接着解，而不是干等（正常播放时
@@ -3183,8 +3404,12 @@ int main(int argc, char **argv)
 
 		/* 兜底再推一次（每帧的那次在解帧处已经调过）：这里不阻塞，
 		 * 只把还没翻掉的一并清掉，免得轮末还挂着帧。 */
-		if (rend)
+		if (rend) {
+			double tpu = now_s();
+
 			render_pump(rend, 0);
+			t_pump_acc += now_s() - tpu;
+		}
 
 		/* recycle output buffers */
 		for (;;) {
@@ -3236,6 +3461,17 @@ int main(int argc, char **argv)
 		double feed = t_last_q - t_first_q;
 		double decode_busy = active - t_write_acc - t_tm_acc;
 
+		printf("SPLIT read=%.3fs qbuf=%.3fs dq=%.3fs submit=%.3fs "
+		       "poll=%.3fs pump=%.3fs sleep=%.3fs(%d) frames=%d\n",
+		       t_rd_acc, t_qb_acc, t_dq_acc, t_sub_acc,
+		       t_poll_acc, t_pump_acc, t_slp_acc, n_slp, got);
+		printf("SPLIT2 per-frame: read=%.2fms dq=%.2fms sub=%.2fms "
+		       "poll=%.2fms pump=%.2fms\n",
+		       t_rd_acc * 1000.0 / (got_queued ? got_queued : 1),
+		       t_dq_acc * 1000.0 / (got ? got : 1),
+		       t_sub_acc * 1000.0 / (got ? got : 1),
+		       t_poll_acc * 1000.0 / (got ? got : 1),
+		       t_pump_acc * 1000.0 / (got ? got : 1));
 		printf("PHASE feed=%.3fs  active=%.3fs  tail=%.3fs  write=%.3fs  eos=%d\n",
 		       feed, active, wall - active - (t_first_rx - t0),
 		       t_write_acc, eos_seen);

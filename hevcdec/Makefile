@@ -34,21 +34,21 @@ GL_LIBS  := $(CROSSLIB)/libEGL.so.1 $(CROSSLIB)/libGLESv2.so.2 $(CROSSLIB)/libgb
 GL_CFLAGS := -O2 -Wall -Wformat
 
 # 播放器 = 主循环 + Renderer 分发 + 两个后端 + vout
-PLAY_SRC := v4l2hevc.c spscolor.c render.c render_drm.c render_gl.c vout.c
-PLAY_HDR := render.h vout.h hdrcolor.inc csig.h spscolor.h
+PLAY_SRC := v4l2hevc.c spscolor.c render.c render_drm.c render_gl.c vout.c aout.c pctl.c
+PLAY_HDR := render.h vout.h hdrcolor.inc csig.h spscolor.h aout.h pctl.h
 
-.PHONY: all clean drm gl vout voutprobe glselftest aout aoutprobe hdrselftest
+.PHONY: all clean drm gl vout voutprobe glselftest aout aoutprobe hdrselftest mpvctl rcd
 
 all: $(BIN)
 
 # 本机：只有 drm 后端（没有 EGL/GBM 开发包），render_gl.c 编成 stub
 ifeq ($(CROSS),0)
 $(BIN): $(PLAY_SRC) $(PLAY_HDR)
-	$(CC) $(CFLAGS) -DUSE_DRM -o $@ $(PLAY_SRC) $(LDLIBS)
+	$(CC) $(CFLAGS) -DUSE_DRM -DAOUT_EMBED -pthread -o $@ $(PLAY_SRC) $(LDLIBS)
 else
 # aarch64：两个后端都在同一个二进制里，运行期 RENDER= 选
 $(BIN): $(PLAY_SRC) glout.c $(PLAY_HDR) $(GL_LIBS)
-	$(CC) $(GL_CFLAGS) -DUSE_DRM -DHAVE_GLOUT -DGLOUT_NO_MAIN -o $@ \
+	$(CC) $(GL_CFLAGS) -DUSE_DRM -DAOUT_EMBED -DHAVE_GLOUT -DGLOUT_NO_MAIN -pthread -o $@ \
 	  $(PLAY_SRC) glout.c \
 	  -idirafter /usr/include -idirafter /usr/include/libdrm -lm $(GL_LIBS)
 endif
@@ -76,6 +76,20 @@ $(AOUT_BIN): aout.c
 	$(CC) -O2 -Wall -pthread -static -o $@ $<
 
 $(AOUTCTL_BIN): aoutctl.c
+	$(CC) -O2 -Wall -static -o $@ $<
+
+# mpvctl：给音频 mpv 的 --input-ipc-server 发一行命令（音量/静音/quit 全靠它）
+# 二进制名随 CROSS 变：一个目标名只能有一条规则，否则 make 会报警覆盖配方。
+MPVCTL_BIN := mpvctl$(if $(filter 1,$(CROSS)),-aarch64,)
+RC_BIN     := rcinputd$(if $(filter 1,$(CROSS)),-aarch64,)
+
+mpvctl: $(MPVCTL_BIN)
+$(MPVCTL_BIN): mpvctl.c
+	$(CC) -O2 -Wall -static -o $@ $<
+
+# 遥控器守护：evdev → /tmp/play.sh key <动作>
+rcd: $(RC_BIN)
+$(RC_BIN): rcinputd.c
 	$(CC) -O2 -Wall -static -o $@ $<
 
 # 硬件能力探测（period/buffer 上限、大 buffer 能不能压掉 xrun）
@@ -129,4 +143,5 @@ clean:
 	      v4l2hevc-gl-aarch64 glout glout-aarch64 *.yuv \
 	      glselftest glselftest-aarch64 \
 	      aout aout-aarch64 aoutctl aoutctl-aarch64 aoutprobe-aarch64 \
+	      mpvctl mpvctl-aarch64 rcinputd rcinputd-aarch64 \
 	      vout.o vout-aarch64.o voutprobe voutprobe-aarch64 raptest hdr-selftest hcvisual
