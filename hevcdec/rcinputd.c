@@ -24,13 +24,18 @@
 #include <linux/input.h>
 
 #define MAXDEV 16
-#define NODE_DEFAULT "/tmp/play.sh"
+/* play.sh 现在跟二进制一起放 /root（重启不丢），/tmp 只留临时调试的副本 */
+#define NODE_DEFAULT "/root/play.sh"
+#define NODE_LEGACY "/tmp/play.sh"
 #define NODE NODE_DEFAULT	/* 兼容旧引用；实际用 node_path() */
 static const char *node_path(void)
 {
 	const char *p = getenv("RC_NODE");
 
-	return (p && *p) ? p : NODE_DEFAULT;
+	if (p && *p)
+		return p;
+	/* 没设就按新位置走，老盒子（只有 /tmp 副本）自动退回 */
+	return access(NODE_DEFAULT, X_OK) == 0 ? NODE_DEFAULT : NODE_LEGACY;
 }
 #define LOGF "/tmp/tvplay-rc.log"
 
@@ -259,7 +264,11 @@ int main(int argc, char **argv)
 					continue;
 				}
 				if (ev[k].type != EV_KEY) continue;
-				if (ev[k].value == 0) continue;
+				/* 修饰键必须排在 value==0 之前处理：遥控器发 Ctrl+数字，
+				 * Ctrl 的"松开"就是 value=0，以前那行 continue 在它前面，
+				 * mods 一旦置上就再也清不掉（M_CTRL 永远挂着），
+				 * Ctrl+2..5 于是全部匹配失败 → 音量/静音键整排失效。
+				 */
 				{
 					int m = mod_of(ev[k].code);
 
@@ -269,6 +278,7 @@ int main(int argc, char **argv)
 						continue;
 					}
 				}
+				if (ev[k].value == 0) continue;
 				/* 这块板子的遥控器有些键会报出离谱的 value
 				 * （如 code=4 val=458976，把菜单键刷成连发），只认 1/2 */
 				if (ev[k].value > 2) continue;

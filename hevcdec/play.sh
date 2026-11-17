@@ -22,7 +22,15 @@
 #   容器 → Annex-B  ffmpeg -c copy -f hevc，首包才有 start code、SPS 才读得出来
 set -u
 
-BIN=${BIN:-/tmp/v4l2hevc-aarch64}
+# 播放器位置：部署在 /root（重启不丢，不再靠 rcup 往 /tmp 补）。
+# 老盒子/临时调试的 /tmp 副本仍然认，BIN 显式给了就以它为准。
+if [ -z "${BIN:-}" ]; then
+	for _b in /root/v4l2hevc-aarch64 /tmp/v4l2hevc-aarch64 \
+	          "$(dirname "$0")/v4l2hevc-aarch64" /tmp/v4l2hevc; do
+		[ -x "$_b" ] && { BIN=$_b; break; }
+	done
+	BIN=${BIN:-/root/v4l2hevc-aarch64}
+fi
 LOG=${LOG:-/tmp/play.log}
 PIDF=${PIDF:-/tmp/play.pid}
 STATE=${STATE:-/tmp/play.state}
@@ -292,7 +300,7 @@ do_play() {
 	*) [ -f "$SRC" ] || [ -r "$SRC" ] || die "片源不存在：$SRC$(
 		case "$SRC_REMOTE" in 1) echo "（NAS 地址已解析，检查 .env 的 WEBDAV_*）" ;; esac)" ;;
 	esac
-	[ -x "${BIN:-/tmp/v4l2hevc-aarch64}" ] || die "找不到播放器：$BIN（scp 到盒子上，或用 -B 指定）"
+	[ -x "$BIN" ] || die "找不到播放器：$BIN（scp 到盒子上，或用 -B 指定）"
 
 	case "$SS" in ''|*[!0-9.]*) die "起播秒不是数字：$SS" ;; esac
 	case "$DUR" in ''|*[!0-9.]*) die "时长不是数字：$DUR" ;; esac
@@ -327,9 +335,9 @@ do_play() {
 		_safe=$(printf '%s' "$SRC" | sed 's#://\([^:/@]*\):[^@]*@#://\1:***@#')
 		printf '片源：%s\n' "$_safe"
 		[ "$SRC_REMOTE" = 1 ] && printf '来源：NAS %s（认证取 %s）\n' "$NAS_URL" "${ENVF:-环境变量}"
-		printf '播放器：%s\n' "${BIN:-/tmp/v4l2hevc-aarch64}"
+		printf '播放器：%s\n' "$BIN"
 		printf '命令：ffmpeg -re %s-i "%s" -map 0:v:0 -c:v copy -f hevc - | %s -\n' \
-			"${SS:+-ss $SS }" "$_safe" "${BIN:-/tmp/v4l2hevc-aarch64}"
+			"${SS:+-ss $SS }" "$_safe" "$BIN"
 		return 0
 	fi
 
@@ -394,7 +402,7 @@ else
 		${SS:+-ss "$SS"} $DA $HTTP_OPT \
 		-i "$SRC" -map 0:v:0 -c:v copy -f hevc - $AF 2>>"$LOG"
 fi | PLAY=1 NOWRITE=1 RENDER="$RENDER" SCALE="$SCALE" PLAY_SOCK="$SOCK" \
-	"${BIN:-/tmp/v4l2hevc-aarch64}" - >>"$LOG" 2>&1'
+	"$BIN" - >>"$LOG" 2>&1'
 
 	# </dev/null：不然 ssh 远端起播时子进程握着 stdin，ssh 永远等不到 EOF
 	# 外层 sh 也要重定向：否则它握着调用者的 stdout，ssh 远端起播会一直等 EOF
@@ -423,7 +431,7 @@ fi | PLAY=1 NOWRITE=1 RENDER="$RENDER" SCALE="$SCALE" PLAY_SOCK="$SOCK" \
 	# 重启参数只能从 state 里取（播放进程自己不记得是从哪部片子来的）。
 	umask 077	# state 里存着带凭据的源地址（SRCB64），别人别读
 	{
-		printf 'VPID=%s\nAPID=%s\nSS=%s\nDUR=%s\nBIN=%s\n' "$VPID" "$APID" "$SS" "$DUR" "${BIN:-/tmp/v4l2hevc-aarch64}"
+		printf 'VPID=%s\nAPID=%s\nSS=%s\nDUR=%s\nBIN=%s\n' "$VPID" "$APID" "$SS" "$DUR" "$BIN"
 		printf 'LOGF=%s\nSOCK=%s\nAUDIO=%s\nRENDER=%s\nSCALE=%s\nFPS=%s\n' \
 			"$LOG" "$SOCK" "$AUDIO" "$RENDER" "$SCALE" "${FPS:-}"
 		printf 'SRCB64=%s\n' "$(enc "$SRC")"
@@ -453,7 +461,7 @@ fi | PLAY=1 NOWRITE=1 RENDER="$RENDER" SCALE="$SCALE" PLAY_SOCK="$SOCK" \
 # 地方。没有控制口（老二进制）才退回冻进程组。
 pctl() {	# pctl <命令...>
 	[ -S "${SOCK:-/nonexist}" ] || return 1
-	PCTL_ECHO=1 PLAY_SOCK="$SOCK" "${BIN:-/tmp/v4l2hevc-aarch64}" -c "$@" 2>/dev/null
+	PCTL_ECHO=1 PLAY_SOCK="$SOCK" "$BIN" -c "$@" 2>/dev/null
 }
 
 # 当前是不是暂停：优先问播放器（它自己记着 pause 状态），
@@ -627,7 +635,7 @@ do_key() {
 		PLAY_OSD="位置 $(fmt_pos "$T")"
 		export PLAY_OSD
 		setsid sh "$0" -d -a "${AUDIO:-1}" -r "${RENDER:-gl}" -s "${SCALE:-fit}" \
-			${FPS:+-f "$FPS"} -B "${BIN:-/tmp/v4l2hevc-aarch64}" \
+			${FPS:+-f "$FPS"} -B "$BIN" \
 			"$SRC" "$T" "$_r" >/dev/null 2>&1 </dev/null
 		# 暂停中拖动：重开后再压回去，保持"暂停"语义
 		if [ "$_WAS" = 1 ]; then sleep 0.5; load_state && do_pause; fi
