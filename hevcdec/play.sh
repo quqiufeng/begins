@@ -443,11 +443,16 @@ fi | PLAY=1 NOWRITE=1 RENDER="$RENDER" SCALE="$SCALE" PLAY_SOCK="$SOCK" \
 		say "开始：$SRC  ${SS}s → $((SS + DUR))s（$DUR 秒），后端 $RENDER"
 	fi
 	sleep 1.5
-	# 上屏成功与否只看日志里的这两行，别靠"屏幕亮了没"
-	if grep -q '^PLAY: \(plane=\|renderer=\)' "$LOG" 2>/dev/null; then
-		sed -n 's/^PLAY: /  /p' "$LOG" | head -1
+	# 上屏判据只认渲染器握手的这两行，别靠"屏幕亮了没"：
+	#   RENDER: gl (caps hdr)            ← 后端初始化完立刻打，1.5s 时必有
+	#   RENDER: mode=gles tonemap=… src= ← 首帧配置完打
+	# PLAY: renderer= 是播完才出的收尾统计，拿它当判据必然误报（老版本的
+	# PLAY: plane= 更是早就不打了）。三者都认，只为兼容旧二进制。
+	if grep -qE '^RENDER: [A-Za-z0-9_]+ \(caps|^RENDER: mode=|^PLAY: (plane=|renderer=|submit=)' "$LOG" 2>/dev/null; then
+		grep -m2 -E '^RENDER: ([A-Za-z0-9_]+ \(caps|mode=)' "$LOG" | sed 's/^RENDER: /  /'
+		grep -m1 -E '^PLAY: ' "$LOG" | sed 's/^PLAY: /  /'
 	else
-		say "警告：日志里没有 PLAY: plane=/renderer= 行，可能没上屏"
+		say "警告：日志里没有 RENDER: <后端> (caps …) 行，渲染器没起来，可能没上屏"
 		say "      先看 $LOG，再查 head -4 /sys/kernel/debug/dri/0/state"
 	fi
 	return 0
