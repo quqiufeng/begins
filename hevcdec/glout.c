@@ -266,7 +266,12 @@ static const char *VS2 =
 	"  gl_Position = vec4(aPos,0.0,1.0);\n"
 	"}\n";
 
-static const char *FS =
+/* 旧版每像素两次 sin() 生成抖动噪声：Mali-G31 上 sin 是 4~8 周期的超
+ * 周期指令，1080p 2M 像素就是 16 个周期/像素级别，实测占 pass1 的
+ * 1/3 以上。抖动的目的只是打散 8bit 输出的色带，用一张 64x64 噪声贴图
+ * （4KB）查表就够，NEAREST + REPEAT 命中纹理缓存几乎免费。
+ */
+static const char *FS_SIN =
 	"#version 300 es\n"
 	"precision highp float;\n"
 	"uniform sampler2D uY, uC, uLut;\n"
@@ -297,6 +302,33 @@ static const char *FS =
 	"  oCol = vec4(clamp(o, 0.0, 1.0), 1.0);\n"
 	"}\n";
 
+/* 默认着色器：和 FS_SIN 逐项等价，只有抖动改成查噪声贴图。 */
+static const char *FS =
+	"#version 300 es\n"
+	"precision highp float;\n"
+	"uniform sampler2D uY, uC, uLut, uNoise;\n"
+	"uniform float uSat;\n"
+	"uniform mat3 uGm;\n"
+	"in vec2 vUV;\n"
+	"out vec4 oCol;\n"
+	"void main(){\n"
+	"  float y8 = texture(uY, vUV).r * 255.0;\n"
+	"  vec2  c8 = texture(uC, vUV).rg * 255.0;\n"
+	"  vec2  l  = texture(uLut, vec2(y8/255.0, 0.5)).rg;\n"
+	"  float Y1 = (l.r * 255.0 - 16.0) / 219.0;\n"
+	"  float gain = l.g;\n"
+	"  float cb = (c8.x - 128.0) / 224.0 * gain;\n"
+	"  float cr = (c8.y - 128.0) / 224.0 * gain;\n"
+	"  vec3 rgb = vec3(Y1 + 1.47460 * cr,\n"
+	"                  Y1 - 0.16455 * cb - 0.57135 * cr,\n"
+	"                  Y1 + 1.88140 * cb);\n"
+	"  vec3 o = clamp(uGm * rgb, 0.0, 1.0);\n"
+	"  float lum = dot(o, vec3(0.2126, 0.7152, 0.0722));\n"
+	"  o = mix(vec3(lum), o, uSat);\n"
+	"  o += (texture(uNoise, gl_FragCoord.xy * 0.0078125).r - 0.5) / 255.0;\n"
+	"  oCol = vec4(clamp(o, 0.0, 1.0), 1.0);\n"
+	"}\n";
+
 
 /* 源色域→709 的 3x3 上到 uGm。系数本身在 hdrcolor.inc（hc_mat），和软映射
  * 是同一组数：以前这里手抄了九个数，P3 片要么走错矩阵要么全无。GLSL 的
@@ -313,7 +345,7 @@ static void gm_upload(GLuint prog)
 	glUniformMatrix3fv(glGetUniformLocation(prog, "uGm"), 1, GL_FALSE, c);
 }
 
-static const char *FSV[11] = {NULL};
+static const char *FSV[12] = {NULL};
 static void build_fsv(void)
 {
 	FSV[0] = FS;			/* 全功能 */
@@ -424,6 +456,8 @@ static void build_fsv(void)
 		" o += (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233)))*43758.5453)+fract(sin(dot(gl_FragCoord.yx+vec2(71.0,13.0), vec2(39.3467,11.1351)))*24634.6345)-1.0)/255.0;"
 		" oCol = vec4(clamp(o,0.0,1.0),1.0); }\n";
 
+	FSV[11] = FS_SIN;		/* 旧的两次 sin 抖动，留着 A/B */
+
 	FSV[10] = "#version 300 es\nprecision highp float;\n"
 		"uniform sampler2D uY, uC;\n"
 		"uniform float uPc[12], uSat;\n"
@@ -499,7 +533,7 @@ static struct {
 	EGLContext ctx;
 	EGLSurface surf;
 	EGLConfig cfg;
-	GLuint prog, tex_y, tex_c, tex_lut, vao, vbo;
+	GLuint prog, tex_y, tex_c, tex_lut, tex_noise, vao, vbo;
 	unsigned sw, sh;		/* 源尺寸 */
 	unsigned dw, dh;		/* 屏幕尺寸 */
 	int dx, dy;
@@ -523,7 +557,7 @@ static struct {
 	 *   lock    gbm_surface_lock_front_buffer（没空闲 bo 会在这里阻塞）
 	 *   flip    请求翻页 → flip 完成事件（含 SetCrtc 兜底）
 	 */
-	double s_swap, s_lock, s_flip;
+	double s_swap, s_lock, s_flip, s_in, s_draw;
 	unsigned s_n;
 	int split;
 	/* 每块 dmabuf 一纹理。EGLImage 必须一起存：Mali 上 img 拿着
@@ -726,6 +760,34 @@ int glout_init(unsigned sw, unsigned sh)
 }
 
 /* LUT 纹理上传 + 采样参数（初始化一次；SEI 峰值后到时重建也走这条） */
+/* 抖动噪声贴图：128x128 R8，NEAREST+REPEAT，命中纹理缓存基本免费。
+ * 内容用 LCG 生成成"蓝噪声近似"（打散 + 固定种子），不做逐帧变化——
+ * 抖动只为了打散 8bit 色带，逐帧变化反而会闪。
+ */
+static void noise_upload(void)
+{
+	unsigned char n[128 * 128];
+	unsigned i, x = 12345;
+
+	for (i = 0; i < sizeof(n); i++) {
+		x = x * 1103515245u + 12345u;
+		/* 三角分布：两个均匀相加，均值 0.5，比纯均匀少一半的抖动能量 */
+		unsigned a = (x >> 16) & 0xff, b = (x >> 8) & 0xff;
+
+		n[i] = (unsigned char)((a + b) >> 1);
+	}
+	glGenTextures(1, &g.tex_noise);
+	glBindTexture(GL_TEXTURE_2D, g.tex_noise);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, 128, 128, 0, GL_RED,
+		     GL_UNSIGNED_BYTE, n);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+}
+
 static void lut_upload(const float *lut)
 {
 	glBindTexture(GL_TEXTURE_2D, g.tex_lut);
@@ -796,7 +858,7 @@ static int glout_gl_init(void)
 		const char *v = getenv("GLFS");
 		int k = v ? atoi(v) : 0;
 
-		if (k < 0 || k > 10) k = 0;
+		if (k < 0 || k > 11) k = 0;
 		g.prog = mk_prog(VS, FSV[k]);
 		if (k) printf("GLOUT: FS 变体 %d\n", k);
 	}
@@ -809,6 +871,7 @@ static int glout_gl_init(void)
 	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)0);
 	glGenTextures(1, &g.tex_lut);
 	lut_upload(lut);
+	noise_upload();
 	g.tex_y = 0;
 	g.tex_c = 0;
 	return 0;
@@ -1116,6 +1179,7 @@ static int twopass_frame(unsigned w, unsigned h)
 {
 	unsigned dW, dH, pw, ph;
 	double ar_s, ar_d, t0 = now_s();
+	double tA = t0, tB = t0, tC = t0, tD = t0, tE = t0;
 	int dx, dy;
 
 	if (!g.prog2) {
@@ -1175,34 +1239,59 @@ static int twopass_frame(unsigned w, unsigned h)
 	glBindTexture(GL_TEXTURE_2D, g.tex_c);
 	glActiveTexture(GL_TEXTURE2);
 	glBindTexture(GL_TEXTURE_2D, g.tex_lut);
+	glActiveTexture(GL_TEXTURE3);
+	glBindTexture(GL_TEXTURE_2D, g.tex_noise);
+	glActiveTexture(GL_TEXTURE0);
 	glUniform1i(glGetUniformLocation(g.prog, "uY"), 0);
 	glUniform1i(glGetUniformLocation(g.prog, "uC"), 1);
 	glUniform1i(glGetUniformLocation(g.prog, "uLut"), 2);
+	glUniform1i(glGetUniformLocation(g.prog, "uNoise"), 3);
 	glUniform1f(glGetUniformLocation(g.prog, "uSat"), (float)tp.sat);
 	gm_upload(g.prog);
 	glUniform1fv(glGetUniformLocation(g.prog, "uPc"), 12, poly_c);
 	glUniform1fv(glGetUniformLocation(g.prog, "uPg"), 12, poly_g);
 	glBindVertexArray(g.vao);
+	tB = now_s();
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	tC = now_s();
 	/* pass2 */
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	glViewport(0, 0, g.dw, g.dh);
-	glClearColor(0, 0, 0, 1);
-	glClear(GL_COLOR_BUFFER_BIT);
 	ar_s = (double)w / h;
 	ar_d = (double)g.dw / g.dh;
 	if (ar_s > ar_d) { dW = g.dw; dH = (unsigned)(g.dw / ar_s + 0.5) & ~1u; }
 	else { dH = g.dh; dW = (unsigned)(g.dh * ar_s + 0.5) & ~1u; }
 	dx = (g.dw - dW) / 2;
 	dy = (g.dh - dH) / 2;
+	glClearColor(0, 0, 0, 1);
+	glClear(GL_COLOR_BUFFER_BIT);
 	glViewport(dx, g.dh - dy - dH, dW, dH);
 	glUseProgram(g.prog2);
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, g.tex_rgb);
 	glUniform1i(glGetUniformLocation(g.prog2, "uTex"), 0);
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	tD = now_s();
 	osd_draw();		/* 提示条在屏幕坐标里，两 pass 之后再合成 */
+	tE = now_s();
 	gpu_done(t0);		/* twopass 也要记，别只记单 pass */
+	{
+		static long n;
+		static double ab, bc, cd, de, ef;
+		static int on = -1;
+
+		if (on < 0) on = getenv("GLOUT_T") ? 1 : 0;
+		if (on) {
+			double te = now_s();
+
+			ab += tB - tA; bc += tC - tB; cd += tD - tC;
+			de += tE - tD; ef += te - tE;
+			if (++n % 60 == 0)
+				printf("GLIN setup=%.1f p1=%.1f p2=%.1f osd=%.1f "
+				       "fin=%.1f ms/帧\n", ab / n * 1000,
+				       bc / n * 1000, cd / n * 1000,
+				       de / n * 1000, ef / n * 1000);
+		}
+	}
 	return 0;
 }
 
@@ -1213,6 +1302,7 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 	unsigned fbr, dW, dH;
 	int dx, dy;
 	double ar_s, ar_d;
+	double tg0 = 0, tg1 = 0, tg2 = 0, tg3 = 0, tg4 = 0, tg5 = 0;
 
 	if (!g.inited) {
 		printf("GLOUT: glout_frame 但未 inited (errno=%d %s)\n",
@@ -1227,6 +1317,7 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 			return -1;
 		}
 	}
+	tg0 = now_s();
 	tm_peak_sync();	/* 峰值后到就重建 LUT（每帧两次比较） */
 	if (w != g.sw || h != g.sh) {
 		drop_tex();
@@ -1278,6 +1369,7 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 		g.tex_y = g.tc[k].ty;
 		g.tex_c = g.tc[k].tc;
 	}
+	tg1 = now_s();
 	if (g.twopass) {
 		g.last_fy = fd_y;
 		g.last_fc = fd_c;
@@ -1311,9 +1403,13 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 	glBindTexture(GL_TEXTURE_2D, g.tex_c);
 	glActiveTexture(GL_TEXTURE2);
 	glBindTexture(GL_TEXTURE_2D, g.tex_lut);
+	glActiveTexture(GL_TEXTURE3);
+	glBindTexture(GL_TEXTURE_2D, g.tex_noise);
+	glActiveTexture(GL_TEXTURE0);
 	glUniform1i(glGetUniformLocation(g.prog, "uY"), 0);
 	glUniform1i(glGetUniformLocation(g.prog, "uC"), 1);
 	glUniform1i(glGetUniformLocation(g.prog, "uLut"), 2);
+	glUniform1i(glGetUniformLocation(g.prog, "uNoise"), 3);
 	glUniform1f(glGetUniformLocation(g.prog, "uSat"), (float)tp.sat);
 	gm_upload(g.prog);
 	glUniform1fv(glGetUniformLocation(g.prog, "uPc"), 12, poly_c);
@@ -1335,6 +1431,7 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 	osd_draw();
 
 swap:
+	tg2 = now_s();
 	dump_frame();
 	{
 		double ts = now_s(), dt;
@@ -1348,6 +1445,7 @@ swap:
 		g.tsum += dt;
 		g.s_swap += dt;
 		ps_add(&g.h_swap, dt * 1000.0);
+		tg3 = now_s();
 	}
 	if (0) {
 		printf("GLOUT: swap 失败 0x%x\n", eglGetError());
@@ -1358,6 +1456,7 @@ swap:
 
 		bo = gbm_surface_lock_front_buffer(g.gs);
 		g.s_lock += now_s() - tl;
+		tg4 = now_s();
 	}
 	if (!bo) { printf("GLOUT: lock_front 失败\n"); g.drops++; return -1; }
 	fbr = gbm_bo_get_user_data(bo) ? *(uint32_t *)gbm_bo_get_user_data(bo) : 0;
@@ -1424,6 +1523,7 @@ swap:
 		}
 	}
 	g.s_flip += now_s() - tf;
+	tg5 = now_s();
 	}
 	if (g.prev_bo && g.prev_bo != bo) {
 		gbm_surface_release_buffer(g.gs, g.prev_bo);
@@ -1431,11 +1531,21 @@ swap:
 	}
 	g.prev_bo = bo;
 	g.frames++;
+	if (g.split) {
+		g.s_in += tg1 - tg0;
+		g.s_draw += tg2 - tg1;
+	} else {
+		g.s_in = g.s_draw = 0;
+	}
 	if (g.split && ++g.s_n >= 60) {
-		printf("GLSPLIT swap=%.1f lock=%.1f flip=%.1f ms/帧 (n=%u)\n",
+		printf("GLSPLIT in=%.1f draw=%.1f swap=%.1f lock=%.1f flip=%.1f "
+		       "sum=%.1f ms/帧 (n=%u)\n",
+		       g.s_in / g.s_n * 1000.0, g.s_draw / g.s_n * 1000.0,
 		       g.s_swap / g.s_n * 1000.0, g.s_lock / g.s_n * 1000.0,
-		       g.s_flip / g.s_n * 1000.0, g.frames);
-		g.s_swap = g.s_lock = g.s_flip = 0;
+		       g.s_flip / g.s_n * 1000.0,
+		       (g.s_in + g.s_draw + g.s_swap + g.s_lock + g.s_flip) /
+		       g.s_n * 1000.0, g.frames);
+		g.s_swap = g.s_lock = g.s_flip = g.s_in = g.s_draw = 0;
 		g.s_n = 0;
 	}
 	return 0;

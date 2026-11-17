@@ -320,6 +320,9 @@ static double t_first_q, t_last_q, t_first_rx, t_last_rx, t_write_acc, t_tm_acc;
  * 不算清楚这三项，一卡就只能靠猜是"硬解慢"还是"上屏慢"。
  */
 static double t_rd_acc, t_dq_acc, t_sub_acc, t_qb_acc, t_poll_acc, t_pump_acc;
+/* RDSPLIT：把 t_rd_acc 拆成 compact(memmove)/fill(read 系统调用)/scan(找起始码+SEI 解析) */
+static double t_cpt_acc, t_fil_acc; static int n_cpt, n_fil, n_rd;
+static double t_hist[4]; static int n_hist[4]; static size_t b_hist[4];
 static double t_slp_acc; static int n_slp; static double t_frame0;	/* 播放器自己配速睡觉的时间 */
 static double t_loop;	/* 上一轮主循环的时刻，用来识别"进程被冻住过" */
 
@@ -1114,6 +1117,9 @@ static int sps_try(const unsigned char *d, size_t nbytes, int ptl,
  * 只保留"当前 AU + 未扫完的尾巴"，窗口因此很小（几 MB）。
  * ------------------------------------------------------------------ */
 static int s_fd = -1;		/* 码流 fd（文件或 STDIN） */
+#ifndef CHUNK_RD
+#define CHUNK_RD (64u << 10)
+#endif	/* 单次 read 上限：见 s_fill() 注释 */
 static unsigned char *s_buf;
 static size_t s_cap, s_len;	/* 缓冲区容量 / 有效字节 */
 static size_t s_pos;		/* 扫描位置 */
@@ -1156,8 +1162,24 @@ static void s_fill(size_t want)
 		}
 	}
 	for (;;) {
-		ssize_t r = read(s_fd, s_buf + s_len, s_cap - s_len);
+		double tf = now_s();
+		/* 一次最多读 CHUNK 字节，别把整块缓冲区灌满。
+		 * 之前的 read(.., s_cap - s_len) 在 4MB 缓冲下会一口气读 4MB，
+		 * 于是 s_len 一直是几 MB，而 s_compact() 每交出一个 AU 就要
+		 * memmove(s_len - s_au_start) —— 实测 1080p 每 AU 固定 2.44ms，
+		 * 占满整个 t_rd_acc（300 AU 共 0.73s，AU 大小 13KB/48KB 都一样贵，
+		 * 因为搬的是缓存里的尾巴不是 AU）。钳成小块后 memmove 只剩
+		 * 「当前 AU + 一个 chunk」，大 AU 由 for(;;) 多读几次补齐。
+		 * 管道上 read() 本来就只返回已有字节，不会因此多等。
+		 */
+		size_t room = s_cap - s_len;
 
+		if (room > (CHUNK_RD))
+			room = (CHUNK_RD);
+		ssize_t r = read(s_fd, s_buf + s_len, room);
+
+		t_fil_acc += now_s() - tf;
+		n_fil++;
 		if (r < 0) {
 			if (errno == EINTR) {
 				/* 阻塞在 read() 等 ffmpeg 供流时收到 seek 信号：
@@ -1184,7 +1206,11 @@ static void s_compact(void)
 	if (!s_release)
 		return;
 	if (s_au_start) {
+		double tc = now_s();
+
 		memmove(s_buf, s_buf + s_au_start, s_len - s_au_start);
+		t_cpt_acc += now_s() - tc;
+		n_cpt++;
 		s_len -= s_au_start;
 		s_pos -= s_au_start;
 		s_au_start = 0;
@@ -3086,9 +3112,21 @@ int main(int argc, char **argv)
 				break;
 			{
 				double tr = now_s();
+				size_t p0 = s_len - s_pos;
+				int hi;
 
 				r = stream_next_au(&ap, &al);
-				t_rd_acc += now_s() - tr;
+				{
+					double dt = now_s() - tr;
+
+					t_rd_acc += dt;
+					hi = (r > 2) ? 3 : (r < -1 ? 0 : r + 1);
+					t_hist[hi] += dt;
+					n_hist[hi]++;
+					b_hist[hi] += (s_len - s_pos > p0) ?
+						0 : (p0 - (s_len - s_pos));
+				}
+				n_rd++;
 			}
 			if (r < 0)
 				break;		/* seek 打断：回主循环处理重建 */
@@ -3483,6 +3521,24 @@ int main(int argc, char **argv)
 		       t_sub_acc * 1000.0 / (got ? got : 1),
 		       t_poll_acc * 1000.0 / (got ? got : 1),
 		       t_pump_acc * 1000.0 / (got ? got : 1));
+		if (getenv("RDSPLIT") && n_rd)
+			printf("RDSPLIT per-au: total=%.2fms compact=%.2fms(%d/%d) "
+			       "read=%.3fms(%d) scan=%.2fms\n",
+			       t_rd_acc * 1000.0 / n_rd,
+			       t_cpt_acc * 1000.0 / n_rd, n_cpt, n_rd,
+			       t_fil_acc * 1000.0 / (n_rd ? n_rd : 1), n_fil,
+			       (t_rd_acc - t_cpt_acc - t_fil_acc) * 1000.0 / n_rd);
+		if (getenv("RDSPLIT")) {
+			int i;
+
+			for (i = 0; i < 4; i++)
+				if (n_hist[i])
+					printf("RDSPLIT r=%d: n=%d %.2fms/call "
+					       "scan=%zuB/call\n", i - 1,
+					       n_hist[i],
+					       t_hist[i] * 1000.0 / n_hist[i],
+					       b_hist[i] / n_hist[i]);
+		}
 		printf("PHASE feed=%.3fs  active=%.3fs  tail=%.3fs  write=%.3fs  eos=%d\n",
 		       feed, active, wall - active - (t_first_rx - t0),
 		       t_write_acc, eos_seen);
