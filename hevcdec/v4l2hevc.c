@@ -173,6 +173,15 @@ static int rap_accept(int rap)
 	return 0;
 }
 
+/* RAPKEEPRASL=1：收到 CRA 后连它后面那串 RASL 也照喂给驱动，
+ * 由驱动自己 "Couldn't find ref. frame" 跳过。默认关（丢 RASL 是原本的策略），
+ * 这开关只为量一件事：静默挂死到底是"丢 RASL"引起的，还是 CRA 本身引起的。
+ */
+static int rap_keep_rasl(void)
+{
+	return getenv("RAPKEEPRASL") != NULL;
+}
+
 static void rap_enter(int st, const char *why)
 {
 	static const char *nm[] = { "PLAY", "WAIT", "RASL" };
@@ -3143,7 +3152,9 @@ int main(int argc, char **argv)
 			 */
 			if (g_rap_st != RAP_PLAY) {
 				if (r == 2 && rap_accept(s_au_last_rap)) {
-					int idr = s_au_last_rap <= 20;
+					/* RAPKEEPRASL：CRA 也直接开播，RASL 不丢 */
+					int idr = s_au_last_rap <= 20 ||
+						  rap_keep_rasl();
 
 					rap_enter(idr ? RAP_PLAY : RAP_RASL,
 						  idr ? "IDR" : (g_rap_degraded
