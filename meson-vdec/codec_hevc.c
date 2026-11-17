@@ -1295,6 +1295,18 @@ static int codec_hevc_process_segment(struct amvdec_session *sess)
 		if (!hevc->cur_frame)
 			return -1;
 	} else {
+		/*
+		 * A slice that is not the first one of a picture, but we have
+		 * no current frame: the leading slices were dropped (src change,
+		 * seek landing mid-picture, reset). Dereferencing cur_frame here
+		 * crashes the IRQ thread, which then leaves the decoder hardware
+		 * permanently busy. Drop this orphan slice instead.
+		 */
+		if (!hevc->cur_frame) {
+			dev_err(core->dev, "orphan slice seg addr=%u, no cur frame\n",
+				slice_segment_address);
+			return -1;
+		}
 		hevc->cur_frame->cur_slice_idx++;
 	}
 
