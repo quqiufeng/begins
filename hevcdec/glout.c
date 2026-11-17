@@ -268,6 +268,7 @@ static const char *FS =
 	"precision highp float;\n"
 	"uniform sampler2D uY, uC, uLut;\n"
 	"uniform float uSat;\n"
+	"uniform mat3 uGm;\n"
 	"in vec2 vUV;\n"
 	"out vec4 oCol;\n"
 	"void main(){\n"
@@ -287,8 +288,9 @@ static const char *FS =
 	"  o = clamp(o, 0.0, 1.0);\n"
 	"  float lum = dot(o, vec3(0.2126, 0.7152, 0.0722));\n"
 	"  o = mix(vec3(lum), o, uSat);\n"
-	"  float dth = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233)))*43758.5453);\n"
-	"  o += (dth - 0.5) / 255.0;\n"
+	"  float d1 = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233)))*43758.5453);\n"
+	"  float d2 = fract(sin(dot(gl_FragCoord.yx+vec2(71.0,13.0), vec2(39.3467,11.1351)))*24634.6345);\n"
+	"  o += (d1 + d2 - 1.0) / 255.0;\n"
 	"  oCol = vec4(clamp(o, 0.0, 1.0), 1.0);\n"
 	"}\n";
 
@@ -355,6 +357,8 @@ static void build_fsv(void)
 		" o = clamp(o,0.0,1.0);"
 		" float lum = dot(o, vec3(0.2126,0.7152,0.0722));"
 		" o = mix(vec3(lum), o, uSat);"
+		" o += (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233)))*43758.5453)"
+		"+fract(sin(dot(gl_FragCoord.yx+vec2(71.0,13.0), vec2(39.3467,11.1351)))*24634.6345)-1.0)/255.0;"
 		" oCol = vec4(clamp(o,0.0,1.0),1.0); }\n";
 	FSV[7] = "#version 300 es\nprecision highp float;\n"
 		"uniform sampler2D uY, uC, uLut;\nuniform float uSat;\nuniform mat3 uGm;\n"
@@ -371,6 +375,8 @@ static void build_fsv(void)
 		" o = clamp(o,0.0,1.0);"
 		" float lum = dot(o, vec3(0.2126,0.7152,0.0722));"
 		" o = mix(vec3(lum), o, uSat);"
+		" o += (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233)))*43758.5453)"
+		"+fract(sin(dot(gl_FragCoord.yx+vec2(71.0,13.0), vec2(39.3467,11.1351)))*24634.6345)-1.0)/255.0;"
 		" oCol = vec4(clamp(o,0.0,1.0),1.0); }\n";
 
 	FSV[8] = "#version 300 es\nprecision highp float;\n"
@@ -392,7 +398,7 @@ static void build_fsv(void)
 		" o = clamp(o,0.0,1.0);"
 		" float lum = dot(o, vec3(0.2126,0.7152,0.0722));"
 		" o = mix(vec3(lum), o, uSat);"
-		" o += (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233)))*43758.5453)-0.5)/255.0;"
+		" o += (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233)))*43758.5453)+fract(sin(dot(gl_FragCoord.yx+vec2(71.0,13.0), vec2(39.3467,11.1351)))*24634.6345)-1.0)/255.0;"
 		" oCol = vec4(clamp(o,0.0,1.0),1.0); }\n";
 
 
@@ -412,7 +418,7 @@ static void build_fsv(void)
 		" o = clamp(o,0.0,1.0);"
 		" float lum = dot(o, vec3(0.2126,0.7152,0.0722));"
 		" o = mix(vec3(lum), o, uSat);"
-		" o += (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233)))*43758.5453)-0.5)/255.0;"
+		" o += (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233)))*43758.5453)+fract(sin(dot(gl_FragCoord.yx+vec2(71.0,13.0), vec2(39.3467,11.1351)))*24634.6345)-1.0)/255.0;"
 		" oCol = vec4(clamp(o,0.0,1.0),1.0); }\n";
 
 	FSV[10] = "#version 300 es\nprecision highp float;\n"
@@ -439,7 +445,7 @@ static void build_fsv(void)
 		" o = clamp(o,0.0,1.0);"
 		" float lum = dot(o, vec3(0.2126,0.7152,0.0722));"
 		" o = mix(vec3(lum), o, uSat);"
-		" o += (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233)))*43758.5453)-0.5)/255.0;"
+		" o += (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898,78.233)))*43758.5453)+fract(sin(dot(gl_FragCoord.yx+vec2(71.0,13.0), vec2(39.3467,11.1351)))*24634.6345)-1.0)/255.0;"
 		" oCol = vec4(clamp(o,0.0,1.0),1.0); }\n";
 
 }
