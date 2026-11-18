@@ -1091,8 +1091,15 @@ int glout_init(unsigned sw, unsigned sh)
 	 * 所以比例差超过 0.5% 就退回整屏 target，让 GL 自己画黑边。
 	 * 上限 4x：再往上 DPU 的单次放大插值明显发虚。
 	 */
-	g.up = getenv("DPUSCALE") ? (unsigned)atoi(getenv("DPUSCALE"))
-				  : (g.atomic ? 4 : 0);
+	/* 默认 0（不放大）。曾经默认跟着 atomic 走 4x，实测站不住：
+	 * target 就是源尺寸，所以 DPU 放大只会发生在「源比屏小」的场合，
+	 * 而那正是填充最便宜的时候 —— 720p 源 target 1280x720 的 draw 只有
+	 * 0.01ms，1080p 源 target 1920x1080 是 0.02ms（开不开 tonemap 都一样），
+	 * Mali-G31 在这个量级上根本不是瓶颈。反过来 DPU 路径要 atomic 提交，
+	 * 720p 源上实测 55.5 fps，整屏 target 是 58.9 fps —— 放大不赚还略亏，
+	 * 却要多一层插值。留着当手动旋钮（DPUSCALE=2/4 + ATOMIC=1 能跑通、
+	 * 300/300 上屏），但不该是默认行为。 */
+	g.up = getenv("DPUSCALE") ? (unsigned)atoi(getenv("DPUSCALE")) : 0;
 	/* 死结 1 的后果：没有 atomic 就只有 legacy SetCrtc/PageFlip，而这两条
 	 * 对小 fb 一律 ENOSPC —— 显式要了 DPUSCALE 却忘了 ATOMIC=1，实测就是
 	 * 全程黑屏（submit 300 / shown 0，日志只有一行 SetCrtc 失败）。
