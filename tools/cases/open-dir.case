@@ -1,0 +1,5 @@
+# 进目录：HOME 落首项是目录，OK 进去，条目数应变化
+mode desk
+do call:app.goto:{"dir":"dav:/sata11-18072858035/book"};wait:400;key:HOME;wait:300;key:OK;wait:1200
+golden open-dir
+restore key:BACK;wait:600

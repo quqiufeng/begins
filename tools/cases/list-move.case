@@ -1,0 +1,5 @@
+# 右移一格：选中项必须真的变了（注入生效），画面高亮跟着走
+mode desk
+do call:app.goto:{"dir":"dav:/sata11-18072858035/book"};wait:400;key:HOME;wait:300;key:RIGHT;wait:400
+assert-sel 机器学习
+golden list-move

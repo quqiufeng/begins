@@ -1,0 +1,5 @@
+# 下移一格（8 列布局，落下一行同列 = 第 9 项）
+mode desk
+do call:app.goto:{"dir":"dav:/sata11-18072858035/book"};wait:400;key:HOME;wait:300;key:DOWN;wait:400
+assert-sel Erlang-OTP并发编程实战 (图灵程序设计丛书 31).mobi
+golden list-down

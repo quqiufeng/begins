@@ -1,0 +1,8 @@
+# 归位到书库首项：目录/选中/条目数全复位
+mode desk
+fuzz 1
+max-diff 0.1
+do call:app.goto:{"dir":"dav:/sata11-18072858035/book"};wait:400;key:HOME;wait:400
+assert-sel 中信见识丛书
+assert-count 89
+golden list-home
