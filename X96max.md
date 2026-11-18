@@ -2806,6 +2806,21 @@ apt-get update                    # rc=0，无 E:/W:
 不是黑底白字，也不要花屏。做法不是改 framebuffer 驱动，而是「先把图画进 `/dev/fb0`，
 再用半透明 fbterm 盖在上面」。
 
+### 22.0.1 截图（tools/x96-shot.sh）
+
+两套显示栈各有一条抓法，`/dev/fb0` 里**没有**桌面像素（桌面走 DRM planes），别拿 fb 抓桌面：
+
+```bash
+tools/x96-shot.sh                 # tty1 桌面 → ~/x96-desktop-<时间>.png（走 /tmp/desktop-automation.sock 的 app.capture）
+tools/x96-shot.sh -c              # tty2 壁纸终端 → ~/x96-console-<时间>.png（dd /dev/fb0 → BGRA → PNG）
+tools/x96-shot.sh -a -o /tmp/a.png  # 两个都抓（第二张自动加 -console 后缀）
+```
+
+- 桌面那条：socket 是 `root:600`，必须 root ssh；返回 `{"ok":true,"path":...}` 才算成功。
+- fb 那条：`fb0/virtual_size` 是 `2560,2160`（比屏高），真正上屏行数看 `fb0/modes`（`U:2560x1440p-0`），
+  只 `dd` 可见的 1440 行，否则下面多一大条白边。stride 10240 = 2560×4，32bpp 小端 BGRA。
+- 桌面在前台时 fb0 里只是打底壁纸，fbterm 的文字要 `chvt 2` 才有。
+
 ### 22.1 两个落点
 
 | 件 | 位置 | 说明 |
