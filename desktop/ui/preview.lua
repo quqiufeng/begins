@@ -14,7 +14,23 @@ function M.new(cfg, sdl, img, ttf)
 	return setmetatable({
 		cfg = cfg, sdl = sdl, img = img, ttf = ttf, font = font,
 		list = {}, idx = 1, tex = nil, tex_path = nil, open = false,
+		-- 列表里的 path 可能是 NAS 上的 dav 路径，解码器只认本地文件：
+		-- stage(item) → 本地路径（由 launcher 注入，内部按需下到缓存）。
+		stage = nil, local_of = {},
 	}, M)
+end
+
+-- 列表项 → 能直接喂给解码器的本地路径；取不到（离线/没配 NAS）就退回原路径
+function M:local_path(item)
+	if not item then return nil end
+	local hit = self.local_of[item.path]
+
+	if hit then return hit ~= false and hit or item.path end
+	if not self.stage then return item.path end
+	local p = self.stage(item)
+
+	self.local_of[item.path] = p or false
+	return p or item.path
 end
 
 function M:clear_tex()
@@ -26,12 +42,14 @@ function M:load()
 	local item = self.list[self.idx]
 
 	if not item then return end
-	if self.tex_path == item.path then return end
+	local path = self:local_path(item)
+
+	if self.tex_path == path then return end
 	self:clear_tex()
-	local tex = self.img.texture(self.ren, item.path)
+	local tex = self.img.texture(self.ren, path)
 
 	self.tex = tex
-	self.tex_path = item.path
+	self.tex_path = path
 end
 
 function M:show(fs, path)

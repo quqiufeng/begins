@@ -311,10 +311,10 @@ function M:open(fs, preview, item)
 		end
 		return self:open_media(item) and "opened", nil
 	elseif kind == "image" then
-		local local_path = self:stage(item)
-
-		if not local_path then return nil, "NAS 取图失败" end
-		local ok, err = preview:show(fs, local_path)
+		-- 播放列表里是 NAS 上的 dav 路径，解码器只认本地文件：
+		-- 把 stage 注入预览器，翻到哪张就下哪张（同大小复用缓存）。
+		preview.stage = function(it) return self:stage(it) end
+		local ok, err = preview:show(fs, item.path)
 
 		if not ok then return nil, err end
 		return "opened"
