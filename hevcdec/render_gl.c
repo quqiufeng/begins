@@ -180,8 +180,11 @@ static void gl_get_stats(struct renderer *r, struct render_stats *st)
 	st->sh = p->sh;
 	st->t_first = p->t_first;
 	st->t_last = p->t_last;
-	st->draw_ms_sum = p->draw_sum;
-	st->draw_ms_max = p->draw_max;
+	/* glout_stats 给的是秒（它自己按 now_s() 累计），字段名是 ms——
+	 * 这里必须换算。不换算的话 1080p 两 pass 真实 17.9ms/帧会印成
+	 * 「draw avg=0.02ms」，看着像 GPU 白干，实际是数错了。 */
+	st->draw_ms_sum = p->draw_sum * 1000.0;
+	st->draw_ms_max = p->draw_max * 1000.0;
 	st->swap_ms_sum = p->swap_sum;
 }
 

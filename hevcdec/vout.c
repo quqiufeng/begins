@@ -684,35 +684,47 @@ static int plane_commit(struct vout *v, const struct vframe *f)
 	return 0;
 }
 
-/* 显示完成反馈：SETPLANE 要等到下一个 vblank 才接管扫描，所以目标槽 T 的
- * 那一帧，真正开始扫描是 T+1。下一轮 pump 拿当前序号去核：
- *   cur >= prev_latch   上一帧确实吃到了 vblank → SHOWN，把真序号交回去
- *   cur <  prev_latch   两次 SETPLANE 挤进同一个 vblank，后一次盖掉前一次，
- *                       前帧一帧都没被扫过 → 记 miss，按丢弃回报
+/* 显示完成反馈：拿"每次 SETPLANE 落定的 vblank 号"（prev_latch）直接比，
+ * 不问"下一槽"——meson 的 SETPLANE 是阻塞的，ioctl 返回时这一槽已经过完，
+ * 再 +1 就等于给每一帧都记上"晚一槽还没扫到"：一帧一槽的稳态（RENDER=drm
+ * + NOPACE，解码 58.8fps 对上 60Hz）会被判成几乎全 miss，实测 shown=17/360。
+ *
+ *   latch_k >  latch_{k-1}   落在更晚的一槽 → 上一帧确实被扫过 → SHOWN
+ *   latch_k == latch_{k-1}   两次 SETPLANE 挤进同一槽，后一次盖掉前一次，
+ *                            前帧一帧都没被扫过 → miss，按丢弃回报
+ *
+ * soft=1：只是在轮首"顺手套"一下，同一槽时还不能下结论——这一槽里随时可能
+ * 再来一张把它盖掉，留给下一次落定去判。soft=0：新的 latch 已经落定，上一帧
+ * 的命运算死了。
  * legacy ioctl 没有 flip event，这是能拿到的最准的完成反馈；粒度一帧，
  * 用来回收 buffer 足够（回收只要"不在扫描"这个结论，不要精确到行）。 */
-static void confirm_prev(struct vout *v, uint32_t cur, int okv)
+static void confirm_prev(struct vout *v, uint32_t cur, int okv, int soft)
 {
 	if (!v->prev_valid) return;
-	v->prev_valid = 0;
-	if (!okv || (int32_t)(cur - v->prev_latch) >= 0) {
-		if (okv) {
-			/* 真正上屏的两个 latch 之间的间隔：节拍真相在这，
-			 * fps 只是它的调和平均，抖动全被抹平 */
-			if (v->latch_have) {
-				double ms = (double)(uint32_t)(v->prev_latch - v->latch_prev)
-					    * 1000.0 / v->refresh;
-
-				ps_add(&v->h_int, ms);
-			}
-			v->latch_prev = v->prev_latch;
-			v->latch_have = 1;
-		}
-		fire(v, &v->prev, VOUT_SHOWN, okv ? v->prev_latch : 0);
-	} else {
-		v->misses++;
-		fire(v, &v->prev, VOUT_DROPPED, 0);
+	if (!okv) {			/* 拿不到序号：按"上过屏"回收，别卡住 buffer */
+		v->prev_valid = 0;
+		fire(v, &v->prev, VOUT_SHOWN, 0);
+		return;
 	}
+	if ((int32_t)(cur - v->prev_latch) > 0) {
+		/* 真正上屏的两个 latch 之间的间隔：节拍真相在这，
+		 * fps 只是它的调和平均，抖动全被抹平 */
+		if (v->latch_have) {
+			double ms = (double)(uint32_t)(v->prev_latch - v->latch_prev)
+				    * 1000.0 / v->refresh;
+
+			ps_add(&v->h_int, ms);
+		}
+		v->latch_prev = v->prev_latch;
+		v->latch_have = 1;
+		v->prev_valid = 0;
+		fire(v, &v->prev, VOUT_SHOWN, v->prev_latch);
+		return;
+	}
+	if (soft) return;
+	v->misses++;
+	v->prev_valid = 0;
+	fire(v, &v->prev, VOUT_DROPPED, 0);
 }
 
 /* pts → 目标 vblank 槽。锚点在首帧（和 seek 回跳）时种下，之后纯靠绝对时间
@@ -812,11 +824,29 @@ int vout_submit(struct vout *v, const int fd[2], unsigned w, unsigned h,
 		v->nopts++;
 	}
 
-	/* 入队。满了丢最老的：显示队列永远"新的赢"，落后时跳帧去追，
-	 * 而不是把最新帧也堵在外面——那等于让延迟越攒越大。 */
+	/* 入队。满了必须丢一帧，但丢谁要看是谁落后了 —— 这一步原来一律丢
+	 * 最老的（"新的赢"），只在屏幕真落后时才对；生产者比屏幕快时它是个
+	 * 灾难：队首那几张还没到自己的槽位，本来就等着上层扫，却先被自己的
+	 * 后来者顶掉，屏上只剩偶尔蒙中槽的零星几帧。RENDER=drm + NOPACE
+	 * （解码 58.8fps 灌 24fps 的片、队列 3 格）实测 shown=10/600，
+	 * 就是这么被"新"的拱没的，而它其实一帧都不该丢。
+	 *
+	 * 所以按槽位判：新来的这张比队首还早/同时（队首已该翻却没翻，屏幕
+	 * 真落后）才丢最老的、往前追；否则丢新来的这张，守住队列里已经排好
+	 * 队的帧。没有槽位信息（vbl 不可用/无 pts）时保持老行为。 */
 	if (v->qn >= v->qmax) {
 		struct vframe *old = &v->q[v->qh];
 
+		if (f.has_slot && old->has_slot &&
+		    (long long)f.slot > (long long)old->slot) {
+			v->drops++;
+			v->stales++;
+			if (getenv("VOUTDBG"))
+				printf("VOUT: queue full, drop new pts=%.3f "
+				       "(head pts=%.3f 还没到槽)\n", f.pts, old->pts);
+			fire(v, &f, VOUT_DROPPED, 0);
+			return 3;
+		}
 		printf("VOUT: queue full, drop pts=%.3f\n", old->pts);
 		fire(v, old, VOUT_DROPPED, 0);
 		v->qh = (v->qh + 1) % VOUT_Q_MAX;
@@ -846,7 +876,7 @@ int vout_pump(struct vout *v, int timeout_ms)
 		int okv = 0;
 		uint32_t cur = vbl_seq(v, &okv);
 
-		confirm_prev(v, cur, okv);	/* 顺手核掉上一帧的完成反馈 */
+		confirm_prev(v, cur, okv, 1);	/* 顺手核掉上一帧（同一槽还不能定论） */
 		/* 回调里允许 submit（见 vout.h），而队列满时 submit 会丢最老的、
 		 * 把 qh 推走——所以 confirm 之后必须重取队首，别拿旧指针去 commit。 */
 		f = &v->q[v->qh];
@@ -886,13 +916,38 @@ int vout_pump(struct vout *v, int timeout_ms)
 				ps_add(&v->h_late, ms);
 			}
 		}
+		/* 同一 vblank 里只许翻一张：硬件只认最后那张，同 vblank 内
+		 * 多翻的帧一帧都没被扫过（confirm_prev 会诚实地记 miss），白扔
+		 * 还占着队列。有槽位时槽位天然把它们分开；没有槽位（DRM 直出
+		 * 后端：播放器给 pts=0，节拍全由播放器自己睡）时这里就是唯一
+		 * 的节拍 —— 少了它一轮里连翻多张，实测 RENDER=drm+NOPACE
+		 * 360 帧只有 15 张真被扫过（shown=15 miss=345 而 drop=0：
+		 * 帧不是被"丢"了，是被自己后一张盖掉了）。
+		 * 不阻塞：这个 vblank 里就停手，剩下的留给下一次 pump。 */
+		if (!f->has_slot && okv && v->prev_valid &&
+		    (int32_t)(cur - v->prev_latch) < 0)
+			break;
+		if (getenv("FLIPDBG")) {
+			static int c;
+			if (c++ < 30)
+				fprintf(stderr, "[flip] t=%.3f cur=%u prev_latch=%u "
+					"has_slot=%d qn=%d refresh=%u\n",
+					now_s() - v->t_ref, cur, v->prev_latch,
+					f->has_slot, v->qn, v->refresh);
+		}
 		if (plane_commit(v, f) < 0) {
 			fire(v, f, VOUT_DROPPED, 0);	/* 翻不上去也得把 buffer 还了 */
 		} else {
+			struct vframe latched = *f;
+
 			cur = vbl_seq(v, &okv);
 			if (okv) v->vbl_last = cur;
-			v->prev = *f;
-			v->prev_latch = cur + 1;	/* 下一 vblank 接管扫描 */
+			/* 这一次 latch 落在 cur 号槽上，上一帧的命运算死了：
+			 * 落在更早的槽 = 真扫过，同一槽 = 被这张盖掉。
+			 * 先拷一份再回调：回调里允许 submit，队首会被顶走。 */
+			confirm_prev(v, cur, okv, 0);
+			v->prev = latched;
+			v->prev_latch = cur;	/* 这一槽就是它落定的槽 */
 			v->prev_valid = 1;
 		}
 		v->qh = (v->qh + 1) % VOUT_Q_MAX;
@@ -916,16 +971,19 @@ int vout_drain(struct vout *v)
 
 		/* 同一个 vblank 里连翻，中间那几张其实没被扫过：诚实地按 miss
 		 * 回报，别把"翻过"当"显示过"——否则调用方会以为画面完整。 */
-		confirm_prev(v, vbl_seq(v, &okv), okv);
+		confirm_prev(v, vbl_seq(v, &okv), okv, 0);
 		f = &v->q[v->qh];
 		f->has_slot = 0;
 		if (plane_commit(v, f) < 0) {
 			fire(v, f, VOUT_DROPPED, 0);
 		} else {
+			struct vframe latched = *f;
+
 			cur = vbl_seq(v, &okv);
 			if (okv) v->vbl_last = cur;
-			v->prev = *f;
-			v->prev_latch = cur + 1;
+			confirm_prev(v, cur, okv, 0);
+			v->prev = latched;
+			v->prev_latch = cur;
 			v->prev_valid = 1;
 		}
 		v->qh = (v->qh + 1) % VOUT_Q_MAX;
@@ -943,15 +1001,16 @@ int vout_wait_shown(struct vout *v, int timeout_ms)
 	if (!v) return -1;
 	vout_pump(v, timeout_ms);	/* 先把队列推平，可能刚好花光预算 */
 	if (!v->prev_valid) return 1;	/* 没有在途帧 = 最后那张已经在屏上 */
-	if (!v->vbl_ok) { confirm_prev(v, 0, 0); return 1; }
+	if (!v->vbl_ok) { confirm_prev(v, 0, 0, 0); return 1; }
 
 	for (;;) {
 		int okv = 0;
 		uint32_t cur = vbl_seq(v, &okv);
 		double left;
 
-		if (okv && (int32_t)(cur - v->prev_latch) >= 0) {
-			confirm_prev(v, cur, okv);
+		/* 落定的那一槽过完了，这张才算真扫过：要等 cur 严格更晚 */
+		if (okv && (int32_t)(cur - v->prev_latch) > 0) {
+			confirm_prev(v, cur, okv, 0);
 			return 1;
 		}
 		left = (deadline - now_s()) * 1000.0;
