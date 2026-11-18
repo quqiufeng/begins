@@ -168,6 +168,11 @@ local function on_key(name)
 	elseif name == "REFRESH" or name == "F5" then rescan()
 	elseif name == "QUIT" or name == "EXIT" then running = false
 	elseif name == "UP_DIR" then go_up()
+	elseif name == "T" or name == "THEME" then
+		-- 换色系：和 lite 的 12 套同一份调色板，T 循环（不改版式）
+		theme.cycle(1)
+		toast(("配色：%s"):format(theme.label or theme.name), 2)
+		logf("配色切换 → " .. tostring(theme.name))
 	else
 		return false
 	end
@@ -185,7 +190,7 @@ do
 		{ K.RETURN, "OK" }, { K.KP_ENTER, "OK" }, { K.SPACE, "OK" },
 		{ K.ESCAPE, "BACK" }, { K.BACKSPACE, "BACK" }, { K.PAGEUP, "PAGEUP" },
 		{ K.PAGEDOWN, "PAGEDOWN" }, { K.HOME, "HOME" }, { K.END, "END" },
-		{ K.F5, "REFRESH" }, { K.Q, "QUIT" },
+		{ K.F5, "REFRESH" }, { K.Q, "QUIT" }, { K.T, "THEME" },
 	}) do KEYSYM[p[1]] = p[2] end
 end
 

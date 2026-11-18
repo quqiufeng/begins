@@ -236,6 +236,68 @@ end
 
 M.decode_jpeg = decode_jpeg
 
+-- ---------- JPEG 里的 ICC 剖面会让盒子上的 libjpeg 整张解不出来 ----------
+--
+-- 实测（X96Max，libSDL2_image 2.8.8 + 系统 libjpeg.so.62）：带 APP2/ICC_PROFILE
+-- 的 JPEG，IMG_Load 直接返回 NULL，把 APP2 段剥掉同一个文件立刻能解 —— 文件本身
+-- 完整（字节数、md5 都对得上源），ffmpeg 也能正常解码，所以不是坏图，是解码栈的
+-- 毛病。手机拍的、网页存的图十有八九带 ICC，表现就是「jpg 显示不出来」。
+--
+-- 兜底：IMG_Load 失败且魔数是 JPEG 时，把 APP2（ICC）和 APP13（IPTC）段剔掉，
+-- 写到临时文件再 IMG_Load 一次。EXIF(APP1)/Adobe(APP14) 必须留着：后者决定
+-- YCCK/CMYK 的色彩变换，剥了颜色就反。
+local function rebuild_jpeg(path)
+	local f = io.open(path, "rb")
+
+	if not f then return nil end
+	local d = f:read("*a")
+
+	f:close()
+	if not d or #d < 4 or d:sub(1, 3) ~= "\255\216\255" then return nil end
+
+	local out, i, dropped = { d:sub(1, 2) }, 3, 0
+
+	while i <= #d do
+		if d:byte(i) ~= 0xFF then return nil end   -- 段标记错位：不是能修的图
+		local m = d:byte(i + 1)
+
+		if m == 0xD9 then out[#out + 1] = d:sub(i); break end   -- EOI
+		if m == 0xDA then out[#out + 1] = d:sub(i); break end   -- SOS：后面是熵编码，整段抄
+		if m == 0x00 or (m >= 0xD0 and m <= 0xD7) then
+			out[#out + 1] = d:sub(i, i + 1)
+			i = i + 2
+		else
+			local hi, lo = d:byte(i + 2), d:byte(i + 3)
+
+			if not hi or not lo then return nil end
+
+			local seg = d:sub(i, i + 1 + hi * 256 + lo)
+
+			if m ~= 0xE2 and m ~= 0xED then out[#out + 1] = seg else dropped = dropped + 1 end
+			i = i + 2 + #seg
+		end
+	end
+	if dropped == 0 then return nil end
+	return table.concat(out)
+end
+
+-- 返回一个能让 IMG_Load 认的临时路径（调用方负责删）
+local function sanitized_copy(path)
+	local data = rebuild_jpeg(path)
+
+	if not data then return nil end
+	local tmp = os.tmpname()
+
+	-- os.tmpname 在盒子上给的是相对 /tmp 的名字（/tmp/lua_xxxxx）
+	local full = tmp:sub(1, 1) == "/" and tmp or ("/tmp/" .. tmp)
+	local w = io.open(full, "wb")
+
+	if not w then return nil end
+	w:write(data)
+	w:close()
+	return full
+end
+
 local cache = {}
 
 -- 直接出纹理；失败返回 nil
@@ -246,7 +308,15 @@ function M.texture(ren, path)
 	if M.lib then
 		local surf = M.load(path)
 
-		if surf == nil then return nil end
+		if surf == nil then
+			-- 有 ICC 的 JPEG 在盒子上会走这条路：剥掉段头再试一次
+			local tmp = sanitized_copy(path)
+
+			if not tmp then return nil end
+			surf = M.load(tmp)
+			os.remove(tmp)
+			if surf == nil then return nil end
+		end
 		local tex = sdl.texture_from_surface(ren, surf)
 
 		sdl.free_surface(surf)

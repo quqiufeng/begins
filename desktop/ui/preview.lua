@@ -3,6 +3,8 @@
 -- 打开一张图 → 收集当前目录里的同类图片做播放列表，左右翻，ESC/BACK 退出。
 -- 走 SDL2_image；库不在就退化成"不支持预览"的 toast。
 
+local theme = require("ui.theme")
+
 local M = {}
 M.__index = M
 
@@ -82,7 +84,10 @@ function M:draw(ren, W, H)
 
 	self.ren = ren
 	self:load()
-	sdl.fill(ren, 0, 0, W, H, 0x000000, 180)
+	-- 幕布走当前色系：亮底铺 paper（像展厅白墙），暗底铺黑，都不透底下的列表
+	local scrim_a = theme.dark and 190 or 240
+
+	sdl.fill(ren, 0, 0, W, H, theme.scrim, scrim_a)
 
 	local item = self.list[self.idx]
 	local title = ("%d/%d  %s"):format(self.idx, #self.list, item and item.name or "")
@@ -102,9 +107,9 @@ function M:draw(ren, W, H)
 		self.ttf.draw(ren, self.font, "无法解码这张图", 20, W / 2, H / 2,
 			0xE0644A, "center")
 	end
-	self.ttf.draw(ren, self.font, title, 16, W / 2, H - 52, 0xE6EDF3, "center")
+	self.ttf.draw(ren, self.font, title, 16, W / 2, H - 52, theme.text, "center")
 	self.ttf.draw(ren, self.font, "◀▶ 切换    OK/BACK 关闭", 14, W / 2, H - 26,
-		0x8B949E, "center")
+		theme.text_dim, "center")
 end
 
 return M
