@@ -2173,6 +2173,12 @@ static void tm_apply(int idx, unsigned w, unsigned h)
 static struct renderer *rend;
 static int g_drop_owners;	/* 会话重建中：owner 已作废，别再往旧 fd 上 QBUF */
 static double g_play_fps = 24.0;	/* 播放配速；0 = 不限速（测吞吐） */
+/* 声画偏斜探针（SYNC=1）：重建/seek 之后画面必须跳过一整个 GOP 才能重新
+ * 起解，这段时间音频照走（ffmpeg -re 按墙钟灌 PCM），两边差多少必须能量
+ * 出来——"跳段"（两边一起丢）和"错位"（只丢画面）是两种完全不同的病，
+ * 光看日志分不清。d = 音频走过的时长 - 画面帧号走过的时长。 */
+static int    g_sync_dbg;
+static long   g_sync_ms0 = -1;
 static double g_play_lead = 6;		/* 解码最多领先上屏几帧（背压） */
 static int g_need_tm;			/* 后端不吃 HDR：播放器侧先 CPU 转 SDR */
 
@@ -3626,6 +3632,21 @@ no_stall:;
 				render_pump(rend, 0);
 			got++;
 			g_au_pub = got;
+			if (!g_sync_dbg && getenv("SYNC"))
+				g_sync_dbg = 1;
+			if (g_sync_dbg && g_play_fps > 0 && got % 24 == 0) {
+				long ams = aout_played_ms();
+
+				if (ams >= 0) {
+					if (g_sync_ms0 < 0) g_sync_ms0 = ams;
+					printf("SYNC got=%ld audio_ms=%ld frame_pos=%.2f "
+					       "audio_pos=%.2f d=%+ldms\n",
+					       (long)got, ams, (double)got / g_play_fps,
+					       (double)(ams - g_sync_ms0) / 1000.0,
+					       (ams - g_sync_ms0) - (long)(got * 1000.0 / g_play_fps));
+					fflush(stdout);
+				}
+			}
 			/* 自愈路径的确定性验证开关：FORCEREINIT=300 在第 300 帧
 			 * 主动走一遍"固件 hang → 整块复位 → 等 IRAP"流程，
 			 * 用来确认重建后能真的接着解，而不是干等（正常播放时
