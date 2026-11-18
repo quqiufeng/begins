@@ -692,9 +692,13 @@ do_key() {
 		fi
 		;;
 	quit)   do_stop ;;
-	fwd|back|fwdmore|backmore)
+	fwd|back|fwdmore|backmore|fwd:*|back:*)
+		# 也认「fwd:<秒>」「back:<秒>」这种带秒数的形式（pctl 的 seek N 转出来）：
+		# 播放器没有 IPC，seek 只能整链重开，秒数由调用方给，档位别写死在两档。
 		case "$ACT" in
 		fwd) D=10 ;; back) D=-10 ;; fwdmore) D=60 ;; backmore) D=-60 ;;
+		fwd:*)  D=${ACT#*:}; case "$D" in ''|*[!0-9]*) D=10 ;; esac ;;
+		back:*) D=${ACT#*:}; case "$D" in ''|*[!0-9]*) D=10 ;; esac; D=$((0 - D)) ;;
 		esac
 		P=$(pos_of); [ -n "$P" ] || P=0
 		T=$((P + D)); [ "$T" -lt 0 ] && T=0

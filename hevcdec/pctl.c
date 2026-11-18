@@ -216,7 +216,29 @@ static int handle_line(int fd, char *line)
 		}
 		return 0;
 	}
-	if (!strcmp(a, "seek") && b) { run_play_sh(b); reply(fd, "{\"ok\":1}\n"); return 0; }
+	/* seek <±秒>：播放器没有 IPC，seek 只能整链重开（play.sh key …）。
+	 * 以前把秒数原样当动作名交给 play.sh（"seek 30" → "play.sh key 30"），
+	 * play.sh 只认 fwd/back/fwdmore/backmore，未知动作直接空转 ——
+	 * 遥控器 ▶ 显示"ok"、画面原地不动，就是这个。现在翻成 fwd:<秒>/back:<秒>。
+	 * 非数字参数（fwd/back/fwdmore/backmore…）原样透传。 */
+	if (!strcmp(a, "seek") && b) {
+		char act[32];
+		char *p = b;
+		int neg = 0, n;
+
+		if (*p == '+' || *p == '-') { neg = (*p == '-'); p++; }
+		if (*p >= '0' && *p <= '9') {
+			n = atoi(p);
+			if (n < 0) { neg = !neg; n = -n; }
+			if (n == 0) { reply(fd, "{\"ok\":1}\n"); return 0; }
+			snprintf(act, sizeof act, "%s:%d", neg ? "back" : "fwd", n);
+		} else {
+			snprintf(act, sizeof act, "%s", b);
+		}
+		run_play_sh(act);
+		reply(fd, "{\"ok\":1}\n");
+		return 0;
+	}
 	if (!strcmp(a, "quit")) { do_quit(); reply(fd, "{\"ok\":1}\n"); return 1; }
 	reply(fd, "{\"error\":\"unknown\"}\n");
 	return 0;
