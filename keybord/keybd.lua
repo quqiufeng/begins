@@ -25,12 +25,13 @@
 --           DEDUP_MS=40 REPEAT_MS=220 FOCUS_TTL=800 DISPATCH=inproc|exec
 --           KEYBD_SOCK=/tmp/keybd.sock LOG=/tmp/keybd.log KEYBD_ROOT=/opt/keybord
 
+local ROOT = os.getenv("KEYBD_ROOT") or "/opt/keybord"
+package.path = ROOT .. "/?.lua;" .. package.path
+
 local ffi = require("ffi")
 local evdev = require("evdev")
 local sock = require("sock")
 local keynames = require("keynames")
-
-local ROOT = os.getenv("KEYBD_ROOT") or "/opt/keybord"
 
 local function num(v, d)
 	local n = tonumber(v)
@@ -48,6 +49,7 @@ local CFG = {
 	log = "/tmp/keybd.log",
 	appdir = ROOT .. "/apps",
 	mapdir = ROOT .. "/maps",
+	keydir = ROOT .. "/keys",
 	dispatch = "inproc",
 	learn = false,
 	scan_ms = 2000,
@@ -80,6 +82,7 @@ env_num("REPEAT_MS", "repeat_ms")
 env_num("FOCUS_TTL", "focus_ttl")
 CFG.appdir = ROOT .. "/apps"
 CFG.mapdir = ROOT .. "/maps"
+CFG.keydir = ROOT .. "/keys"
 
 -- —— 日志 ——
 local logf
@@ -132,6 +135,25 @@ local function load_apps()
 				fh:close()
 				local ok2, over = pcall(dofile, mf)
 				if ok2 then merge_map(m.map, over); log("app %s: 覆盖键位 %s", m.name, mf) end
+			end
+			-- keys/<app>.lua：第二步落地的固定脚本，键码表就是唯一真源
+			-- （只取数据不执行：置 _KEYBD_DATA_ONLY）
+			local kf = CFG.keydir .. "/" .. m.name .. ".lua"
+			local kfh = io.open(kf)
+			if kfh then
+				kfh:close()
+				_KEYBD_DATA_ONLY = true
+				local ok3, km = pcall(dofile, kf)
+				_KEYBD_DATA_ONLY = nil
+				if ok3 and type(km) == "table" and km.map then
+					m.keysfile = kf
+					merge_map(m.map, km.map())
+					if km.repeatable then m.repeatable = km.repeatable end
+					m.order = km.order or m.order
+					log("app %s: 固定脚本 %s（%d 键）", m.name, kf, #(km.list or {}))
+				else
+					log("app %s: 固定脚本载入失败 %s: %s", m.name, kf, tostring(km))
+				end
 			end
 			apps[#apps + 1] = m
 			app_by_name[m.name] = m
@@ -187,11 +209,21 @@ end
 -- —— 动作执行 ——
 local function run_action(app, action, key)
 	if CFG.dispatch == "exec" then
-		-- 真·外部进程：等价 luajit -e 'dofile("/opt/keybord/act.lua")'
-		local cmd = ("luajit %s/act.lua %s %q >/dev/null 2>&1"):format(ROOT, app.name, action)
+		-- 真·外部进程：按键 → fork 一次 luajit -e 跑该 app 的固定脚本
+		-- keys/<app>.lua 存在就把它当唯一入口（它自己查固定键码表再调 app 自动化），
+		-- 没有才退回 act.lua <app> <action>（探索期的临时调法）。
+		local cmd
+
+		if app.keysfile then
+			cmd = ("luajit -e 'dofile(%q)' %q >/dev/null 2>&1")
+				:format(app.keysfile, key or action)
+		else
+			cmd = ("luajit -e 'dofile(%q)' %s %q >/dev/null 2>&1")
+				:format(ROOT .. "/act.lua", app.name, action)
+		end
 		local rc = os.execute(cmd)
 
-		return rc == 0 or rc == true, "exec"
+		return rc == 0 or rc == true, "exec " .. (app.keysfile and "keys/" .. app.name .. ".lua" or "act.lua")
 	end
 
 	local ok, res, detail = pcall(app.run, action, key, ENV)
@@ -220,16 +252,18 @@ local function press(name, code, val, devname)
 		return
 	end
 
+	local layer = tostring(why or "up")
+
 	local action = app.map and app.map[name]
 	if not action then
-		log("press %s code=%s focus=%s: 该 app 无此键", name, tostring(code), app.name)
+		log("press %s code=%s focus=%s[%s]: 该 app 无此键", name, tostring(code), app.name, layer)
 		return
 	end
 	if val == 2 and not (app.repeatable and app.repeatable(action)) then return end
 
 	local ok, detail = run_action(app, action, name)
-	log("press %s%s code=%s focus=%s -> %s %s", name, val == 2 and "~" or "",
-		tostring(code), app.name, action, ok and "ok" or ("FAILED " .. tostring(detail)))
+	log("press %s%s code=%s focus=%s[%s] -> %s %s", name, val == 2 and "~" or "",
+		tostring(code), app.name, layer, action, ok and "ok" or ("FAILED " .. tostring(detail)))
 
 	if not ok then
 		cache.at = 0
@@ -297,6 +331,8 @@ local function handle_ev(d, type, code, val)
 		return
 	end
 	if val ~= 0 and val ~= 1 and val ~= 2 then return end   -- 有的遥控报天外飞仙值
+	-- 只认按下(1)/连发(2)：抬起(0) 绝不能派发动作，否则一次按键翻两次页
+	if val == 0 then return end
 
 	local prefix = ""
 	for _, c in ipairs({ 29, 97, 42, 54, 56, 100, 125, 126 }) do
@@ -375,6 +411,16 @@ local function ctl_handle(cfd)
 			end
 		end
 		if not code then
+			-- 组合键（C-1 / S-RIGHT …）：去掉修饰前缀查本键 code，
+			-- 名字原样传给 press()，所以 map 里写的 C-1 能直接命中
+			local base = name:match("^[CSAM]+%-(.+)$")
+			if base then
+				for c, n in pairs(keynames) do
+					if n == base then code = c; break end
+				end
+			end
+		end
+		if not code then
 			resp = { ok = false, error = "unknown key: " .. name }
 		else
 			press(name, code, val, "ctl")
@@ -427,7 +473,7 @@ local function shortcuts(argv)
 			if not name then print("用法: --key <键名，如 OK/RIGHT/C-1>"); os.exit(2) end
 			local code
 			for c, n in pairs(keynames) do
-				if n == name:gsub("^[CSA]-", "") then code = c; break end
+				if n == (name:gsub("^[CSA]%-", "")) then code = c; break end
 			end
 			if not code then print("未知键: " .. name); os.exit(2) end
 			CFG.learn = false
@@ -445,8 +491,10 @@ local function shortcuts(argv)
 			for _, ap in ipairs(apps) do
 				local ok, det, info = pcall(ap.detect, ENV)
 
-				print(("  %-8s order=%-3d %s %s"):format(ap.name, ap.order or 0,
-					(ok and det) and "UP  " or "down", info and tostring(info) or ""))
+				print(("  %-8s order=%-3d %s %-18s %s"):format(ap.name, ap.order or 0,
+					(ok and det) and "UP  " or "down",
+					ap.keysfile and ("keys/" .. ap.name .. ".lua") or "-",
+					info and tostring(info) or ""))
 			end
 			return true
 		elseif a == "--learn" then
@@ -496,8 +544,17 @@ while running do
 	for i = #devs, 1, -1 do
 		local d = devs[i]
 
-		-- 设备消失时 read 报错，drain 返回 0；靠 rescan 清理
-		evdev.drain(d.fd, function(t, c, v) handle_ev(d, t, c, v) end)
+		-- 设备消失（拔掉/虚拟键盘退出）时 read 报 ENODEV：立刻摘掉并马上重扫，
+		-- 否则要等 scan_ms 才发现，期间新节点上的按键会丢。
+		local _, gone = evdev.drain(d.fd, function(t, c, v) handle_ev(d, t, c, v) end)
+
+		if gone then
+			log("close %s (%s) 设备消失", d.path, d.name)
+			evdev.close(d.fd)
+			open_by_path[d.path] = nil
+			table.remove(devs, i)
+			last_scan = 0
+		end
 	end
 	local now = evdev.now_ms()
 	if now - last_scan >= CFG.scan_ms then

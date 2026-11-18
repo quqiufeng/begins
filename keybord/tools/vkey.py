@@ -16,7 +16,7 @@ UI_DEV_CREATE = 0x5501
 
 NAMES = {
     "right": 106, "left": 105, "up": 103, "down": 108, "ok": 352,
-    "enter": 28, "home": 172, "volup": 115, "voldn": 114, "back": 158,
+    "enter": 28, "esc": 1, "space": 57, "tab": 15, "backspace": 14, "home": 172, "volup": 115, "voldn": 114, "back": 158,
     "blue": 371, "green": 399, "yellow": 400, "red": 398,
     "ctrl": 29, "1": 2, "2": 3, "3": 4, "4": 5, "5": 6,
     "menu": 139, "playpause": 164, "mute": 113, "info": 358,

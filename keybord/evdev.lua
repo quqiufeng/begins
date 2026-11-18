@@ -20,6 +20,7 @@ long read(int fd, void *buf, unsigned long count);
 int ioctl(int fd, unsigned long req, ...);
 int nanosleep(const struct ev_timespec *req, struct ev_timespec *rem);
 int select(int nfds, void *rd, void *wr, void *ex, void *tv);
+int *__errno_location(void);
 ]]
 
 local C = ffi.C
@@ -92,15 +93,19 @@ end
 function M.ungrab(fd) C.ioctl(fd, EVIOCGRAB, ffi.cast("int", 0)) end
 function M.close(fd) if fd and fd >= 0 then C.close(fd) end end
 
--- 读一批事件；回调 fn(type, code, value)。返回读到的条数。
+-- 读一批事件；回调 fn(type, code, value)。返回 条数, 设备是否已消失(ENODEV)
 local evbuf = ffi.new("struct input_event[64]")
+local ENODEV, ENXIO = 19, 6
 function M.drain(fd, fn)
 	local n = 0
 
 	while true do
 		local r = C.read(fd, evbuf, M.SIZE * 64)
 
-		if r <= 0 then break end
+		if r <= 0 then
+			local e = (r < 0) and C.__errno_location()[0] or 0
+			return n, (e == ENODEV or e == ENXIO)
+		end
 		local cnt = tonumber(r) / M.SIZE
 
 		for i = 0, cnt - 1 do
@@ -110,7 +115,7 @@ function M.drain(fd, fn)
 			n = n + 1
 		end
 	end
-	return n
+	return n, false
 end
 
 -- 阻塞等可读（ms 超时）；fds 为 fd 数组

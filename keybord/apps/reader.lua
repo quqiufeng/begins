@@ -57,22 +57,44 @@ end
 
 local function call(env, fn, args)
 	local body = ('{"cmd":"call","fn":"%s","args":%s}'):format(fn, args or "{}")
-	local r, err = env.sock.json_req(M.socket, body, 1500)
+	local r, err = env.sock.json_req(M.socket, body, 4000)
 
-	if not r then return false, err end
+	-- 阅读器单线程，重绘/开书时接了连接但迟迟不回包。只有"连不上"才重试
+	-- （那是真没送到）；连上了却没回包 = 已收到、正在做，重试会翻两次，
+	-- 报失败还会让 keybd fallback 再派发一次。所以没回包就认定成功。
+	if not r then
+		if tostring(err):find("connect failed", 1, true) then
+			r, err = env.sock.json_req(M.socket, body, 4000)
+		end
+		if not r then return true, "sent (no reply: " .. tostring(err) .. ")" end
+	end
 	if r.ok == false then return false, tostring(r.error or "failed") end
 	return true, r
 end
 
 local function state(env)
-	return env.sock.json_req(M.socket, '{"cmd":"state"}', 1500)
+	return env.sock.json_req(M.socket, '{"cmd":"state"}', 4000)
 end
 
--- 前台判定：ping 得通就算在跑（socket 在但进程死了会连不上/没回应）
+-- 前台判定：ping 通则在前台；再问一次 state 看在哪一层，
+-- 让日志 / ctl state 能区分「书架」和「看书 p68/534」而不是笼统的 reader。
+-- state 走同一个单线程服务、可能慢，所以超时（1.2s）就退回 ping-only，
+-- 只影响打印的层级，不影响派发（层级语义仍由 app.* 自己判面板）。
 function M.detect(env)
 	local r = env.sock.json_req(M.socket, '{"cmd":"ping"}', 400)
 
-	return r ~= nil and r.ok == true, r and "pong" or "no reply"
+	if not r or r.ok ~= true then return false, "no reply" end
+
+	local s = env.sock.json_req(M.socket, '{"cmd":"state"}', 1200)
+	local st = s and s.state
+
+	if not st then return true, "up (state timeout)" end
+	if st.library then return true, ("shelf(%s)"):format(tostring(st.count or "?")) end
+	if st.chapter then
+		return true, ("book c%s/p%s of %s"):format(tostring(st.chapter),
+			tostring(st.page), tostring(st.pages))
+	end
+	return true, ("book p%s/%s"):format(tostring(st.page), tostring(st.pages))
 end
 
 function M.run(action, key, env)

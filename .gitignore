@@ -55,3 +55,6 @@ meson-vdec/logs/
 /bench.sh
 # 遥控器实物照片（本地参考）
 /remote.jpg
+
+# 本地临时脚本（rk.sh 之类的一次性调试，不入库）
+.scratch/

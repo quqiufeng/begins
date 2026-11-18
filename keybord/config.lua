@@ -10,7 +10,11 @@ return {
 	dedup_ms = 40,     -- 同一键在两个设备上报，去重窗口
 	repeat_ms = 220,   -- 长按连发最小间隔
 	focus_ttl = 800,   -- 前台判定缓存（越小越灵，越大越省钱）
-	dispatch = "inproc",  -- "inproc" 同进程调用；"exec" 每键 fork luajit act.lua
+	-- 每键 fork 一次 `luajit -e 'dofile("/opt/keybord/keys/<app>.lua")' <键名>`：
+	-- 键位=keys/<app>.lua（第二步冻结的写死键码表，真源），执行=apps/<app>.lua
+	-- → app 自己的自动化口。没有 keys/<app>.lua 时退回 act.lua <app> <action>。
+	-- 守护只负责判前台+分发，脚本改了不用重启 keybd。
+	dispatch = "exec",
 	log = "/tmp/keybd.log",
 	sock = "/tmp/keybd.sock",
 }
