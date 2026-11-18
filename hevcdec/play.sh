@@ -454,7 +454,61 @@ do_play() {
 	[ -n "$DITHER" ] && export TMDITHER="$DITHER"
 	export AF
 
-	set -- 'set -uf
+	# ── spawn 模式：ffmpeg 收成播放器的子进程（design §5.4、§6.2）──
+	# 只有 spawn 才谈得上这三件事（都是实测过、不是推测）：
+	#   ① seek 就地跳：kill 子进程 + 新 -ss 重开 + L2 重建会话，
+	#      DRM/GL 不放手 → 屏幕不黑，buffer 不重建；
+	#   ② 供流饿死自愈（STARVESEC）：ffmpeg 活着但不吐字节时能就地重连；
+	#   ③ 片尾/上游死能分开：EOF 后 waitpid 得到 ffmpeg 的退出码。
+	# 模板按空白切词后 execvp 直接起（不过 shell），所以：
+	#   - 片源/fifo 路径里不能有空白（含空格就退回管道模式）；
+	#   - 不能靠重定向，stderr 直接继承播放器的（外层已 >>"$LOG"）。
+	# 上游死（播放器 exit 3）后壳要重连，位置只能靠播放器落的这个文件：
+	# 控制口 socket 随进程一起消失，问不到 pos()。
+	POSFILE=${POSFILE:-${STATE}.pos}
+	export POSFILE
+	rm -f "$POSFILE" 2>/dev/null
+
+	SPAWNED=0
+	if [ "$NAKED" = 0 ] && [ "${OPIPE:-0}" != 1 ]; then
+		case "$SRC$AFIFO_USE" in
+		*[[:space:]]*)
+			say "片源/fifo 路径含空格：退回管道模式（spawn 模板不分词）" ;;
+		*)
+			export SPAWN="ffmpeg -hide_banner -loglevel warning -nostdin -y -re -ss {SS} $DA $HTTP_OPT $IN_FMT -i $SRC -map 0:v:0 -c:v copy -f $VF - $AF"
+			export SS DUR
+			SPAWNED=1 ;;
+		esac
+	fi
+	[ "$SPAWNED" = 1 ] && say "链路：spawn（ffmpeg 是播放器的子进程，seek 就地跳）"
+
+	# 壳侧重连（design §1.6 剩的那条）：spawn 模式下播放器能拿到 ffmpeg 的
+	# 退出码，非 0 就 exit 3；这里读到 3 就拿播放器落下的 POSFILE 当新 -ss
+	# 整条链重开——片尾（ffmpeg 正常收尾，exit 0）不会走到这里。
+	# 连续 3 次还死就放弃，不然网络彻底断了会原地空转。
+	RECONNECT_MAX=${RECONNECT_MAX:-3}
+	if [ "$SPAWNED" = 1 ]; then
+		set -- 'rc=0; _try=0
+while :; do
+	PLAY=1 NOWRITE=1 RENDER="$RENDER" SCALE="$SCALE" PLAY_SOCK="$SOCK" \
+		"$BIN" - '"$VWH"' >>"$LOG" 2>&1
+	rc=$?
+	[ "$rc" = 3 ] || break
+	_try=$((_try + 1))
+	if [ "$_try" -gt '"$RECONNECT_MAX"' ]; then
+		echo "UPSTREAM: 连续 $_try 次上游死，放弃重连" >>"$LOG"
+		break
+	fi
+	_p=$(cat "$POSFILE" 2>/dev/null | tr -d " ")
+	case "$_p" in ""|*[!0-9.]*) _p=$SS ;; esac
+	SS=$_p
+	echo "UPSTREAM: 壳就地重连，从 ${SS}s 重开（第 $_try 次）" >>"$LOG"
+	sed -i "s/^SS=.*/SS=$SS/" "'"$STATE"'"
+	sleep 0.3
+done
+exit $rc'
+	else
+		set -- 'set -uf
 if [ "$NAKED" = 1 ]; then
 	cat "$SRC"
 else
@@ -463,6 +517,7 @@ else
 		-i "$SRC" -map 0:v:0 -c:v copy -f "$VF" - $AF 2>>"$LOG"
 fi | PLAY=1 NOWRITE=1 RENDER="$RENDER" SCALE="$SCALE" PLAY_SOCK="$SOCK" \
 	"$BIN" - $VWH >>"$LOG" 2>&1'
+	fi
 
 	# </dev/null：不然 ssh 远端起播时子进程握着 stdin，ssh 永远等不到 EOF
 	# 外层 sh 也要重定向：否则它握着调用者的 stdout，ssh 远端起播会一直等 EOF
@@ -578,12 +633,14 @@ pos_of() {
 	load_state || return 1
 	# 优先问播放器要实时位置：HB 心跳 10s 一条，靠它算位置会一格跳 10 秒，
 	# 遥控器连按时"位置没变"的观感就是这么来的。pos_ms 是音频主钟推出来的
-	# 播放时间轴（相对起播点），加回 SS 才是片源位置。
+	# 播放时间轴，而且是**绝对**的（播放器把时钟原点挪到了 -SS：
+	# `g_t_clock0 = t_play0 - g_ss0`），这里再加 SS 就是双算——起播 40s
+	# 会被显示成 80s。下面靠 HB 的 t= 是相对量，才需要补 SS。
 	_tm=$(pctl pos | sed -n 's/.*"pos_ms":\([0-9]*\).*/\1/p')
 	case "${_tm:-}" in
 	'') ;;
 	*) awk -v m="$_tm" -v o="${SS:-0}" -v d="${DUR:-0}" 'BEGIN{
-	       p = int(m / 1000) + o
+	       p = int(m / 1000)
 	       if (d > 0 && p > o + d) p = o + d
 	       printf "%d", p }'; return 0 ;;
 	esac
@@ -660,6 +717,18 @@ seek_guard() {
 	return 0
 }
 
+# 就地跳（design §5.4）：spawn 模式下 ffmpeg 是播放器的子进程，播放器自己
+# 能 kill 它、带新 -ss 重开、顺手重建 V4L2 会话 —— DRM/GL 一路不放手，屏幕
+# 不黑、buffer 不重建。控制口直接接住就别重开整条链（返回 0 = 已接管）。
+# 接不住（非 spawn 模式、老二进制、socket 不通）返回 1，调用方退回整链重开。
+seek_inplace() {
+	_r=$(pctl "$1" "$2" 2>/dev/null) || return 1
+	case "$_r" in
+	*'"seek":"abs"'*|*'"seek":"inplace"'*) return 0 ;;
+	esac
+	return 1
+}
+
 # 音量只能在播放器里做（软件增益）：这块板的 ALSA 没有可写的主音量
 # （ACODEC 不存在，只有 SPDIF/TDM 的通道音量，动它就是动别的输出路径）。
 vol_step() {
@@ -704,6 +773,10 @@ do_key() {
 			[ "$T" -ge "$DUR" ] && T=$((DUR - 1))
 			_r=$((DUR - (T - SS))); [ "$_r" -le 0 ] && _r=$DUR
 		fi
+		if seek_inplace seekto "$T"; then
+			say "跳到 ${T}s（绝对，原 ${P}s，就地跳，屏幕不黑）"
+			return 0
+		fi
 		seek_guard || return 0
 		_WAS=0; is_paused && _WAS=1
 		say "跳到 ${T}s（绝对，原 ${P}s）"
@@ -730,6 +803,12 @@ do_key() {
 		_r=0
 		if [ "${DUR:-0}" -gt 0 ]; then
 			_r=$((DUR - (T - SS))); [ "$_r" -le 0 ] && _r=$DUR
+		fi
+		# 偏移量交给播放器算：它有连续 seek 的基准链（末次目标），
+		# 这里用 pos_of() 的旧位置起算会连按跳错。
+		if seek_inplace seek "$D"; then
+			say "跳 ${D}s（就地跳，屏幕不黑）"
+			return 0
 		fi
 		seek_guard || return 0
 		_WAS=0; is_paused && _WAS=1

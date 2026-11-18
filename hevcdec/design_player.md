@@ -184,9 +184,31 @@ EOS 就是这么来的：**正常播完和 ffmpeg 挂掉走的是同一条路**�
   `STARVE 2.1s → 就地重开 0.000 → first frame → 播 2.6s → STARVE 2.1s → 重开 2.613s …`，
   位置一路前移，画面自己回来。
 
-还剩两条壳侧的事（都没做）：
-- 壳侧 `set -o pipefail`，ffmpeg 非 0 就 `restart_at $(pos)`；
-- hevcdec 在 `s_eof && got < 期望帧数` 时返回非 0，让壳有据可依。
+**已修：播放器把"片尾"和"上游死"分开，壳据此就地重连。**
+
+- 播放器侧（spawn 模式，ffmpeg 是它的子进程）：`s_eof && got > 0` 时 `waitpid` 收尸，
+  退出码 0 = 片尾（只 vlog），非 0 = 上游死在半路：
+  `UPSTREAM: ffmpeg 退出码 137，停在 6.5s —— 不是片尾`，然后把位置写进 `$POSFILE`
+  （控制口 socket 随进程一起没了，壳问不到 `pos()`，只能落文件），`return 3`。
+  `1` 留给参数错误、`2` 留给"一帧没出"，三者不混。
+- 壳侧（`play.sh` 的 spawn 分支）：`sh -c` 里套一层循环，`rc == 3` 就读 `POSFILE`
+  当新 `-ss` 整条链重开，并把 `SS=` 回写进 state（遥控 / `status` 的位置才对得上）；
+  `RECONNECT_MAX`（默认 3）次还死就放弃，免得网络全断时原地空转。
+  管道模式没有"上游退出码"可看（`sh` 没有 `pipefail`），保持原样：只喊一声。
+- 实测（盒子，`/tmp/t90.ts` 1280x720 HEVC，播到 6s 时 `kill -9` 掉 ffmpeg）：
+  ```
+  UPSTREAM: ffmpeg 退出码 137，停在 6.5s —— 不是片尾
+  UPSTREAM: 壳就地重连，从 6.525s 重开（第 1 次）
+  ```
+  位置从 6.5s 续上，画面自己回来；同一条命令播 5s 短片到真片尾时**没有**任何
+  `UPSTREAM:` 行，也没有重连——两种结束分得开。
+
+顺带修的两个壳侧/显示 bug：
+- `pos_of()` 把 `pos_ms` 又加了一次 `SS`：`pos_ms` 是**绝对**的（播放器把时钟原点
+  挪到了 `-SS`：`g_t_clock0 = t_play0 - g_ss0`），从 40s 起播会显示成 80s。
+  靠 HB `t=` 的兜底分支才是相对量、需要补 `SS`。实测修好：`SS=40` 起播 6s 后报 45s。
+- 心跳 `quiet` 在读到第一个字节之前打印成 `now_s()` 本身（开机单调时钟，几万秒），
+  看着像卡死 28000s。`t_last_rx == 0` 时归 0。
 
 ### 1.7 参数集探测（SPS）
 
@@ -196,6 +218,25 @@ EOS 就是这么来的：**正常播完和 ffmpeg 挂掉走的是同一条路**�
   坑：`conformance_window` 的 `crop_left/right/top/bottom` 必须**紧跟 flag** 读，
   放到 `bit_depth`/`poc` 之后会读到错位比特（宽度被误裁 8 像素）。
 - 探测走的是全局 `stream/stream_size`，预读窗口期间临时指向 `s_buf/s_len`，用完立刻置回 NULL。
+
+**编码格式探测（`codec_detect()`）：只看首个 NAL 是错的。** 它的活是回答
+"这条裸流该喂 H.264 还是 HEVC 解码器"（`CODEC` 没显式给的时候）。老实现看第一个
+起始码后的字节：HEVC 的 VPS/SPS/PPS(0x40/42/44) 与 H.264 的 SPS/PPS(0x67/0x68) 不撞，
+于是"两者不会撞"。但 **x265 默认带 AUD**（`nal_unit_type 35` → 字节 0x46），按 H.264 读
+正好是 SEI(6)，整条 HEVC 流被塞进 H.264 解码器：SPS 求不出、`au=0`、一帧不出，
+日志里只有 `CODEC: 自动识别为 H.264` 一行，看上去像"片子坏了"。
+
+改成对前若干个 NAL 投票，判据用 HEVC **二字节** NAL 头的强约束：
+
+- HEVC 头第二字节 = `nuh_layer_id` 低 5 位 + `nuh_temporal_id_plus1`（3 位），
+  常规流里 layer_id=0、temporal_id_plus1≥1 ⇒ **恰好落在 0x01..0x07**；
+- H.264 的 VCL NAL 在同一位置是 `first_mb_in_slice` 的 ue(v)，首图像 first_mb=0
+  ⇒ 首比特为 1 ⇒ 该字节 ≥0x80，落不进这 7 个值；
+- 再叠加类型分：HEVC 的 32/33/34/35/39 前导权重高，H.264 的 SPS/PPS/AUD(7/8/9) 权重高。
+
+单看第一个头字节不行：H.264 的非 IDR 参考帧 0x41 右移一位正好是 HEVC 的 VPS 码位 32，
+反过来 HEVC 的 IDR(19→0x26) 按 H.264 读是 SEI(6)。实测三条流（`x265` 带 AUD、
+`x265 --no-aud`、`libx264`）现在都判对。
 
 ### 1.8 OUTPUT / CAPTURE 队列
 
@@ -352,7 +393,8 @@ HTTP/WebDAV 源带宽 ×2、起播多一次握手，且 `--cache-secs=20` 让 mp
 ALSA 跟采样时钟，两个独立晶振（§4.4、`X96Max-Player.md` §:411 已记"漂移无界"）。
 没有丢帧/补帧，只有缓慢分离；短片看不出，长片必然。
 
-**③ seek 是两条命令。** HEVC 链没有 IPC，只能 `restart_at` 整链重开（带新 `--start`）；
+**③ seek 是两条路径。** HEVC 链在 spawn 模式下走播放器控制口（`pctl seek N` /
+`seekto N`，就地跳，§5.4），接不住才 `restart_at` 整链重开（带新 `--start`）；
 `PLAYER=mpv` 时走 `mpvctl seek`。两个目标位置**只能靠人手保持一致**，
 `START/OFF/PAUSE_AT` 三个变量存在的唯一理由就是让 `pos()` 自洽（§5.4）。
 
@@ -963,8 +1005,10 @@ primary plane 的属性表里有没有 `IN_FENCE_FD`、缩放上下限多少 —
 
 - **A/V 同步是粗对齐**：只靠两边同一个 `-ss`，没有音频时钟驱动视频丢帧/补帧，
   长片必然缓慢漂移；`-re` 本身也是按平均码率，不做音频对齐。
-- **seek 黑 0.8 s**：`tvplay-node.sh` 目前是整链重开；`v4l2hevc` 的 `SIGUSR1`
-  热重建已经能用，但没接上。
+- **seek 不再黑屏，但只在新壳上**：`play.sh key` 现在先问播放器控制口
+  （spawn 模式下 kill 子 ffmpeg + 新 `-ss` 重开 + 重建 V4L2 会话，DRM/GL 不放手，
+  §5.4），接不住才退回整链重开。老前端 `tvplay-node.sh` 仍直接 `restart_at`，
+  走的是整链重开（~0.8 s 黑屏）。
 - **不能换码流**：一个 V4L2 会话只能吃一条流，任何跳变都走 `g_reinit`
   （重开 `/dev/video0`），固件真 hang 时还要 `g_hard_reset_on_reinit` 整块复位。
 - **拖动精度受 GOP 限制**：`-ss` 落在关键帧前要等 IRAP，最长 60 s（`IRAPWAIT`）兜底。
@@ -991,7 +1035,7 @@ primary plane 的属性表里有没有 `IN_FENCE_FD`、缩放上下限多少 —
 tvplay-node.sh key   ← 语义全在这里（暂停/拖动/音量/退出）
    ├─ pkill -STOP/-CONT 整条 HEVC 链（视频 + ffmpeg + 音频 mpv）
    ├─ mpvctl + /tmp/tvplay.sock（mpv IPC：音量/静音）
-   └─ 重新执行 play 子命令（seek = 整链重开）
+   └─ 重新执行 play 子命令（seek 先试控制口就地跳，接不住才整链重开）
 ```
 
 ### 5.2 `rcinputd`：按键 → 动作名
@@ -1054,7 +1098,7 @@ elapsed = (PAUSE_AT>0 ? PAUSE_AT : now) - START + OFF
 | `toggle` | 先判"实际在跑哪条链"（`pgrep v4l2hevc-aarch64`），**不能只看 state**：HEVC 链的画面(v4l2hevc/ffmpeg)和声音(独立 mpv)是两个进程，只 toggle mpv 会哑掉声音、画面照跑 → 必须整条 `pkill -STOP/-CONT` |
 | 暂停 `pause_video` | `STOP` v4l2hevc / ffmpeg / mpv，写 `PAUSE_AT=now` |
 | 继续 `resume_video` | `CONT` 三者，把暂停时长并进 `START`（`START += now - PAUSE_AT`），`PAUSE_AT=0`，`pos()` 才连续 |
-| `fwd`/`back`/`fwdmore`/`backmore` | ±10s / ±60s。`PLAYER=mpv` 走 mpv IPC `seek`；HEVC 链只能 **整链重开**（~0.8s 黑屏） |
+| `fwd`/`back`/`fwdmore`/`backmore` | ±10s / ±60s。`PLAYER=mpv` 走 mpv IPC `seek`；HEVC 链先 `pctl seek N` 就地跳（spawn 模式，屏幕不黑），接不住才整链重开 |
 | `volup`/`voldn` | `mpvctl` 读 `volume` 再 `set_property`，步进 ±10，**夹在 0..100**（mpv 的 `add` 会累加，>100 削波，实测被连按到 130 晚上炸响） |
 | `mute` | `mpvctl <sock> mute` |
 | `quit` | `stop`：kill 三个进程 + 删 socket + `chvt 1` |
@@ -1063,22 +1107,37 @@ elapsed = (PAUSE_AT>0 ? PAUSE_AT : now) - START + OFF
 `vol_step` 必须 `MPVCTL_ECHO=1`：不加则 mpvctl 不回显回复，读到的 `cur` 永远是空、
 退化成每次按 100 算（实测连按减 12 次只掉到 90）。
 
-### 5.4 seek：整链重开 + 合并连发
+### 5.4 seek：就地跳优先，整链重开兜底
 
-HEVC 路径没有 IPC，`seek` = `restart_at <T>` = 用 state 里的参数重新执行
-`play hevc <KEYB64> <T> …`（每个参数都必须 `enc`，play 侧一律 `dec`；
-传明文会被当 base64 解成垃圾，实测 `AUDIO` 解空 → 重开后没有音频 mpv、
-`GEO` 解出二进制 → state 文件写坏，坏值还会顺着 restart_at 再传一轮）。
+两档，按"控制口能不能接住"分：
+
+**① 就地跳（spawn 模式，默认）。** `play.sh key fwd` → `pctl seek 10`（相对）
+或 `pctl seekto 120`（绝对）。播放器回 `{"ok":1,"seek":"inplace"|"abs"}`，
+壳就直接返回，**不重开整条链**：播放器 kill 掉子 ffmpeg、带新 `-ss` 重开、
+重建 V4L2 会话并 `s_fill` 预读，DRM/GL 一路不放手 —— 屏幕不黑、buffer 不重建。
+实测（盒子，`t720long.mp4` 95.9 s）：`key fwd` 后 PID 不变，日志只有
+`SEEK: 就地重开供流 → 15.797 s（DRM/GL 不动）`。
+
+- 相对量交给播放器算：它有"末次目标"基准（`g_seek_to`），连按 ▶▶ 从上次
+  目标接着加，不会因为 `pos()` 还停在旧位置而跳错。
+- 目标位置由播放器钳住：知道片长（`DUR`）或探到过片尾（`g_end_hi`）就停在
+  片尾前 1 s，OSD 说一句"已到片尾"（实测 `seekto 200` → 94.914 s）。
+- 暂停中 seek 不需要壳再压一次：`spawn_reseek()` 把暂停时长并进
+  `g_t_clock0`，暂停态原样保留。
+
+**② 整链重开（非 spawn / 老二进制 / socket 不通）。** `restart_at <T>` = 用
+state 里的参数重新执行 `play hevc <KEYB64> <T> …`（每个参数都必须 `enc`，play
+侧一律 `dec`；传明文会被当 base64 解成垃圾，实测 `AUDIO` 解空 → 重开后没有
+音频 mpv、`GEO` 解出二进制 → state 文件写坏，坏值还会顺着 restart_at 再传一轮）。
 
 - **`seek_guard`**：`/tmp/tvplay.seek.stamp` 记上次 seek 时间，3 s 内的重复 seek 直接丢。
   原因：`rcinputd` 是 `wait(NULL)` 串行处理的，按住 ▶ 时连发事件排在队列里，
   松开后仍会逐个补跑，每个都重开一次链 —— 表现是"播放界面消失变成命令行，
   松开才慢慢恢复"。合并成一次即可。
 - 暂停中拖动：重开后若 `WASPAUSED>0` 再 `pause_video()` 压回去，保持"暂停"语义。
-- 重开期间 DRM 没被释放（`v4l2hevc` 内部只是重建 V4L2 会话），但整链重启时
-  进程确实退出 → 屏幕会短暂回到内核控制台文本（约 0.8 s）。
-  更好的做法是把 `SIGUSR1` 接上（`v4l2hevc.c` 已支持 seek 不黑屏），
-  目前 `tvplay-node.sh` 还没走这条。
+- 整链重开时进程确实退出 → 屏幕会短暂回到内核控制台文本（约 0.8 s）。
+  所以这条路是兜底，正常路径是上面的就地跳；`tvplay-node.sh`（老前端）仍
+  直连这条，没走控制口。
 
 ### 5.5 前端协议（ssh）
 
@@ -1140,9 +1199,10 @@ IRAP 等不到。
 ## 6. 已知限制 / 下一步
 
 1. **A/V 同步是粗对齐**：只靠两边同一个 `-ss`，长片会有漂移，没有丢帧/补帧机制。
-2. **seek 会黑 0.8 s**：整链重开。黑屏的因是 `restart_at()` 打死持 DRM master 的进程
-   （屏幕掉回控制台），**不是 V4L2 会话重建**——所以这一条与 `design_recover.md` §3.3
-   的软重置研究正交，不要等软重置。
+2. **整链重开的 seek 会黑 0.8 s**（只发生在兜底路径）：黑屏的因是 `restart_at()`
+   打死持 DRM master 的进程（屏幕掉回控制台），**不是 V4L2 会话重建**——所以这一条
+   与 `design_recover.md` §3.3 的软重置研究正交，不要等软重置。spawn 模式下的
+   就地跳不黑屏，已接进 `play.sh key`（§5.4）；老的 `tvplay-node.sh` 还没接。
    但**不能**靠"让 `tvplay-node.sh` 发 `SIGUSR1`"解决：seek 要的是新字节位置，位置只在
    `ffmpeg -ss` 参数里，而 `SIGUSR1` 只重建已有 fd 上的会话（`v4l2hevc.c:1908`）。
    现在 `ffmpeg | v4l2hevc` 是兄弟进程，杀上游下游就 EOF。真正的改法是把 ffmpeg 收成

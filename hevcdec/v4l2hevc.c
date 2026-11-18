@@ -397,30 +397,57 @@ static int h264_new_pic(const unsigned char *nal, size_t n)
 	return 0;
 }
 
-/* 首个 NAL 判格式：HEVC 的 VPS/SPS/PPS/SEI 是 0x40/0x42/0x44/0x4e，
- * H.264 的 SPS/PPS/SEI/AUD 是 0x67/0x68/0x06/0x09。两者不会撞。
+/* NAL 投票判格式：HEVC 的 VPS/SPS/PPS/AUD/SEI 是 0x40/0x42/0x44/0x46/0x4e，
+ * H.264 的 SPS/PPS/AUD/SEI 是 0x67/0x68/0x09/0x06。
+ *
+ * 只看首个 NAL 会翻车：x265 默认带 AUD（type 35 → 0x46），按 H.264 读是
+ * SEI(6)，于是整条 HEVC 流被当成 H.264 喂给 H.264 解码器，一帧不出。
+ * 改成对前若干个 NAL 投票，并用 HEVC 二字节 NAL 头的强约束判票：
+ * nuh_layer_id 通常为 0、nuh_temporal_id_plus1≥1 ⇒ 第二个头字节恰好是 0x01..0x07；
+ * H.264 的 VCL NAL（first_mb_in_slice 的 ue(v) 首比特为 1 ⇒ ≥0x80）几乎不会落进来。
  * 返回 1=H.264，0=HEVC，-1=看不出来。
  */
 static int codec_detect(const unsigned char *buf, size_t n)
 {
 	size_t i;
+	int hevc_vote = 0, h264_vote = 0;
 
-	for (i = 0; i + 4 < n; i++) {
+	for (i = 0; i + 5 < n && hevc_vote + h264_vote < 64; i++) {
+		unsigned char b0, b1;
 		int hevc_t, h264_t;
 
 		if (!(buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 1))
 			continue;
-		hevc_t = (buf[i+3] >> 1) & 0x3f;
-		h264_t = buf[i+3] & 0x1f;
-		if (hevc_t == 32 || hevc_t == 33 || hevc_t == 34 || hevc_t == 39)
-			return 0;
-		if (!(buf[i+3] & 0x80) &&
-		    (h264_t == 5 || h264_t == 6 || h264_t == 7 ||
-		     h264_t == 8 || h264_t == 9 || h264_t == 1))
-			return 1;
-		return -1;
+		/* 起始码后面又跟一根起始码：不是 NAL 头，跳过 */
+		if (buf[i+3] == 0 && buf[i+4] == 0)
+			continue;
+		b0 = buf[i+3];
+		b1 = buf[i+4];
+		hevc_t = (b0 >> 1) & 0x3f;
+		h264_t = b0 & 0x1f;
+		/* 判据是"第二个头字节 ∈ 0x01..0x07"（layer_id=0、temporal_id_plus1≥1）：
+		 * H.264 的 VCL NAL 里这个位置是 first_mb_in_slice 的 ue(v)，
+		 * 首图像 first_mb=0 ⇒ 首比特为 1 ⇒ ≥0x80，落不进这 7 个值。
+		 * 单看 b0 不行：0x41(非 IDR 参考帧) 按 HEVC 读正好是 VPS 的 0x40 邻位。
+		 */
+		if (b1 >= 1 && b1 <= 7) {
+			if (hevc_t == 32 || hevc_t == 33 || hevc_t == 34 ||
+			    hevc_t == 35 || hevc_t == 39)
+				hevc_vote += 6;	/* VPS/SPS/PPS/AUD/SEI 前导 */
+			else
+				hevc_vote += 3;
+			continue;
+		}
+		if (b0 & 0x80)
+			continue;
+		if (h264_t == 7 || h264_t == 8 || h264_t == 9)
+			h264_vote += 6;		/* SPS/PPS/AUD */
+		else if (h264_t == 1 || h264_t == 5 || h264_t == 6)
+			h264_vote += 2;
 	}
-	return -1;
+	if (!hevc_vote && !h264_vote)
+		return -1;
+	return hevc_vote >= h264_vote ? 0 : 1;
 }
 
 /* Split Annex-B stream into access units. */
@@ -3339,6 +3366,7 @@ int main(int argc, char **argv)
 	const char *path = argc > 1 ? argv[1] : "/tmp/test.265";
 	struct stat st;
 	int sf, au_idx = 0, poll_timeouts = 0, drained = 0, stream_done = 0;
+	int upstream_dead = 0;	/* 片尾还是上游死了（design §1.6） */
 	int i;
 	int idle_ticks = 0;	/* 连续没进展的轮次（喂不进也收不到帧） */
 	double t_play0 = 0;
@@ -3619,9 +3647,13 @@ int main(int argc, char **argv)
 			}
 			if (now_s() - t_hb >= 10.0) {
 				t_hb = now_s();
+				/* t_last_rx==0 是"还没读到第一个字节"，直接减会打印
+				 * now_s() 本身（开机单调时钟，几万秒），看着像卡死。
+				 */
 				printf("HB t=%.0f au=%d got=%d out_nfree=%d/%d quiet=%.1f qmax=%.2f rec=%d\n",
 				       t_hb - t0, au_idx, got, out_nfree, n_out,
-				       t_hb - t_last_rx, q_peak, g_err_rec);
+				       t_last_rx > 0 ? t_hb - t_last_rx : 0.0,
+				       q_peak, g_err_rec);
 				fflush(stdout);
 				q_peak = 0;
 			}
@@ -4176,6 +4208,50 @@ no_stall:;
 
 	}
 
+	/* 片尾还是上游死了（design §1.6）：spawn 模式下 ffmpeg 是子进程，
+	 * EOF 之后直接收它的退出码——管道模式永远只有"读到 EOF"这一个信号，
+	 * 于是"播完了"和"ffmpeg 崩了/网络断了"长得一模一样：画面冻在最后一帧，
+	 * pos() 还在走，遥控器有反应但不生效。
+	 */
+	if (g_spawn_mode && s_eof && got > 0) {
+		int st = 0, k;
+		pid_t w = -1;
+
+		for (k = 0; k < 100; k++) {	/* 最多等 1s，别为收尸卡住退出 */
+			w = waitpid(g_child, &st, WNOHANG);
+			if (w == g_child || w < 0)
+				break;
+			usleep(10000);
+		}
+		if (w == g_child) {
+			int code = WIFEXITED(st) ? WEXITSTATUS(st)
+						 : 128 + WTERMSIG(st);
+
+			g_child = -1;	/* 已收割：atexit 的 spawn_kill 别再打一遍 */
+			if (code != 0) {
+				double at = (double)pl_pos_ms() / 1000.0;
+				const char *pf = getenv("POSFILE");
+
+				printf("UPSTREAM: ffmpeg 退出码 %d，停在 %.1fs —— 不是片尾\n",
+				       code, at);
+				/* 壳（play.sh）要拿着这个位置就地重连：socket 随进程一起
+				 * 没了，问不到 pos()，只能落个文件。
+				 */
+				if (pf && *pf) {
+					FILE *fp = fopen(pf, "w");
+
+					if (fp) {
+						fprintf(fp, "%.3f\n", at);
+						fclose(fp);
+					}
+				}
+				upstream_dead = 1;
+			} else if (g_verbose) {
+				printf("UPSTREAM: ffmpeg 正常收尾（片尾）\n");
+			}
+		}
+	}
+
 	t1 = now_s();
 	wall = t1 - t0;
 	if (out) fclose(out);
@@ -4271,5 +4347,8 @@ no_stall:;
 			close(bf);
 		}
 	}
+	/* 3 = 上游提前死（片尾被截断），壳据此就地重连；1（die）留给参数错误 */
+	if (upstream_dead)
+		return 3;
 	return got > 0 ? 0 : 2;
 }
