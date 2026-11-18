@@ -53,7 +53,8 @@ keybd 启动时读它当 map，`DISPATCH=exec` 时每键 fork 一条
 | `apps/<app>.lua` | 自动化适配层：detect / run / state，连 app 自己的 socket |
 | `maps/<app>.lua` | 探索期的手工键位覆盖（`--freeze` 的输入之一） |
 | `tools/rk.sh` | 按遥控器键 + 回传截图（`./tools/rk.sh down x3 ok`），不摸遥控器也能测 |
-| `tools/vkey.py` | 用 /dev/uinput 造虚拟键盘往盒子里打按键 |
+| `tools/vkey.lua` | 用 /dev/uinput 造虚拟键盘往盒子里打按键（LuaJIT FFI，无 python） |
+| `tools/gen-keynames.lua` | 从 `input-event-codes.h` 全量生成 `keynames.lua`；`--check` 校验漏码 |
 
 ## 安装
 
