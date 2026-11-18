@@ -314,35 +314,63 @@ do_play() {
 	*) NAKED=0 ;;
 	esac
 
-	# 编码：驱动侧两种都能硬解（meson-vdec 的 sm1/g12 表里 HEVC 和 H.264
-	# 都在，固件 g12a_h264.bin 也在盒子上），但**裸流格式必须对得上**：
-	# `-f hevc` 喂 H.264 会让 ffmpeg 直接 "Could not write header"，管道
-	# 空着就是黑屏 + FAIL stream 空。所以先问 ffprobe 一句，再定 -f。
-	# H.264 的宽高解析不了 HEVC 那套 SPS，得由这里传给播放器。
-	VC=""; VW=""; VH=""
-	if [ "$NAKED" = 0 ] && command -v ffprobe >/dev/null 2>&1; then
-		_pv=$(ffprobe -v error -select_streams v:0 \
-			-show_entries stream=codec_name,width,height \
-			-of csv=p=0 "$SRC" 2>/dev/null | head -n 1)
-		VC=${_pv%%,*}
-		_wh=${_pv#*,}
-		VW=${_wh%%,*}; VH=${_wh##*,}
-		case "$VC" in h264|hevc) ;; *) VC="" ;; esac
-		case "$VW$VH" in ''|*[!0-9]*) VW=""; VH="" ;; esac
-	fi
-	[ -z "$VC" ] && case "$SRC" in *.h264|*.264|*.avc) VC=h264 ;; esac
-	[ -z "$VC" ] && VC=hevc
-	VF=hevc; VWH=""
-	[ "$VC" = h264 ] && { VF=h264; [ -n "$VW" ] && VWH="$VW $VH"; }
-	say "编码：$VC（ffmpeg -f $VF）${VWH:+ ${VW}x$VH}"
 	# NAS 上读片：网络抖一下不该整条链卡死（默认 rw_timeout 是无限等）。
 	# -reconnect* 只对 http 输入有意义，本地文件加上也无害。
+	# 提到探测之前：下面每多探一次就多一次 http 请求，都得带超时。
 	HTTP_OPT=""
 	case "$SRC" in
 	http://*|https://*)
 		HTTP_OPT="-rw_timeout 15000000 -reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_delay_max 4"
 		;;
 	esac
+
+	# 探测一次视频流（codec + 宽高）。$1 是额外交给 ffprobe 的输入格式。
+	# 空输出 = 没有任何 demuxer 认领这个片源。
+	probe_video() {
+		# shellcheck disable=SC2086
+		ffprobe -v error $1 $HTTP_OPT -select_streams v:0 \
+			-show_entries stream=codec_name,width,height \
+			-of csv=p=0 "$SRC" 2>/dev/null | head -n 1
+	}
+
+	# 编码：驱动侧两种都能硬解（meson-vdec 的 sm1/g12 表里 HEVC 和 H.264
+	# 都在，固件 g12a_h264.bin 也在盒子上），但**裸流格式必须对得上**：
+	# `-f hevc` 喂 H.264 会让 ffmpeg 直接 "Could not write header"，管道
+	# 空着就是黑屏 + FAIL stream 空。所以先问 ffprobe 一句，再定 -f。
+	# H.264 的宽高解析不了 HEVC 那套 SPS，得由这里传给播放器。
+	VC=""; VW=""; VH=""; IN_FMT=""
+	if [ "$NAKED" = 0 ] && command -v ffprobe >/dev/null 2>&1; then
+		_pv=$(probe_video "")
+		# 空 = 自动探测失败。NAS 上有一批 .mkv 其实是 MPEG-TS：自动探测先按
+		# 扩展名试 matroska（EBML 解析失败），mpegts 探测又要求文件头就是
+		# 0x47 同步字节 —— 有的片子开头带十几字节脏数据，两条路一起挂，
+		# ffmpeg 直接 "Invalid data found when processing input" 退出，
+		# 管道空转就是黑屏。强给 -f mpegts 后同步字节一扫描就对齐（实测
+		# 348/348 命中），所以这里补一次带 -f mpegts 的探测。
+		if [ -z "$_pv" ]; then
+			_pv=$(probe_video "-f mpegts")
+			case "$_pv" in
+			h264,*|hevc,*)
+				IN_FMT="-f mpegts"
+				say "封装：MPEG-TS（扩展名不可信，自动探测失败后强探命中）" ;;
+			*) _pv="" ;;
+			esac
+		fi
+		VC=${_pv%%,*}
+		_wh=${_pv#*,}
+		VW=${_wh%%,*}; VH=${_wh##*,}
+		case "$VC" in h264|hevc) ;; *) VC="" ;; esac
+		case "$VW$VH" in ''|*[!0-9]*) VW=""; VH="" ;; esac
+		# 探测彻底失败：以前是静默黑屏，现在至少说清楚
+		if [ -z "$VC" ]; then
+			say "警告：片源封装探测失败，按原样交给 ffmpeg（可能黑屏）"
+		fi
+	fi
+	[ -z "$VC" ] && case "$SRC" in *.h264|*.264|*.avc) VC=h264 ;; esac
+	[ -z "$VC" ] && VC=hevc
+	VF=hevc; VWH=""
+	[ "$VC" = h264 ] && { VF=h264; [ -n "$VW" ] && VWH="$VW $VH"; }
+	say "编码：$VC（ffmpeg -f $VF）${VWH:+ ${VW}x$VH}${IN_FMT:+  输入 $IN_FMT}"
 	# 裸流没有时间戳，不能 seek：宁可拒绝，也别让人以为"跳过去了"
 	if [ "$NAKED" = 1 ] && [ "$SS" != "0" ] && [ "$SS" != "0.0" ]; then
 		die "裸流（$SRC）不能从 $SS 秒起播，没有时间戳可 seek"
@@ -362,8 +390,9 @@ do_play() {
 		[ "$SRC_REMOTE" = 1 ] && printf '来源：NAS %s（认证取 %s）\n' "$NAS_URL" "${ENVF:-环境变量}"
 		printf '播放器：%s\n' "$BIN"
 		printf '编码：%s\n' "$VC"
-		printf '命令：ffmpeg -re %s-i "%s" -map 0:v:0 -c:v copy -f %s - | %s - %s\n' \
-			"${SS:+-ss $SS }" "$_safe" "$VF" "$BIN" "$VWH"
+		printf '封装：%s\n' "${IN_FMT:-自动探测}"
+		printf '命令：ffmpeg -re %s%s-i "%s" -map 0:v:0 -c:v copy -f %s - | %s - %s\n' \
+			"${SS:+-ss $SS }" "${IN_FMT:+$IN_FMT }" "$_safe" "$VF" "$BIN" "$VWH"
 		return 0
 	fi
 
@@ -387,7 +416,9 @@ do_play() {
 	if [ "$AUDIO" = 1 ] && [ "$NAKED" = 0 ]; then
 		_ha=0
 		if command -v ffprobe >/dev/null 2>&1; then
-			if ffprobe -v error -select_streams a:0 -show_entries stream=index \
+			# shellcheck disable=SC2086
+			if ffprobe -v error $IN_FMT $HTTP_OPT -select_streams a:0 \
+				-show_entries stream=index \
 				-of csv=p=0 "$SRC" 2>/dev/null | grep -q .; then
 				_ha=1
 			fi
@@ -413,7 +444,7 @@ do_play() {
 	# AUDIO_FIFO 直接 export：写成 `${X:+AUDIO_FIFO=...}` 那个赋值不会生效，
 	# 展开出来的是一个「命令名」，报 AUDIO_FIFO=/tmp/play.afifo: not found。
 	export SRC SS DUR DA NAKED BIN LOG RENDER SCALE AFIFO_USE SOCK AUDIO HTTP_OPT
-	export VC VF VWH CODEC=""
+	export VC VF VWH IN_FMT CODEC=""
 	[ "$VC" = h264 ] && CODEC=h264
 	export CODEC
 	if [ -n "$AFIFO_USE" ]; then export AUDIO_FIFO="$AFIFO_USE"; else unset AUDIO_FIFO; fi
@@ -428,7 +459,7 @@ if [ "$NAKED" = 1 ]; then
 	cat "$SRC"
 else
 	ffmpeg -hide_banner -loglevel warning -nostdin -y -re \
-		${SS:+-ss "$SS"} $DA $HTTP_OPT \
+		${SS:+-ss "$SS"} $DA $HTTP_OPT $IN_FMT \
 		-i "$SRC" -map 0:v:0 -c:v copy -f "$VF" - $AF 2>>"$LOG"
 fi | PLAY=1 NOWRITE=1 RENDER="$RENDER" SCALE="$SCALE" PLAY_SOCK="$SOCK" \
 	"$BIN" - $VWH >>"$LOG" 2>&1'
