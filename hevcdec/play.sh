@@ -371,6 +371,13 @@ do_play() {
 	VF=hevc; VWH=""
 	[ "$VC" = h264 ] && { VF=h264; [ -n "$VW" ] && VWH="$VW $VH"; }
 	say "编码：$VC（ffmpeg -f $VF）${VWH:+ ${VW}x$VH}${IN_FMT:+  输入 $IN_FMT}"
+	# 这块板子上 H.264 **解不出帧**（实测 2026-11-19，720p x264 8bit 4:2:0）：
+	# 会话开得起来、S_FMT 全对、喂进 6 个 AU，DQBUF 一个都不出，1.6s 后
+	# 被看门狗重建会话，连续 5 次后退出；dmesg 只有 hard reset n=6。
+	# 播放器侧没错（CODEC=h264 / V4L2_PIX_FMT_H264 都给到了），死的是
+	# meson-vdec 的 codec_h264 那条路。不提前喊一声，表现就是"在放但全黑"：
+	# 位置照走、遥控照应，最容易被当成遥控器或上屏链的问题查半天。
+	[ "$VC" = h264 ] && say "警告：H.264 硬解在这块板子上解不出帧（meson-vdec codec_h264 未通），继续只会黑屏"
 	# 裸流没有时间戳，不能 seek：宁可拒绝，也别让人以为"跳过去了"
 	if [ "$NAKED" = 1 ] && [ "$SS" != "0" ] && [ "$SS" != "0.0" ]; then
 		die "裸流（$SRC）不能从 $SS 秒起播，没有时间戳可 seek"
