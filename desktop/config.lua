@@ -151,6 +151,15 @@ M.reader_script = env("DESKTOP_READER_SCRIPT", "")   -- 整条命令模板，%s 
 M.play_cmd = env("DESKTOP_PLAY_CMD", "/root/play.sh")
 M.play_script = env("DESKTOP_PLAY_SCRIPT", "")
 M.launch_log = env("DESKTOP_LAUNCH_LOG", "/tmp/desktop-launch.log")
+
+-- 外部 app 的自动化口 / 状态文件：桌面把它们汇总成一份语义 state 给 agent，
+-- 模型就不用自己挨个 socket 去问，也不用看截图猜"在播什么、播到第几秒"。
+M.reader_sock = env("READER_AUTOMATION_SOCK", "/tmp/native-reader-automation.sock")
+M.play_sock = env("PLAY_SOCK", "/tmp/play.sock")
+M.play_state = env("DESKTOP_PLAY_STATE", "/tmp/play.state")
+
+-- 能力白名单开关：默认不让 agent 关掉桌面/外部 app 这类动作
+M.allow_quit = env("DESKTOP_ALLOW_QUIT", "") ~= ""
 -- 播放器上屏看门狗：play.sh 自己打的 RENDER: <后端> (caps …) 是唯一可信判据
 M.play_log = env("DESKTOP_PLAY_LOG", "/tmp/play.log")
 M.play_onscreen_ms = tonumber(env("DESKTOP_PLAY_ONSCREEN_MS", "25000") or 25000)

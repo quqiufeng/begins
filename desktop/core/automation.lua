@@ -41,9 +41,81 @@ local O_NONBLOCK = 0x800
 local MSG_NOSIGNAL = 0x4000
 
 local BUF = 65536
+local POLL_BUF = ffi.new("char[?]", BUF)
 
 local M = {}
 M.__index = M
+
+-- ---------- 能力白名单 ----------
+--
+-- 协议通了不等于什么都该能做：agent 的自由度不等于 root 自由度。
+-- handlers.caps 给了就按它裁，没给（老调用方/测试）则全放行。
+--   caps.cmds   = { ping=true, state=true, click=true, ... }   允许的顶层命令
+--   caps.click  = { "^nav%.[a-z]+$", "^select%." }             允许的动作 id（表 == 字面名，含正则元字符的按模式）
+--   caps.keys   = { LEFT=true, OK=true }                      允许的键名
+--   caps.calls  = { "^app%." , "^reader%." }                  允许的 call fn
+local function name_match(s, p)
+	if s == p then return true end
+	-- 带正则元字符的当模式；纯名字把点号转义（app.capture 不该匹配 appXcapture）
+	if p:find("[%%%^%$%*%+%?%[%(]") then return s:match(p) ~= nil end
+	return s:match((p:gsub("%.", "%%."))) ~= nil
+end
+
+local function any_match(list, s)
+	if not list then return true end
+	for i = 1, #list do
+		if name_match(s, list[i]) then return true end
+	end
+	return false
+end
+
+function M:allowed(cmd, req)
+	local caps = self.handlers.caps
+
+	if not caps then return true end
+	if caps.cmds and not caps.cmds[cmd] then return false, cmd end
+	if cmd == "click" then
+		local id = tostring(req.id or "")
+
+		if not any_match(caps.click, id) then return false, "click " .. id end
+	elseif cmd == "key" then
+		local n = tostring(req.name or ""):upper()
+
+		if caps.keys and not caps.keys[n] then return false, "key " .. n end
+	elseif cmd == "call" then
+		local fn = tostring(req.fn or "")
+
+		if not any_match(caps.calls, fn) then return false, "call " .. fn end
+	end
+	return true
+end
+
+-- ---------- 状态指纹（动作幂等 + 可验证） ----------
+--
+-- 每个动作应答都带 state_digest + changed：模型据此判断「按了到底有没有起作用」，
+-- 而不是发完 nav.ok 就假设成功。digest 只覆盖控制面（路径/选中/前后台/页码），
+-- 不含 pos_ms 这种每秒都变的量，否则 changed 永远是 true，等于没有。
+local function fnv1a(s)
+	local h = 2166136261
+
+	for i = 1, #s do
+		h = bit.bxor(h, s:byte(i))
+		-- h * 16777619 mod 2^32，用 32 位乘法拆开算（Lua 数字是 double）
+		h = (h * 16777619) % 4294967296
+	end
+	return ("%08x"):format(h)
+end
+
+function M:digest()
+	local H = self.handlers
+	local ok, s = pcall(function()
+		if H.digest then return H.digest() end
+		return json.encode(H.state and H.state() or {})
+	end)
+
+	if not ok or type(s) ~= "string" then s = tostring(s) end
+	return fnv1a(s)
+end
 
 local function set_nonblock(fd)
 	local fl = C.fcntl(fd, F_GETFL, 0)
@@ -83,6 +155,31 @@ function M.start(path, handlers)
 	return self
 end
 
+-- 动作应答统一包一层：digest 前后对比 → changed。
+-- 延迟执行的动作（会阻塞主循环的那种，比如开播放器）只回当前 digest，
+-- changed 由调用方下一轮 state/digest 自己看。
+function M:mutate(fn)
+	local before = self:digest()
+	local ok, r = pcall(fn)
+
+	if not ok then
+		return json.encode({ ok = false, error = tostring(r), state_digest = before })
+	end
+	r = type(r) == "table" and r or { ok = true }
+	r.ok = r.ok ~= false
+	if r.deferred then
+		r.state_digest = before
+	else
+		local after = self:digest()
+
+		r.state_digest = after
+		-- 转发给 reader/player 的动作自己知道「变了没」（页码/暂停位），
+		-- 它们给了 changed 就用它们的，别被桌面本地指纹盖成 false
+		if r.changed == nil then r.changed = after ~= before end
+	end
+	return json.encode(r)
+end
+
 -- 处理一条请求，返回应答字符串
 function M:handle(line)
 	local req, perr = json.decode(line)
@@ -93,12 +190,25 @@ function M:handle(line)
 	local H = self.handlers
 	local cmd = req.cmd or ""
 
+	-- 白名单在最前面裁：被拒的请求不该有任何副作用
+	local pass, deny = self:allowed(cmd, req)
+
+	if not pass then
+		return json.encode({
+			ok = false, denied = true,
+			error = "capability denied: " .. tostring(deny),
+		})
+	end
+
 	if cmd == "ping" then return json.encode({ ok = true, pong = true }) end
 	if cmd == "list" then
 		return json.encode({ ok = true, actions = H.actions and H.actions() or {} })
 	end
 	if cmd == "state" then
 		return json.encode({ ok = true, state = H.state and H.state() or {} })
+	end
+	if cmd == "digest" then
+		return json.encode({ ok = true, state_digest = self:digest() })
 	end
 	if cmd == "brief" then
 		-- 扁平摘要：控制端（keybord/sock.lua）在盒子上没有 cjson，极简解码
@@ -112,53 +222,63 @@ function M:handle(line)
 			count = st.count, selected = st.selected,
 			preview = st.preview and true or false,
 			sel = it.name, sel_dir = it.dir and true or false,
+			sel_kind = it.kind, sel_size = it.size_h,
+			pos = st.pos, total = st.count,
+			-- 现在前台是谁、在播什么：agent/keybd 判断"该发什么键"的依据
+			app = st.screen and st.screen.app or "desktop",
+			file = st.screen and st.screen.file or it.name,
+			media_pos = st.media and st.media.pos_ms or nil,
+			media_dur = st.media and st.media.dur_ms or nil,
+			book_page = st.book and st.book.page or nil,
+			book_pages = st.book and st.book.pages or nil,
 			cols = st.cols, rows = st.rows,
 			reader = st.reader and true or false,
 			player = st.player and true or false,
 		})
 	end
 	if cmd == "click" then
-		if self.busy then
-			-- 外部 app 独占屏幕期间只有一件事还能做：返回 = 收掉它回桌面。
-			-- 交给上层的 H.busy 判定（播放中按返回退出播放），其余照旧回 busy。
-			if H.busy then
-				local ok2, r2 = pcall(H.busy, tostring(req.id or ""), "click")
+		local id = tostring(req.id or "")
 
-				if ok2 and type(r2) == "table" then return json.encode(r2) end
+		return self:mutate(function()
+			if self.busy then
+				-- 外部 app 独占屏幕期间只有一件事还能做：返回 = 收掉它回桌面。
+				if H.busy then
+					local ok2, r2 = pcall(H.busy, id, "click")
+
+					if ok2 and type(r2) == "table" then return r2 end
+				end
+				return { ok = false, error = "busy: 外部 app 正在独占屏幕" }
 			end
-			return json.encode({ ok = false, error = "busy: 外部 app 正在独占屏幕" })
-		end
-		local ok, r = pcall(H.click, tostring(req.id or ""))
-
-		if not ok then return json.encode({ ok = false, error = tostring(r) }) end
-		r = type(r) == "table" and r or { ok = true }
-		r.ok = r.ok ~= false
-		return json.encode(r)
+			return H.click(id)
+		end)
 	end
 	if cmd == "key" then
-		if self.busy then
-			-- 同上：播放/阅读中，"返回"要能收掉外部 app（退出播放）
-			if H.busy then
-				local ok2, r2 = pcall(H.busy, tostring(req.name or ""), "key")
+		local name = tostring(req.name or "")
 
-				if ok2 and type(r2) == "table" then return json.encode(r2) end
+		return self:mutate(function()
+			if self.busy then
+				if H.busy then
+					local ok2, r2 = pcall(H.busy, name, "key")
+
+					if ok2 and type(r2) == "table" then return r2 end
+				end
+				return { ok = false, error = "busy: 外部 app 正在独占屏幕" }
 			end
-			return json.encode({ ok = false, error = "busy: 外部 app 正在独占屏幕" })
-		end
-		local ok, r = pcall(H.key, tostring(req.name or ""))
+			local ok, r = pcall(H.key, name)
 
-		if not ok then return json.encode({ ok = false, error = tostring(r) }) end
-		r = type(r) == "table" and r or { ok = true }
-		r.ok = r.ok ~= false
-		return json.encode(r)
+			if not ok then return { ok = false, error = tostring(r) } end
+			return type(r) == "table" and r or { ok = true }
+		end)
 	end
 	if cmd == "call" then
-		local ok, r = pcall(H.call, tostring(req.fn or ""), req.args or {})
+		local fn = tostring(req.fn or "")
 
-		if not ok then return json.encode({ ok = false, error = tostring(r) }) end
-		r = type(r) == "table" and r or { ok = true }
-		r.ok = r.ok ~= false
-		return json.encode(r)
+		return self:mutate(function()
+			local ok, r = pcall(H.call, fn, req.args or {})
+
+			if not ok then return { ok = false, error = tostring(r) } end
+			return type(r) == "table" and r or { ok = true }
+		end)
 	end
 	return json.encode({ ok = false, error = "unknown cmd: " .. tostring(cmd) })
 end
@@ -183,7 +303,9 @@ function M:poll()
 	self:accept_all()
 
 	local handled = 0
-	local buf = ffi.new("char[?]", BUF)
+	-- 缓冲区复用：每帧 new 一块 64KB 的 ffi 数组纯属给 GC 找事；
+	-- recv 之后立刻 ffi.string 拷出来，嵌套调用（launcher 的 pump）也不会串味。
+	local buf = POLL_BUF
 
 	for i = self.n, 1, -1 do
 		local cl = self.clients[i]

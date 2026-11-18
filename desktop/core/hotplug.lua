@@ -75,6 +75,8 @@ local MS_RDONLY, MS_NOSUID, MS_NODEV, MS_NOEXEC, MS_NOATIME = 1, 2, 4, 8, 0x400
 local MNT_DETACH = 2
 
 local UEVENT_BUF = 8192
+-- /sys 那边每帧也可能被扫，一次分配反复用
+local EV_BUF = ffi.new("char[?]", UEVENT_BUF)
 local MAX_EVENTS = 64 -- 单帧最多吃这么多条，防止刷屏事件把帧拖长
 
 -- ---------- 小工具 ----------
@@ -173,15 +175,20 @@ end
 -- 挂载点名字：优先卷标，取不到用设备名；剔掉会惹事的字符
 local function label_of(dev)
 	local base = basename(dev)
+	local list = readdir and readdir("/dev/disk/by-label") or {}
 
-	for _, name in ipairs(readdir and readdir("/dev/disk/by-label") or {}) do
-		local buf = ffi.new("char[512]")
-		local n = F.readlink("/dev/disk/by-label/" .. name, buf, 511)
+	if #list > 0 then
+		-- 一个缓冲区问遍所有标签：每次 new 一块是给 GC 白送活
+		local lbuf = ffi.new("char[512]")
 
-		if n > 0 then
-			local tgt = ffi.string(buf, tonumber(n))
+		for _, name in ipairs(list) do
+			local n = F.readlink("/dev/disk/by-label/" .. name, lbuf, 511)
 
-			if basename(tgt) == base then return name end
+			if n > 0 then
+				local tgt = ffi.string(lbuf, tonumber(n))
+
+				if basename(tgt) == base then return name end
+			end
 		end
 	end
 	-- 盒子上不一定有 udev（也就没有 /dev/disk/by-label），那就自己认文件系统：
@@ -495,7 +502,7 @@ function M:poll(now)
 	local changed = false
 
 	if self.fd then
-		local buf = ffi.new("char[?]", UEVENT_BUF)
+		local buf = EV_BUF
 
 		for _ = 1, MAX_EVENTS do
 			local n = tonumber(F.recv(self.fd, buf, UEVENT_BUF, MSG_DONTWAIT))

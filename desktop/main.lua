@@ -36,7 +36,10 @@ local hotplug = require("core.hotplug")
 local automation = require("core.automation")
 local png = require("util.png")
 local json = require("util.json")
+local peer = require("core.peer")
+local semantic = require("core.semantic")
 
+local bit = require("bit")
 local floor, min, max = math.floor, math.min, math.max
 
 -- ---------- 日志 ----------
@@ -64,6 +67,8 @@ local g = grid.new(cfg, theme, ttf, txt, img, ico, sdl)
 local bar = chrome.new(cfg, theme, ttf)
 local pv = preview.new(cfg, sdl, img, ttf)
 local launcher_ = launcher.new(cfg, win, bar)
+-- 语义状态：把 fs/preview/播放器/reader 的现场汇总成 state 里的文字
+local sem = semantic.new(cfg, fs, pv, launcher_)
 local auto
 
 -- ---------- 热插拔（U 盘）----------
@@ -124,13 +129,25 @@ local function toast(msg, sec, color) bar:toast(msg, sec, color); dirty = true e
 local function layout()
 	if not win.ren then return end
 	g:layout(win.W, win.H)
+	sem.info = { theme = theme.name, cols = g.cols, rows = g.rows }
 	dirty = true
 end
+
+-- 最近一次交出去的外部 app（reader/player）：前台语义靠它 + launcher_:busy()
+local last_open = nil
 
 local function open_current()
 	local item = fs:current()
 
 	if not item then toast("没有可打开的文件"); return end
+	-- 记下这次交出去打开的东西：运行期间 state 要能回答"前台是谁、在放哪一部"
+	if item.kind == "ebook" then
+		last_open = { app = "reader", file = item.name, path = item.path, ts = os.time() }
+		sem.last_open = last_open
+	elseif item.kind == "video" or item.kind == "audio" then
+		last_open = { app = "player", file = item.name, path = item.path, ts = os.time() }
+		sem.last_open = last_open
+	end
 	local res, err = launcher_:open(fs, pv, item)
 
 	-- 外部 app 回来了：解除自动化口的 busy（pump 期间只答只读查询）
@@ -305,6 +322,151 @@ local function capture(path)
 	return path
 end
 
+-- ---------- 能力白名单 ----------
+--
+-- agent 的自由度 ≠ root 自由度。协议一旦通了就什么都能干，等于把 root 交出去，
+-- 所以这里显式列一遍「哪些动作可以、可以到什么程度」：
+--   nav.* / 方向键      可逆、无副作用 → 随便按
+--   select./open.       只作用于当前目录里真实存在的条目
+--   call               只有桌面自己的查询/截图 + reader/player 的自动化口，不给 shell
+--   关桌面、关外部 app   默认拒绝（要开得显式 DESKTOP_ALLOW_QUIT=1）
+-- 白名单的判定在 core/automation.lua（:-allowed），这里是唯一那份配置。
+local CAPS = {
+	cmds = {
+		ping = true, list = true, state = true, brief = true, digest = true,
+		click = true, key = true, call = true,
+	},
+	click = { "^nav%.[a-z]+$", "^select%.", "^open%." },
+	keys = {
+		LEFT = true, RIGHT = true, UP = true, DOWN = true,
+		PAGEUP = true, PAGEDOWN = true, HOME = true, END = true,
+		OK = true, ENTER = true, RETURN = true, SPACE = true,
+		BACK = true, ESC = true, ESCAPE = true,
+		REFRESH = true, F5 = true, UP_DIR = true,
+		ROOTS = true, TAB = true, NEXTROOT = true,
+		MENU = true, T = true, THEME = true,
+	},
+	calls = {
+		"^app%.capture$", "^app%.goto$", "^app%.rescan$", "^app%.size$",
+		"^app%.key$", "^reader%.[%w_.]+$", "^player%.[%w_.]+$",
+	},
+}
+
+if cfg.allow_quit then
+	CAPS.keys.QUIT, CAPS.keys.EXIT = true, true
+	CAPS.click[#CAPS.click + 1] = "^view%.quit$"
+	CAPS.calls[#CAPS.calls + 1] = "^app%.quit$"
+end
+
+-- reader 的 call 参数是扁平的（它按 path/page/q… 自己取字段），照它的口味拼
+local function flatten_into(dst, args)
+	for k, v in pairs(args or {}) do
+		if type(v) ~= "table" then dst[k] = v end
+	end
+	return dst
+end
+
+-- 转发一条给 reader：返回它的应答表，或 nil, err（err == "absent" 就是没在跑）
+local function reader_do(sub, args, timeout)
+	-- 不再先 access() 判存在：直接问，省一次系统调用也省一次 TOCTOU
+	-- state/ping 自己就带页码，不用再问一次 book 算 changed
+	local ask = sub ~= "state" and sub ~= "ping"
+	local b0
+
+	if ask then
+		sem:invalidate("book")
+		b0 = sem:book()
+	end
+	local req
+
+	if sub == "state" or sub == "ping" then
+		req = flatten_into({ cmd = sub }, args)
+	else
+		req = flatten_into({ cmd = "call", fn = "reader." .. sub }, args)
+	end
+	local r, err = peer.req(cfg.reader_sock, req, timeout or 2500)
+
+	if not r then return nil, err end
+	if ask and type(r) == "table" then
+		-- 缓存里是问之前的那一份，变化得重新问才知道，别让 TTL 把 changed 吃掉
+		sem:invalidate("book")
+		local b1 = sem:book()
+
+		if b0 and b1 then
+			r.changed = (b0.page ~= b1.page) or (b0.library ~= b1.library)
+		end
+	end
+	return r
+end
+
+-- 一个门进所有能力：call "reader.next" / "reader.state" 由桌面转发给 reader 的自动化口。
+-- 读（state/ping）必须当场回，否则 agent 拿不到页码；
+-- 改（翻页/开书）可能慢，挂到帧末跑，别把 30fps 主循环按住两秒半。
+local function reader_call(fn, args)
+	local sub = fn:match("^reader%.(.+)$")
+
+	if not sub then return { ok = false, error = "fn 用法：reader.state / reader.next" } end
+	if sub ~= "state" and sub ~= "ping" then
+		return defer(function()
+			local _, err = reader_do(sub, args)
+
+			if err then logf(("转发 reader.%s 失败：%s"):format(sub, tostring(err))) end
+		end, "reader." .. sub)
+	end
+	local r, err = reader_do(sub, args, 2500)
+
+	if not r then
+		if err == "absent" then
+			return { ok = false, error = "阅读器没在跑：" .. cfg.reader_sock }
+		end
+		return { ok = false, error = "reader 无应答：" .. tostring(err) }
+	end
+	return r
+end
+
+-- 播放器控制口是文本协议（status/pos/pause/…）。只放这几条：
+-- 按键/seek 走 key、nav.*，这里不开一条能重开整条播放链的路。
+local PLAYER_CMDS = {
+	status = true, pos = true, pause = true, resume = true,
+	toggle = true, mute = true, vol = true,
+}
+
+local PLAYER_HELP = "播放器只支持 player.status/pos/pause/resume/toggle/mute/vol"
+
+local function player_call(fn, args)
+	local sub = fn:match("^player%.(.+)$")
+
+	if not sub or not PLAYER_CMDS[sub] then return { ok = false, error = PLAYER_HELP } end
+	local cmd = sub
+
+	if sub == "vol" then
+		cmd = ("vol %d"):format(tonumber(args and (args.level or args.vol)) or 100)
+	end
+	-- 播放器的控制口只回一条命令的结果，不告诉你"到底变没变"：
+	-- 改状态的那几条命令前后各问一次 status，自己算 changed。
+	local mutating = sub ~= "status" and sub ~= "pos"
+	local s0 = mutating and peer.text(cfg.play_sock, "status", 300) or nil
+	local r, raw = peer.text(cfg.play_sock, cmd, 500)
+
+	if not r then
+		if raw == "absent" then
+			return { ok = false, error = "播放器控制口不在：" .. cfg.play_sock }
+		end
+		return { ok = false, error = "播放器无应答：" .. tostring(raw) }
+	end
+	-- 播放状态变了：语义缓存里的 pos/paused 立刻作废
+	if mutating then sem:invalidate("media") end
+	if mutating then
+		local s1 = peer.text(cfg.play_sock, "status", 300)
+
+		if s0 and s1 then
+			r.changed = (s0.paused ~= s1.paused) or (s0.mute ~= s1.mute)
+				or (s0.vol ~= s1.vol)
+		end
+	end
+	return r
+end
+
 local ACTIONS = {
 	"nav.left", "nav.right", "nav.up", "nav.down", "nav.pageup", "nav.pagedown",
 	"nav.home", "nav.end", "nav.ok", "nav.back", "nav.refresh", "nav.roots",
@@ -379,9 +541,12 @@ auto = automation.start(cfg.sock, {
 		end
 		return list
 	end,
+	-- 语义优先：路径/选中项/前台是谁/在播什么/看到第几页，agent 读文字就够，
+	-- 不必截图猜。fs:state() 的老字段一个不动，老调用方照旧能用。
 	state = function()
 		local st = fs:state()
 
+		for k, v in pairs(sem:state()) do st[k] = v end
 		st.preview = pv.open and pv.idx or false
 		st.window = { w = win.W, h = win.H, driver = win.driver }
 		st.cols, st.rows = g.cols, g.rows
@@ -400,6 +565,10 @@ auto = automation.start(cfg.sock, {
 		st.player = launcher_:has_player()
 		return st
 	end,
+	-- 控制面指纹（动作应答里的 state_digest / changed 由 automation 加）
+	digest = function() return sem:digest() end,
+	-- 能力白名单：nav.* 随便按，call 只到 reader/player 的 API，关桌面要显式开
+	caps = CAPS,
 	click = function(id) return on_click(id) end,
 	-- 外部 app（播放器/阅读器）独占屏幕期间唯一放行的操作：「返回」= 收掉它。
 	-- 播放电影时按返回要能退出播放，而不是回一句 busy 让遥控器看着像失灵。
@@ -452,6 +621,10 @@ auto = automation.start(cfg.sock, {
 		elseif fn == "app.quit" then
 			running = false
 			return { ok = true }
+		elseif fn:match("^reader%.") then
+			return reader_call(fn, args)
+		elseif fn:match("^player%.") then
+			return player_call(fn, args)
 		end
 		return { ok = false, error = "未知 fn " .. tostring(fn) }
 	end,
