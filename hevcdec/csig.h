@@ -28,6 +28,8 @@ struct ColorMetadata {
 	int matrix;			/* VUI matrix_coeffs: 1=709 9=2020NCL 14=ICtCp */
 	int range;			/* VUI video_full_range_flag: 0=limited 1=full */
 	int bit_depth;			/* 8/10/12，limited 展开的移位量靠它 */
+	int sar_num, sar_den;		/* VUI sample aspect ratio（像素宽高比），
+					 * 0 = VUI 没写，按 1:1 处理 */
 	float mastering_min_luminance;	/* SEI 137，nits */
 	float mastering_max_luminance;	/* SEI 137，nits */
 	float max_cll;			/* SEI 144，nits */

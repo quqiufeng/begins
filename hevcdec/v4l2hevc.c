@@ -1647,11 +1647,12 @@ static int sps_size(unsigned *ow, unsigned *oh)
 					if (sps_color_parse(buf, n, ptls[k], &cm))
 						memcpy(&g_cm, &cm, sizeof(cm));
 					if (getenv("SPSDBG"))
-						printf("SPSDBG ptl=%d -> %ux%u 色域=%s(%d) tf=%d mx=%d rng=%d bd=%d\n",
+						printf("SPSDBG ptl=%d -> %ux%u 色域=%s(%d) tf=%d mx=%d rng=%d bd=%d sar=%d:%d\n",
 						       ptls[k], *ow, *oh, cm_gamut(),
 						       g_cm.primaries, g_cm.transfer,
 						       g_cm.matrix, g_cm.range,
-						       g_cm.bit_depth);
+						       g_cm.bit_depth,
+						       g_cm.sar_num, g_cm.sar_den);
 					return 1;
 				}
 			}
@@ -3572,9 +3573,27 @@ int main(int argc, char **argv)
 		render_dump_state(NULL);
 	}
 
-	/* 事件订阅和 STREAMON 已经在 vdec_open 里做完了，这里只剩输出文件 */
-	out = getenv("NOWRITE") ? NULL : fopen(getenv("OUTYUV") ? getenv("OUTYUV")
-					       : "/tmp/out.yuv", "wb");
+	/* 事件订阅和 STREAMON 已经在 vdec_open 里做完了，这里只剩输出文件。
+	 * 默认值分两种：纯解码（无播放/无渲染）仍然落 /tmp/out.yuv，那是本工具
+	 * 产 YUV 给人验的用法；一旦上了屏（PLAY，rend 非空），裸 YUV 就是纯浪费
+	 * ——1080p 3.1 MB/帧，实测把 e2e 从 23.6 fps 拖到 18.2 fps，4K 更糟。
+	 * 要边播边落盘就显式给 OUTYUV（相当于自我确认），NOWRITE 仍然优先。
+	 */
+	{
+		const char *oy = getenv("OUTYUV");
+		int dump = 0;
+
+		if (!getenv("NOWRITE")) {
+			if (oy)
+				dump = 1;
+			else if (!getenv("PLAY"))
+				dump = 1;	/* 纯解码：照旧落 /tmp/out.yuv */
+		}
+		out = dump ? fopen(oy ? oy : "/tmp/out.yuv", "wb") : NULL;
+		if (dump && getenv("PLAY"))
+			printf("OUT: 落盘 %s（OUTYUV 显式给了）\n",
+			       oy ? oy : "/tmp/out.yuv");
+	}
 	t0 = now_s();
 	g_verbose = getenv("VERBOSE") != NULL;
 	rap_enter(RAP_WAIT, "start");	/* 起播也走同一个闸门 */

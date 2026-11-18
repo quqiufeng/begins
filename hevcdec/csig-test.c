@@ -102,7 +102,7 @@ static void w_ue(struct bwr *w, unsigned v)
 	w_b(w, v1, lz + 1);
 }
 
-static int mk_sps(unsigned char *buf, size_t cap, int with_vui)
+static int mk_sps(unsigned char *buf, size_t cap, int with_vui, int ar_idc)
 {
 	struct bwr w = { buf, cap, 0, 0 };
 	int i;
@@ -135,7 +135,16 @@ static int mk_sps(unsigned char *buf, size_t cap, int with_vui)
 	w_b(&w, 0, 1);			/* strong_intra_smoothing_enabled_flag */
 	w_b(&w, with_vui, 1);		/* vui_parameters_present_flag */
 	if (with_vui) {
-		w_b(&w, 0, 1);		/* aspect_ratio_info_present_flag */
+		/* ar_idc: 0 = 没写 aspect_ratio_info，1 = idc 1 (1:1)，
+		 * 255 = Ext_SAR（显式 16:15，模拟 720x576 那类老片源） */
+		w_b(&w, ar_idc ? 1 : 0, 1);	/* aspect_ratio_info_present_flag */
+		if (ar_idc) {
+			w_b(&w, ar_idc, 8);	/* aspect_ratio_idc */
+			if (ar_idc == 255) {
+				w_b(&w, 16, 16);	/* sar_width */
+				w_b(&w, 15, 16);	/* sar_height */
+			}
+		}
 		w_b(&w, 0, 1);		/* overscan_info_present_flag */
 		w_b(&w, 1, 1);		/* video_signal_type_present_flag */
 		w_b(&w, 5, 3);		/* video_format = unspecified */
@@ -155,9 +164,9 @@ static int t_sps(void)
 {
 	unsigned char buf[256];
 	struct ColorMetadata cm;
-	int n;
+	int n, rc;
 
-	n = mk_sps(buf, sizeof(buf), 1);
+	n = mk_sps(buf, sizeof(buf), 1, 0);
 	if (n < 0) { printf("  [FAIL] 合成 SPS 溢出\n"); fails++; return fails; }
 
 	memset(&cm, 0, sizeof(cm));
@@ -178,8 +187,20 @@ static int t_sps(void)
 	if (strcmp(cm_gamut(), "BT.2020"))
 		fails++;
 
+	/* SAR（aspect_ratio_info）：idc 1 -> 1:1；Ext_SAR -> 显式 16:15 */
+	memset(&cm, 0, sizeof(cm));
+	n = mk_sps(buf, sizeof(buf), 1, 1);
+	rc = sps_color_parse(buf, n, 88, &cm);	/* 先跑再抽查，别让实参求值顺序坑人 */
+	chks(rc && cm.sar_num == 1 && cm.sar_den == 1,
+	     "SAR idc=1 -> 1:1", cm.sar_num * 100 + cm.sar_den, 101);
+	memset(&cm, 0, sizeof(cm));
+	n = mk_sps(buf, sizeof(buf), 1, 255);
+	rc = sps_color_parse(buf, n, 88, &cm);
+	chks(rc && cm.sar_num == 16 && cm.sar_den == 15,
+	     "SAR Ext_SAR -> 16:15", cm.sar_num * 100 + cm.sar_den, 1615);
+
 	/* 没有 VUI：返回 0，且不把 cm 改脏 */
-	n = mk_sps(buf, sizeof(buf), 0);
+	n = mk_sps(buf, sizeof(buf), 0, 0);
 	memset(&cm, 0, sizeof(cm));
 	cm.primaries = 77;	/* 哨兵：解析失败时不该被动过 */
 	chks(!sps_color_parse(buf, n, 88, &cm), "无 VUI -> 返回 0", 0, 0);

@@ -17,7 +17,8 @@
 #
 # 为什么必须设这些变量（漏了就是黑屏而不是报错）：
 #   PLAY=1     不设则根本不走渲染路径，解码结果落盘，屏幕上什么都不变
-#   NOWRITE=1  不设则写 /tmp/out.yuv，4K 约 150MB/s，几秒写满 tmpfs 并拖到 10fps
+#   NOWRITE=1  老版本必须；现在 PLAY=1 默认就不落盘（显式 OUTYUV 才写），
+#              保留只为向下兼容，改默认前漏设过：1080p 写盘把 23.6 拖到 18.2 fps
 #   -re        ffmpeg 按片源节拍供流，管道水位可控；播放器另有自己的节拍
 #   容器 → Annex-B  ffmpeg -c copy -f hevc，首包才有 start code、SPS 才读得出来
 set -u

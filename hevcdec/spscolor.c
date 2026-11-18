@@ -117,12 +117,29 @@ static int skip_st_rps(struct brd *b, unsigned idx, unsigned *num_pocs,
 
 static int parse_vui(struct brd *b, struct ColorMetadata *cm)
 {
-	/* ... 直到 colour_description：后面的 aspect ratio、timing、bitstream
-	 * restriction 都不影响颜色，读到 matrix_coeffs 就收工。 */
+	/* aspect_ratio 不影响颜色，但影响几何：像素不是方的片源（720x576
+	 * SAR 16:15 那类）如果把容器宽高当显示宽高，会算错黑边、也选错渲染
+	 * target 尺寸（glout.c 的比例守卫）。idc 表在 H.265 E.2.1。 */
 	if (br_b(b, 1)) {			/* aspect_ratio_info_present_flag */
-		if (br_b(b, 8) == 255) {	/* aspect_ratio_idc == Ext_SAR */
-			br_b(b, 16);
-			br_b(b, 16);
+		unsigned idc = br_b(b, 8);
+		unsigned num = 0, den = 0;
+
+		if (idc == 255) {		/* Ext_SAR：直接给分子分母 */
+			num = br_b(b, 16);
+			den = br_b(b, 16);
+		} else if (idc >= 1 && idc <= 16) {
+			static const unsigned char t[17][2] = {
+				{0,0},   {1,1},   {12,11}, {10,11}, {16,11},
+				{40,33}, {24,11}, {20,11}, {32,11}, {80,33},
+				{18,11}, {15,11}, {64,33}, {160,99},{4,3},
+				{3,2},   {2,1},
+			};
+			num = t[idc][0];
+			den = t[idc][1];
+		}
+		if (num && den) {		/* 未标识(0)/保留(17..254) 就不写 */
+			cm->sar_num = (int)num;
+			cm->sar_den = (int)den;
 		}
 	}
 	if (br_b(b, 1))				/* overscan_info_present_flag */
