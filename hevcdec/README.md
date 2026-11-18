@@ -108,6 +108,51 @@ head -4 /sys/kernel/debug/dri/0/state    # plane[40]: allocated by = v4l2hevc-aa
 注意 `FPS`/`LEAD` 一旦被赋成空串，播放器那边 `atof("") = 0`，节拍就废了，
 所以脚本只在非空时才 export。
 
+### 给 lua 脚本用：`libpctl.so`（FFI 直连控制面）
+
+`play.sh` 是给人用的；脚本/自动化要控播放，走 `pctl_ffi.c` 编出来的
+`libpctl.so`——同一个 `/tmp/play.sock` 协议，但一次 FFI 调用就到播放器，
+不 fork、不拼 shell：
+
+```c
+const char *pctl_cmd(const char *cmd);   /* 原始命令，返回一行 JSON（线程本地） */
+const char *pctl_status(void);           /* 状态 JSON，没在放返回 NULL */
+int  pctl_ping(void);                    /* 1 活着 */
+int  pctl_paused(void);                  /* 1 暂停 0 播放 -1 失败 */
+int  pctl_pos_ms(void);  double pctl_pos_sec(void);
+int  pctl_pause(void); pctl_resume(void);
+int  pctl_toggle(void);                  /* 返回切换后的暂停态 */
+int  pctl_mute(void);                    /* 返回切换后的静音态 */
+int  pctl_vol(int delta);                /* ±N，返回新音量 */
+int  pctl_set_vol(int v);                /* 绝对 0..150 */
+int  pctl_seek(int sec);                 /* 相对跳播（整条链重开，约 1s 黑屏） */
+int  pctl_quit(void);
+int  pctl_run(const char *args);         /* 跑 play.sh 子命令，返回子进程 pid */
+int  pctl_play(const char *src, const char *opts);       /* 起播，立刻返回 */
+int  pctl_play_wait(const char *src, const char *opts, int wait_ms);
+const char *pctl_err(void);              /* 最近一次失败原因 */
+```
+
+```bash
+make pctlffi            # 本机 libpctl.so
+make pctlffi CROSS=1    # libpctl-aarch64.so → 盒子 /opt/keybord/libpctl.so
+```
+
+```lua
+local ffi = require("ffi")
+ffi.cdef[[ const char *pctl_cmd(const char *); int pctl_paused(void);
+           int pctl_seek(int); int pctl_pos_ms(void); ]]
+local P = ffi.load("/opt/keybord/libpctl.so")
+P.pctl_seek(-30)                        -- 回退 30 秒
+print(ffi.string(P.pctl_cmd("status")))
+```
+
+盒子这边已经包好一层：`keybord/pctl.lua`（自动找 `.so`，找不到退回
+`sock.lua`；动作表 `status/pos/pause/resume/toggle/mute/vol/set_vol/seek/quit/play/run`），
+命令行演示是 `keybord/tools/movie.lua status|pos|seek -30|vol +10|play <片源>`。
+`keybord/apps/player.lua`（遥控器仲裁）也走的这条路，一个键一次 FFI 调用。
+
+
 ## 设计要点
 
 - 一个 AU 一个 OUTPUT buffer，驱动靠 `vififo offset` 与 `sess->timestamps` 匹配帧。

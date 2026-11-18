@@ -37,7 +37,7 @@ GL_CFLAGS := -O2 -Wall -Wformat
 PLAY_SRC := v4l2hevc.c spscolor.c render.c render_drm.c render_gl.c vout.c aout.c pctl.c osd.c
 PLAY_HDR := render.h vout.h hdrcolor.inc csig.h spscolor.h aout.h pctl.h rcmap.h osd.h
 
-.PHONY: all clean drm gl vout voutprobe glselftest aout aoutprobe hdrselftest mpvctl rcd
+.PHONY: all clean pctlffi drm gl vout voutprobe glselftest aout aoutprobe hdrselftest mpvctl rcd
 
 all: $(BIN)
 
@@ -142,10 +142,23 @@ hdr-selftest: hdr-selftest.c $(PLAY_HDR)
 raptest: raptest.c $(PLAY_SRC) $(PLAY_HDR)
 	$(CC_HOST) -O1 -Wall -DUSE_DRM -I. -o $@ raptest.c spscolor.c render.c render_drm.c render_gl.c vout.c -lm
 
+# ── libpctl.so：播放器控制面的 FFI 薄层（pctl_ffi.c）──────────────────────
+# lua/luajit 直接 ffi.load 就能暂停/快进/音量/起播，不再 fork `player -c`。
+#   make pctlffi            本机 libpctl.so
+#   make pctlffi CROSS=1    libpctl-aarch64.so（scp 到盒子 /opt/keybord/）
+PCTL_SO := libpctl$(if $(filter 1,$(CROSS)),-aarch64,).so
+
+pctlffi: $(PCTL_SO)
+
+$(PCTL_SO): pctl_ffi.c
+	$(CC) -O2 -Wall -Wextra -fPIC -shared -o $@ $<
+
+
 clean:
 	rm -f v4l2hevc v4l2hevc-aarch64 v4l2hevc-drm v4l2hevc-drm-aarch64 \
 	      v4l2hevc-gl-aarch64 glout glout-aarch64 *.yuv \
 	      glselftest glselftest-aarch64 \
 	      aout aout-aarch64 aoutctl aoutctl-aarch64 aoutprobe-aarch64 \
 	      mpvctl mpvctl-aarch64 rcinputd rcinputd-aarch64 \
-	      vout.o vout-aarch64.o voutprobe voutprobe-aarch64 raptest hdr-selftest hcvisual osdtest osd.ppm
+	      vout.o vout-aarch64.o voutprobe voutprobe-aarch64 raptest hdr-selftest hcvisual osdtest osd.ppm \
+	      libpctl.so libpctl-aarch64.so
