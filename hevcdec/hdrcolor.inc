@@ -11,8 +11,34 @@
 #define HDRCOLOR_INC
 
 #include <math.h>
+#include <stdlib.h>
+#include <string.h>
 
 enum { HC_CLIP = 0, HC_CURVE = 1, HC_REINHARD = 2, HC_HABLE = 3 };
+/* 输出编码：把曲线算出来的"屏幕线性光 d"写成 SDR 码值。
+ *   HC_ENC_G1886 —— d^(1/2.4)（BT.1886 显示 EOTF 的逆）。SDR 显示器实际是
+ *                   2.4 纯幂，硬要用 BT.709 OETF 会让暗部走 4.5 倍斜率的直线
+ *                   段：3nits 本该出 22 码，709 OETF 只给 3 码，整片暗场被压成
+ *                   纯黑（实测 ramp 与 zscale 差 MAE 11.7 码、22~43% 像素归零）。
+ *   HC_ENC_709    —— bt709 OETF，历史行为，留作 A/B（TM_ENC=709）。
+ * 实测（1000nit ramp vs ffmpeg zscale npl=1000.t=bt1886）：1886 → MAE 1.5 码。
+ */
+enum { HC_ENC_G1886 = 0, HC_ENC_709 = 1 };
+
+/* 唯一的非纯函数：读一次 TM_ENC，之后走静态缓存（每帧调也不疼）。
+ * TM_ENC=709 回到历史行为，缺省/其它值是 1886。 */
+static int hc_enc_env(void)
+{
+	static int e = -1;
+
+	if (e < 0) {
+		const char *s = getenv("TM_ENC");
+
+		e = (s && (!strcmp(s, "709") || !strcmp(s, "bt709"))) ?
+		    HC_ENC_709 : HC_ENC_G1886;
+	}
+	return e;
+}
 /* 色度增益的算法：
  *   HC_GAIN_CODE —— 码值域比值 nout/n（历史实现）：PQ 码是近似对数、709 码是近似
  *                   幂函数，比值没有物理意义，暗部会趋 0（彩色变灰）、高光过冲。
@@ -47,6 +73,7 @@ struct hdrcolor {
 	double sat;		/* 色度增益里的饱和度系数 */
 	double knee;		/* HC_CURVE 的拐点 0..1 */
 	int full;		/* 源是全范围（少见） */
+	int enc;		/* HC_ENC_*：输出码值用哪条 OETF 编码 */
 	int gain_mode;		/* HC_GAIN_* */
 	int transfer;		/* HC_TF_*：决定码值→线性光用哪条 EOTF */
 };
@@ -183,6 +210,15 @@ static double hc_bt709_eotf(double e)
 	return (e < 0.081) ? e / 4.5 : pow((e + 0.099) / 1.099, 1.0 / 0.45);
 }
 
+/* 屏幕线性光 d∈[0,1] → SDR 输出码 0..1（不含 16/219 偏移），按 c->enc 选编码 */
+static double hc_out_oetf(const struct hdrcolor *c, double d)
+{
+	if (d <= 0.0) return 0.0;
+	if (d >= 1.0) return 1.0;
+	if (c->enc == HC_ENC_709) return hc_bt709_oetf(d);
+	return pow(d, 1.0 / 2.4);	/* BT.1886：显示器是 2.4 幂，逆着编回去 */
+}
+
 static double hc_hable(double x)
 {
 	const double A = 0.15, B = 0.50, C = 0.10, D = 0.20, E = 0.02, F = 0.30;
@@ -306,7 +342,7 @@ static void hc_build(const struct hdrcolor *c, unsigned char lut[256],
 		L = hc_src_lin(c, n);
 		x = L / c->target;
 		d = hc_curve(c, x);
-		code = 16.0 + 219.0 * hc_bt709_oetf(d);
+		code = 16.0 + 219.0 * hc_out_oetf(c, d);
 		if (code < 0.0) code = 0.0;
 		if (code > 255.0) code = 255.0;
 		lut[v] = (unsigned char)(code + 0.5);

@@ -1847,6 +1847,7 @@ static void tm_to_hc(const struct tmctx *t, struct hdrcolor *c)
 	c->sat = t->sat;
 	c->knee = t->knee;
 	c->full = t->full;
+	c->enc = hc_enc_env();
 	c->gain_mode = t->gmode;
 	c->transfer = t->tf;
 }
@@ -1859,12 +1860,13 @@ static void tm_compile(void)
 	tm_to_hc(&tm, &c);
 	hc_build(&c, tm.lut, tm.gain);
 	tm.built = 1;
-	printf("TM: on tf=%s curve=%s gain=%s mat=%s peak=%.0fnits(%s) target=%.0fnits sat=%.2f knee=%.2f\n",
+	printf("TM: on tf=%s curve=%s gain=%s mat=%s enc=%s peak=%.0fnits(%s) target=%.0fnits sat=%.2f knee=%.2f\n",
 	       hc_tf_name(tm.tf),
 	       tm.curve == TM_CLIP ? "clip" : tm.curve == TM_REINHARD ? "reinhard" :
 	       tm.curve == TM_HABLE ? "hable" : "curve",
 	       tm.gmode == HC_GAIN_LIN ? "lin" : "code",
 	       tm.mat ? hc_mat_name(tm.pri) : "无",
+	       hc_enc_env() == HC_ENC_709 ? "bt709" : "bt1886",
 	       tm.src_peak, tm.src_env ? "env" : csig_peak() > 0.0 ? "sei" : "默认",
 	       tm.target, tm.sat, tm.knee);
 	if (!tm.sat_env && tm.sat < 0.999)

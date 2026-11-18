@@ -192,6 +192,7 @@ int main(int argc, char **argv)
 	C.target = target;	/* 显示参考白 */
 	C.knee = knee;
 	C.full = 0;
+	C.enc = hc_enc_env();	/* TM_ENC=709 回到旧编码，默认 bt1886 */
 	C.gain_mode = HC_GAIN_LIN;
 	C.transfer = HC_TF_PQ;
 	C.sat = hc_sat_from_primaries(pr, 0.85);	/* 软映射路径的宽色域系数 */

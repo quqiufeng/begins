@@ -85,6 +85,7 @@ static struct hdrcolor tp_hc(void)
 	c.sat = tp.sat;
 	c.knee = tp.knee;
 	c.full = 0;
+	c.enc = hc_enc_env();
 	c.gain_mode = tp.gain;
 	c.transfer = tp.tf;
 	return c;
@@ -266,8 +267,9 @@ static void build_lut(float *out)
 	tp_peak_used = tp.src_peak;
 	tp_tf_used = tp.tf;
 	tp_bd_used = g_cm.bit_depth;
-	printf("GLOUT: TM %s tf=%s curve=%d peak=%.0f(%s) target=%.0f sat=%.2f knee=%.2f\n",
-	       tp.on ? "on" : "off", hc_tf_name(tp.tf), tp.curve, tp.src_peak,
+	printf("GLOUT: TM %s tf=%s curve=%d enc=%s peak=%.0f(%s) target=%.0f sat=%.2f knee=%.2f\n",
+	       tp.on ? "on" : "off", hc_tf_name(tp.tf), tp.curve,
+	       hc_enc_env() == HC_ENC_709 ? "bt709" : "bt1886", tp.src_peak,
 	       tp_peak_env ? "env" : csig_peak() > 0.0 ? "sei" : "默认",
 	       tp.target, tp.sat, tp.knee);
 }

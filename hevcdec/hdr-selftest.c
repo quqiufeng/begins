@@ -442,9 +442,11 @@ static void ref_pipeline(const double *m, double Yp, double cb, double cr,
 	lin709.r = hc_curve(c, lin709.r * 10000.0 / c->target);
 	lin709.g = hc_curve(c, lin709.g * 10000.0 / c->target);
 	lin709.b = hc_curve(c, lin709.b * 10000.0 / c->target);
-	o.r = 16.0 + 219.0 * hc_bt709_oetf(clamp01(lin709.r));
-	o.g = 16.0 + 219.0 * hc_bt709_oetf(clamp01(lin709.g));
-	o.b = 16.0 + 219.0 * hc_bt709_oetf(clamp01(lin709.b));
+	/* 参考管线必须和实现在同一编码域（hc_out_oetf：默认 1886），
+	 * 否则比出来的码差里混着 OETF 的固定偏移，测不出实现本身。 */
+	o.r = 16.0 + 219.0 * hc_out_oetf(c, clamp01(lin709.r));
+	o.g = 16.0 + 219.0 * hc_out_oetf(c, clamp01(lin709.g));
+	o.b = 16.0 + 219.0 * hc_out_oetf(c, clamp01(lin709.b));
 	*out = o;
 }
 
@@ -965,6 +967,7 @@ static void t_p3(void)
 	unsigned char lut[256];
 	unsigned short gain[256];
 	double wp3 = 0.0, w20 = 0.0, ws = 0.0;
+	struct hdrcolor C709 = C;	/* 码差阈值按 709 域标定过：本段固定在 709 域比 */
 	unsigned i;
 
 	printf("\n[12] P3-D65 → 709 矩阵（hc_mat_p3，GL 侧走同一个 uGm）\n");
@@ -980,7 +983,11 @@ static void t_p3(void)
 	ok(hc_mat(HC_PRI_P3) != hc_mat(HC_PRI_2020), "P3 和 2020 是两组系数");
 	ok(hc_mat(HC_PRI_709) == hc_mat_id, "709/窄色域拿恒等矩阵");
 
-	hc_build(&C, lut, gain);
+	/* 本段比的是"码差"（矩阵 vs 标量增益），阈值按 709 域标定；
+	 * 换 1886 只是把同一线性光重新分布到码值，码差大小没有可比性，
+	 * 所以这一段固定用 709 域，不跟实现的 TM_ENC 走。 */
+	C709.enc = HC_ENC_709;
+	hc_build(&C709, lut, gain);
 	for (i = 0; i < sizeof(patches) / sizeof(patches[0]); i++) {
 		struct rgb lin = { patches[i][0], patches[i][1], patches[i][2] };
 		struct rgb ref, g3, g20, sc;
@@ -995,7 +1002,7 @@ static void t_p3(void)
 		g = gain[(int)y8];
 		u = 128.0 + 224.0 * cb;
 		v = 128.0 + 224.0 * cr;
-		ref_pipeline(GMP3, Yp, cb, cr, &C, &ref);
+		ref_pipeline(GMP3, Yp, cb, cr, &C709, &ref);
 		hc_chroma709(ytm, u, v, g, 1.0, hc_mat_p3, &u3, &v3);
 		decode_uv(ytm, u3, v3, 0, &g3);
 		hc_chroma709(ytm, u, v, g, 1.0, hc_mat_2020, &u20, &v20);
@@ -1046,6 +1053,10 @@ static void t_p3(void)
 				if (v < -1e-6 || v > 1.0 + 1e-6) out = 1;
 			}
 			if (out) continue;		/* 709 装不下的颜色不比 */
+			/* 这一段比的是"码差"大小（矩阵 vs 标量增益），码差是
+			 * 编码域的度量，阈值按 709 OETF 标定过；换 1886 只是把
+			 * 同一条线性光重新分布到码值上，比出来的数没有可比性。
+			 * 所以这里固定用 709 域比相对优劣，不跟实现编码走。 */
 			ref[0] = hc_bt709_oetf(clamp01(l709.r));
 			ref[1] = hc_bt709_oetf(clamp01(l709.g));
 			ref[2] = hc_bt709_oetf(clamp01(l709.b));
