@@ -55,7 +55,9 @@ static unsigned int g_rate = 48000, g_ch = 2, g_fmt = SNDRV_PCM_FORMAT_S16_LE;
 static unsigned int g_frame_bytes = 4;
 static snd_pcm_uframes_t g_buf = 8192, g_period = 2048;
 static const char *g_dev = "/dev/snd/pcmC0D0p";
-static const char *g_sock = "/tmp/aout.sock";
+#ifndef AOUT_EMBED
+static const char *g_sock = "/tmp/aout.sock";	/* 只有独立模式有控制口 */
+#endif
 static int g_quiet;
 static int g_in_fd = STDIN_FILENO;      /* PCM 来源：独立模式是 stdin，内嵌时由播放器给 */
 
@@ -94,11 +96,13 @@ static void die(const char *what)
 }
 #endif
 
+#ifndef AOUT_EMBED
 static void on_sig(int s)
 {
 	(void)s;
 	g_quit = 1;
 }
+#endif
 
 /* 只为了打断 DRAIN：不带 SA_RESTART，让 ioctl 返回 EINTR 而不是被信号杀掉 */
 static void on_alarm(int s) { (void)s; }
@@ -339,8 +343,9 @@ static void *play_thread(void *arg)
 	return NULL;
 }
 
-/* ---------- 控制口 ---------- */
+/* ---------- 控制口（只有独立模式有：内嵌时由播放器直接调本模块的 API） ---------- */
 
+#ifndef AOUT_EMBED
 struct cmd_ctx { int fd; };
 
 static void reply(int fd, const char *json)
@@ -383,6 +388,7 @@ static void do_status(int fd)
 		 vol, xrun, g_rate, g_ch, g_written);
 	reply(fd, b);
 }
+#endif /* !AOUT_EMBED */
 
 /* 注意：不能在持 lk 的情况下调 played_frames()——它自己会锁 lk（非递归互斥），
  * 板上第一次测就死在这：pause 一条命令直接把进程锁死。位置先算，再动状态。 */
@@ -432,6 +438,7 @@ static void set_vol(int v)
 	pthread_mutex_unlock(&lk);
 }
 
+#ifndef AOUT_EMBED
 /* 返回 1 = 要退出 */
 static int handle_line(int fd, char *line)
 {
@@ -470,7 +477,6 @@ static int handle_line(int fd, char *line)
 	return 0;
 }
 
-#ifndef AOUT_EMBED
 static int ctl_serve(void)
 {
 	struct sockaddr_un sa;

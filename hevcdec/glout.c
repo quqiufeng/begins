@@ -94,13 +94,6 @@ static struct hdrcolor tp_hc(void)
 /* 着色器要的是 0..1 的 code，bt709_encode 在 glout 里一直无 16/219 偏移 */
 #define bt709_encode hc_bt709_oetf
 
-static double tm_curve(double x)
-{
-	struct hdrcolor c = tp_hc();
-
-	return hc_curve(&c, x);
-}
-
 #define PDEG 7
 #define MAXD 16
 static float poly_c[MAXD + 1], poly_g[MAXD + 1];
@@ -1818,7 +1811,7 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 	unsigned fbr, dW, dH;
 	int dx, dy;
 	double ar_s, ar_d;
-	double tg0 = 0, tg1 = 0, tg2 = 0, tg3 = 0, tg4 = 0, tg5 = 0;
+	double tg0 = 0, tg1 = 0, tg2 = 0;	/* swap/lock/flip 各自累计进 g.s_*，不需要再打点 */
 
 	if (!g.inited) {
 		printf("GLOUT: glout_frame 但未 inited (errno=%d %s)\n",
@@ -1976,7 +1969,6 @@ swap:
 		g.tsum += dt;
 		g.s_swap += dt;
 		ps_add(&g.h_swap, dt * 1000.0);
-		tg3 = now_s();
 	}
 	if (0) {
 		printf("GLOUT: swap 失败 0x%x\n", eglGetError());
@@ -1987,7 +1979,6 @@ swap:
 
 		bo = gbm_surface_lock_front_buffer(g.gs);
 		g.s_lock += now_s() - tl;
-		tg4 = now_s();
 	}
 	if (!bo) { printf("GLOUT: lock_front 失败\n"); g.drops++; return -1; }
 	fbr = gbm_bo_get_user_data(bo) ? *(uint32_t *)gbm_bo_get_user_data(bo) : 0;
@@ -2012,7 +2003,6 @@ swap:
 			/* 第一次就失败：一次性说清「解码还在跑但屏幕不会变」 */
 			printf("GLOUT: 上屏被拒——解码和渲染继续，但这帧没上屏\n");
 		g.s_flip += now_s() - tf;
-		tg5 = now_s();
 	} else {
 	double tf = now_s();
 
@@ -2068,7 +2058,6 @@ swap:
 		}
 	}
 	g.s_flip += now_s() - tf;
-	tg5 = now_s();
 	}
 	if (g.prev_bo && g.prev_bo != bo) {
 		gbm_surface_release_buffer(g.gs, g.prev_bo);

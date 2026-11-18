@@ -276,8 +276,6 @@ static int out_free[NBUF_OUT], out_nfree, n_out;
 
 static unsigned char *stream;
 static size_t stream_size;
-static struct { size_t off, len; int key; } au[4096];
-static int n_au;
 
 static int fd = -1;
 /* 会话生命周期三个入口（实现在下发码流解析之后）：一个进程同一时刻
@@ -355,11 +353,6 @@ static int nal_type(const unsigned char *p)
 	if (g_h264)
 		return p[0] & 0x1f;	/* H.264：1 字节头，type 在低 5 位 */
 	return (p[0] >> 1) & 0x3f;	/* HEVC：2 字节头 */
-}
-
-static int nal_hdrlen(void)
-{
-	return g_h264 ? 1 : 2;
 }
 
 /* HEVC：VCL 是 0..31。H.264：VCL 是 1..5（非 IDR 片=1、分区 A/B/C=2..4、
@@ -448,55 +441,6 @@ static int codec_detect(const unsigned char *buf, size_t n)
 	if (!hevc_vote && !h264_vote)
 		return -1;
 	return hevc_vote >= h264_vote ? 0 : 1;
-}
-
-/* Split Annex-B stream into access units. */
-static void parse_au(void)
-{
-	size_t i = 0;
-	int cur_vcl = 0;
-	size_t au_start = (size_t)-1;
-
-	while (i + 4 < stream_size) {
-		size_t sc, pl;
-		int t, vcl, iru;
-
-		if (!(stream[i] == 0 && stream[i+1] == 0 && stream[i+2] == 1)) {
-			i++;
-			continue;
-		}
-		sc = (i >= 1 && stream[i-1] == 0) ? i - 1 : i;
-		pl = i + 3;
-		t = nal_type(&stream[pl]);
-		vcl = (t <= 31);
-		iru = (t == 32 || t == 33 || t == 34 || t == 35 ||
-		       t == 39 || t == 41);
-
-		if (au_start == (size_t)-1) {
-			au_start = sc;
-			cur_vcl = 0;
-		} else if ((vcl && cur_vcl) || (iru && cur_vcl)) {
-			if (n_au < 4096) {
-				au[n_au].off = au_start;
-				au[n_au].len = sc - au_start;
-				au[n_au].key = 0;
-				n_au++;
-			}
-			au_start = sc;
-			cur_vcl = 0;
-		}
-		if (vcl)
-			cur_vcl = 1;
-		i = pl + 1;
-	}
-	if (au_start != (size_t)-1 && n_au < 4096 && stream_size > au_start) {
-		au[n_au].off = au_start;
-		au[n_au].len = stream_size - au_start;
-		au[n_au].key = 0;
-		n_au++;
-	}
-	if (n_au > 0)
-		au[0].key = 1;
 }
 
 /* ---- §4.3.6 交叉校验：VUI（原始语法）vs V4L2 capture format（驱动翻译过）----
