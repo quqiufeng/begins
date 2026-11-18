@@ -5,7 +5,9 @@
  * gain 有没有乘 sat、bt709_encode 返回 16..235 还是 0..1）。这里收成一份纯函数，
  * 两边 #include 同一段文本；hdr-selftest.c 也 #include 它，所以"测的就是跑的"。
  *
- * 全部纯函数：无全局、无 I/O、不依赖 libm 之外的任何东西。
+ * 全部纯函数：无全局可写状态、无 I/O、不依赖 libm 之外的任何东西。
+ * 唯一例外是 hc_enc_env()：只读一次 getenv("TM_ENC") 并做静态缓存，
+ * 给现场留 A/B 回退用，不进任何数学路径。
  */
 #ifndef HDRCOLOR_INC
 #define HDRCOLOR_INC
@@ -14,6 +16,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* 这是个共享 .inc：每个 TU 只用其中一部分，未用到的 static 函数在 -Wextra 下
+ * 会刷屏。整段静音 -Wunused-function，比给每个函数挂 attribute 干净。 */
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
+
 enum { HC_CLIP = 0, HC_CURVE = 1, HC_REINHARD = 2, HC_HABLE = 3 };
 /* 输出编码：把曲线算出来的"屏幕线性光 d"写成 SDR 码值。
  *   HC_ENC_G1886 —— d^(1/2.4)（BT.1886 显示 EOTF 的逆）。SDR 显示器实际是
@@ -21,7 +30,8 @@ enum { HC_CLIP = 0, HC_CURVE = 1, HC_REINHARD = 2, HC_HABLE = 3 };
  *                   段：3nits 本该出 22 码，709 OETF 只给 3 码，整片暗场被压成
  *                   纯黑（实测 ramp 与 zscale 差 MAE 11.7 码、22~43% 像素归零）。
  *   HC_ENC_709    —— bt709 OETF，历史行为，留作 A/B（TM_ENC=709）。
- * 实测（1000nit ramp vs ffmpeg zscale npl=1000.t=bt1886）：1886 → MAE 1.5 码。
+ * 实测（x96 抓帧，1000nit PQ ramp，vs 主机独立算的 PQ→BT.1886 参考）：
+ * 1886 → MAE 0.39 码（= dither 底噪），709 → 12.54 码。
  */
 enum { HC_ENC_G1886 = 0, HC_ENC_709 = 1 };
 
@@ -513,5 +523,9 @@ static void hc_chroma709(double ytm, double u, double v, double gain,
 	if (*ou < 0.0) *ou = 0.0; else if (*ou > 255.0) *ou = 255.0;
 	if (*ov < 0.0) *ov = 0.0; else if (*ov > 255.0) *ov = 255.0;
 }
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 #endif /* HDRCOLOR_INC */
