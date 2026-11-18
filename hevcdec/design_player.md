@@ -168,12 +168,25 @@ EOS 就是这么来的：**正常播完和 ffmpeg 挂掉走的是同一条路**�
 
 反例更糟：ffmpeg 卡住不吐字节（HTTP 断流、磁盘 IO hang）时，主循环阻塞在 `read()` 里，
 而 `STALLSEC` 看门狗挂在 `poll()` 超时分支（§1.10），**永远走不到**，
-只能靠用户按 seek 触发 `EINTR` 才醒。这条"网络卡死 = 永久冻结"目前没有自愈路径。
+只能靠用户按 seek 触发 `EINTR` 才醒。
 
-修法（都还没做，按性价比排序）：
+**已修：饿死看门狗挪进 `s_fill()`。** 阻塞 `read()` 换成 `poll(fd, 100ms)` 分片：
+- 每 100 ms 醒一次 → seek（`SIGUSR1`）、`quit` 都能立刻打断，不必再靠"恰好落在 read" 的运气；
+- 无字节超过 `STARVESEC`（默认 12 s，`0` 关掉）就判供流挂死 → `player_starve_recover()`：
+  打一行 `STARVE: …无新字节，供流疑似挂死 → 就地重连当前位`，然后走普通 seek 那条路
+  （kill ffmpeg + 新 `-ss` 重开 + L2 重建会话），DRM/GL 不动，不闪黑不掉 buffer，
+  OSD 说"供流卡住，已就地重连"而不是"跳到 x"；
+- 只在 spawn 模式动手（纯文件/管道直供没有"重连"可言，喊一声就够）；
+  `pctl` 暂停期间不计时（暂停本来就不喂流）；
+- 不自限重试次数：ffmpeg 真死会 EOF（`got>0` 则整链退出，交上层重启），
+  只有"活着但不吐字节"才会一轮轮重连，那正是要救的场景。
+- 实测（盒子，`SPAWN` 吐 300 KB 后把管道挂着不写、`STARVESEC=2`）：
+  `STARVE 2.1s → 就地重开 0.000 → first frame → 播 2.6s → STARVE 2.1s → 重开 2.613s …`，
+  位置一路前移，画面自己回来。
+
+还剩两条壳侧的事（都没做）：
 - 壳侧 `set -o pipefail`，ffmpeg 非 0 就 `restart_at $(pos)`；
-- hevcdec 在 `s_eof && got < 期望帧数` 时返回非 0，让壳有据可依；
-- `s_fill()` 改 `O_NONBLOCK` + 12 s 超时，把看门狗从 `poll` 挪到 `read`。
+- hevcdec 在 `s_eof && got < 期望帧数` 时返回非 0，让壳有据可依。
 
 ### 1.7 参数集探测（SPS）
 

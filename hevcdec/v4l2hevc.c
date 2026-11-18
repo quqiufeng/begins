@@ -145,6 +145,9 @@ static int env_i(const char *k, int d)
  *   STALLSEC   1.5s   仅 PLAY 态：无新帧判死（门控态本来就不出帧，不适用）
  *                     —— 12.0s 的老值让每次驱动 hang 白冻 12 秒画面；
  *                     实测 2h soak 里正常段 quiet 恒 0，1.5s（=36 帧）留够余量
+ *   STARVESEC 12.0s   看的是"码流字节"不是"帧"：s_fill() 里无新字节就判供流
+ *                     挂死并就地重连（§1.6）。与 STALLSEC 是两条独立的狗——
+ *                     一个是驱动压着 AU 不吐帧，一个是上游压根不吐字节。
  */
 static int g_verbose;		/* VERBOSE：状态机/事件级日志 */
 enum { RAP_PLAY, RAP_WAIT, RAP_RASL };
@@ -1231,6 +1234,17 @@ static size_t s_sei_pl;		/* 当前 SEI NAL 起点；0=没有待解析的 SEI */
 static size_t s_sps_pl;		/* 当前 SPS NAL 起点；0=没有待解析的 SPS */
 static size_t g_stream_bytes;	/* 已消费字节，用于码率统计 */
 static int g_stream_au;		/* 已产出 AU 数 */
+/* 供流饿死自愈（design §1.6）：ffmpeg 卡住不吐字节时主循环整个阻塞在
+ * read() 里，挂在 poll 超时分支上的 STALL/STARVE 看门狗永远走不到——
+ * 表现就是画面永久冻在最后一帧、pos 还在走、只有用户按 seek 才醒。
+ * 所以把"等字节"由阻塞 read 改成 100ms 一片的 poll：既能被 seek/quit
+ * 打断，也能自己计时；无字节超过 STARVESEC（默认 12s，够容忍网络抽风、
+ * NAS 卡顿）就当供流挂死，就地重连当前位（spawn 模式 = kill ffmpeg +
+ * 新 -ss 重开），不闪屏、不掉 buffer。
+ */
+static int g_spawn_mode;	/* 定义见 SPAWN 段，这里要判能不能重连 */
+static int player_starve_recover(void);
+static double t_last_byte;	/* 上一次真读到字节的时刻（0 = 还没开始计时） */
 
 static void s_fill(size_t want)
 {
@@ -1262,18 +1276,61 @@ static void s_fill(size_t want)
 		 * 管道上 read() 本来就只返回已有字节，不会因此多等。
 		 */
 		size_t room = s_cap - s_len;
+		ssize_t r;
 
 		if (room > (CHUNK_RD))
 			room = (CHUNK_RD);
-		ssize_t r = read(s_fd, s_buf + s_len, room);
+		/* 等字节而不是盲读：100ms 一片，poll 的超时分支就是看门狗的
+		 * 落脚点（阻塞 read 上没有落脚点，见函数头注释）。
+		 */
+		{
+			struct pollfd sp;
 
-		t_fil_acc += now_s() - tf;
-		n_fil++;
+			sp.fd = s_fd;
+			sp.events = POLLIN;
+			sp.revents = 0;
+			{
+				int spr = poll(&sp, 1, 100);
+
+				t_fil_acc += now_s() - tf;
+				n_fil++;
+				if (spr < 0) {
+					if (errno == EINTR) {
+						/* seek/quit 打断：交给主循环处理 */
+						if (g_reinit)
+							return;
+						continue;
+					}
+					die("poll stream");
+				}
+				if (spr == 0) {
+					/* 100ms 没字节：先看要不要跑路，
+					 * 再看供流是不是已经挂死。
+					 */
+					if (g_reinit)
+						return;
+					if (pctl_want_exit()) {
+						/* 饿着的时候也要能被 quit 停下：
+						 * 置请求位让 stream_next_au 返回
+						 * -1，主循环顶部才看得到 quit。
+						 */
+						g_reinit = 1;
+						return;
+					}
+					if (t_last_byte > 0.0 &&
+					    player_starve_recover())
+						return;
+					continue;
+				}
+			}
+			tf = now_s();
+			r = read(s_fd, s_buf + s_len, room);
+			t_fil_acc += now_s() - tf;
+			n_fil++;
+		}
 		if (r < 0) {
-			if (errno == EINTR) {
-				/* 阻塞在 read() 等 ffmpeg 供流时收到 seek 信号：
-				 * 别重新阻塞回去，交给主循环重建会话。
-				 */
+			if (errno == EINTR || errno == EAGAIN) {
+				/* 信号恰好落在 read 与 poll 之间：重来 */
 				if (g_reinit)
 					return;
 				continue;
@@ -1284,6 +1341,7 @@ static void s_fill(size_t want)
 			s_eof = 1;
 			return;
 		}
+		t_last_byte = now_s();
 		s_len += r;
 		return;
 	}
@@ -2303,6 +2361,7 @@ static double g_seek_last = -1.0;
 static double g_seek_ts;	/* 最后一次 seek 请求到达的时刻（连按合并） */
 static int    g_seek_pending;	/* seek 已发、还没见到首帧 */
 static int    g_seek_clamped;	/* 这次 seek 被片尾钳住了（OSD 换词） */
+static int    g_seek_auto;	/* 这次 seek 是饿死自愈发起的（OSD 换词） */
 static double g_end_hi = -1.0;	/* 越界探到的片尾上界（没 DUR 时的兜底） */
 
 static void spawn_kill(void)
@@ -2505,7 +2564,10 @@ static int spawn_reseek(double ss)
 	g_t_clock0 = now_s() - pctl_pause_seconds() - ss;
 	g_pace_ms0 = -1;
 	g_sync_ms0 = -1;
-	if (g_seek_clamped)
+	if (g_seek_auto) {
+		osd_show(2.0, "供流卡住，已就地重连");
+		g_seek_auto = 0;
+	} else if (g_seek_clamped)
 		osd_show(2.0, "已到片尾 %ld:%02ld", (long)ss / 60, (long)ss % 60);
 	else
 		osd_show(2.0, "跳到 %ld:%02ld", (long)ss / 60, (long)ss % 60);
@@ -2547,6 +2609,38 @@ static int player_seek_abs(double t)
 	g_seek_ts = now_s();
 	g_seek_pending = 1;
 	kill(getpid(), SIGUSR1);	/* 打断阻塞的 read/poll */
+	return 1;
+}
+
+/* 供流饿死自愈（design §1.6）。由 s_fill() 每 100ms 调一次：无字节超过
+ * STARVESEC（默认 12s）就当 ffmpeg/网络已经挂死，就地重连当前位——走的是
+ * 普通 seek 那条路（kill ffmpeg + 新 -ss 重开 + L2 重建会话），DRM/GL 不动，
+ * 所以不闪黑也不掉 buffer。返回 1 表示已接管，s_fill 立刻返回让主循环处理。
+ *
+ * 只对 spawn 模式动手：纯文件/管道直供没有"重连"这回事，喊一声就够。
+ * STARVESEC=0 关掉整个自愈（老行为：冻住等用户按 seek）。
+ */
+static int player_starve_recover(void)
+{
+	double limit = env_d("STARVESEC", 12.0), quiet = now_s() - t_last_byte;
+
+	if (limit <= 0 || quiet < limit)
+		return 0;
+	t_last_byte = now_s();	/* 先归零，别每 100ms 喊一次 */
+	if (pctl_paused())
+		return 0;	/* 暂停不喂流，超时是正常的，不算饿死 */
+	if (!g_spawn_mode) {
+		printf("STARVE: %.1fs 无新字节（非 spawn 模式，无法重连）\n", quiet);
+		fflush(stdout);
+		return 0;
+	}
+	printf("STARVE: %.1fs 无新字节，供流疑似挂死 → 就地重连当前位\n", quiet);
+	fflush(stdout);
+	g_seek_auto = 1;
+	if (!player_seek_abs((double)pl_pos_ms() / 1000.0)) {
+		g_seek_auto = 0;
+		return 0;
+	}
 	return 1;
 }
 
@@ -3308,6 +3402,7 @@ int main(int argc, char **argv)
 		if (sf < 0) die("open stream");
 	}
 	s_fd = sf;
+	t_last_byte = now_s();	/* 饿死计时从接上码流开始算 */
 	/* 先接上声音 fifo 再去预读码流：ffmpeg 那边是顺序写多路输出的，
 	 * 没人读 PCM 就会卡在写 fifo 上，连视频一起停。
 	 */
