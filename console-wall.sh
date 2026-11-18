@@ -43,10 +43,18 @@ else
   dd if="$RAW" of=$FB bs=$((W*4)) conv=notrunc status=none
 fi
 
-# 字号决定屏幕上的行×列（2560x1440 实测：-s 20 -> 49 行 x 170 列，单格 29x15）
-# 想更密就调小：-s 16 -> 62x213；想更大：-s 24 -> 41x142
+# 字号跟着分辨率走，别写死：29px 行高只对 1440p 合适，1080p 会挤、4K 会太小。
+# 经验公式 fs = 高 / 72（1440 -> 20，即原来实测的默认值），夹在 [12,32]。
+# CONSOLE_WALL_FONTSIZE 仍可强行覆盖。
 FONT=${CONSOLE_WALL_FONT:-"Noto Sans Mono CJK SC"}
-FSIZE=${CONSOLE_WALL_FONTSIZE:-20}
+if [ -n "${CONSOLE_WALL_FONTSIZE:-}" ]; then
+  FSIZE=$CONSOLE_WALL_FONTSIZE
+else
+  FSIZE=$((H / 72))
+  [ "$FSIZE" -lt 12 ] && FSIZE=12
+  [ "$FSIZE" -gt 32 ] && FSIZE=32
+fi
+# 实测参照（-s 与 行×列）：1440p/-s20 -> 49×170；1080p/-s15 -> 45×128；2160p/-s30 -> 45×170
 
 exec env FBTERM_BACKGROUND_IMAGE=1 TERM=fbterm \
   fbterm -n "$FONT" -s "$FSIZE" -f 0xffe6ffe6 -b 0xb0000000 -- /bin/bash -l

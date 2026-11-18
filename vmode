@@ -1,0 +1,211 @@
+#!/bin/sh
+# vmode —— 预置 EDID 分辨率池切换器
+#   vmode                    当前状态
+#   vmode list               可选分辨率
+#   vmode set 1080p [-y]     切到 1080p（-y 自动重启）
+#   vmode set 2160p30 -y
+#   vmode rollback [-y]      回到上一次的选择
+#   vmode detect             尝试探测显示设备（本机 DDC 已坏，仅留接口）
+#
+# 原理：uEnv.txt 里 drm.edid_firmware 固定引用 edid/benq-pd2500q.bin，
+#      initramfs hook 每次构建时把 active.bin 拷成那个名字。
+#      所以换分辨率 = 换 active.bin + 同步改 video= 的模式数字 + 重建 initrd。
+
+set -eu
+
+POOL=/lib/firmware/edid/pool
+ACTIVE=/lib/firmware/edid/active.bin
+EDID_NAME=benq-pd2500q.bin
+UENV=/boot/uEnv.txt
+STATE=/var/lib/vmode
+KVER=$(uname -r)
+INITRD=/boot/initrd.img-$KVER
+HOOK=/etc/initramfs-tools/hooks/edid
+PY=/usr/bin/python3
+
+red()  { printf '\033[31m%s\033[0m\n' "$*"; }
+grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
+ylw()  { printf '\033[33m%s\033[0m\n' "$*"; }
+
+# 读 EDID 首选时序 -> "WxH@Hz"
+edidinfo() {
+	$PY - "$1" <<-'EOF'
+	import sys
+	d=open(sys.argv[1],'rb').read()
+	if len(d)<128 or d[:8]!=b'\x00\xff\xff\xff\xff\xff\xff\x00':
+	    print("INVALID"); sys.exit(1)
+	n=d[126]
+	if len(d)<128+128*n or sum(d[0:128])%256:
+	    print("INVALID"); sys.exit(1)
+	if n:
+	    for i in range(n):
+	        o=128+i*128
+	        if sum(d[o:o+128])%256: print("INVALID"); sys.exit(1)
+	o=54
+	if d[o:o+2]==b'\x00\x00': print("INVALID"); sys.exit(1)
+	clk=(d[o]|d[o+1]<<8)*10000
+	ha=d[o+2]|((d[o+4]&0xf0)<<4); hb=d[o+3]|((d[o+4]&0x0f)<<8)
+	va=d[o+5]|((d[o+7]&0xf0)<<4); vb=d[o+6]|((d[o+7]&0x0f)<<8)
+	hz=clk/((ha+hb)*(va+vb))
+	print("%dx%d@%.2f" % (ha,va,hz))
+	EOF
+}
+
+cur_video() { sed -n 's/.*video=HDMI-A-1:\([^ ]*\).*/\1/p' "$UENV"; }
+cur_edid()  { sed -n 's/.*drm\.edid_firmware=HDMI-A-1:\([^ ]*\).*/\1/p' "$UENV"; }
+
+do_status() {
+	echo "== 启动参数 =="
+	echo "  EDID 名    : $(cur_edid)   (固定，实际内容由 hook 决定)"
+	echo "  video=     : $(cur_video)"
+	echo
+	echo "== 当前生效 =="
+	if [ -f "$ACTIVE" ]; then
+		printf '  active.bin : %s  ' "$(edidinfo "$ACTIVE")"; echo "($(sha256sum "$ACTIVE" | cut -c1-12))"
+	else
+		ylw "  active.bin : 不存在"
+	fi
+	if [ -f "$STATE/current" ]; then echo "  记录选择   : $(cat "$STATE/current")"; fi
+	echo "  card0 模式 : $(head -1 /sys/class/drm/card0-HDMI-A-1/modes 2>/dev/null || echo n/a)  (共 $(wc -l < /sys/class/drm/card0-HDMI-A-1/modes 2>/dev/null || echo 0) 个)"
+	echo
+	echo "== initramfs 里的 EDID =="
+	tmp=$(mktemp -d); trap 'rm -rf $tmp' EXIT
+	if unmkinitramfs "$INITRD" "$tmp" 2>/dev/null; then
+		f=$(find "$tmp" -name "$EDID_NAME" | head -1)
+		if [ -n "$f" ]; then
+			printf '  %s : %s  (%s)\n' "$EDID_NAME" "$(edidinfo "$f")" "$(sha256sum "$f" | cut -c1-12)"
+			if [ -f "$ACTIVE" ] && cmp -s "$f" "$ACTIVE"; then
+				grn "  >= 与 active.bin 一致，重启后即为该分辨率"
+			else
+				ylw "  != 与 active.bin 不一致，需要跑 vmode set 重建 initrd"
+			fi
+		else
+			ylw "  未找到 $EDID_NAME"
+		fi
+	fi
+}
+
+do_list() {
+	echo "可选分辨率（$POOL）："
+	for f in "$POOL"/*.bin; do
+		[ -f "$f" ] || continue
+		n=$(basename "$f" .bin)
+		printf '  %-12s %s\n' "$n" "$(edidinfo "$f")"
+	done
+	echo
+	echo "用法: vmode set <名字> [-y]"
+}
+
+do_set() {
+	name="${1:?用法: vmode set <名字> [-y]}"
+	auto=no; [ "${2:-}" = "-y" ] && auto=yes
+	src="$POOL/$name.bin"
+	[ -f "$src" ] || { red "池里没有 $name，先 vmode list"; exit 1; }
+
+	info=$(edidinfo "$src") || { red "$src 校验失败，拒绝上机"; exit 1; }
+	res=${info%@*}; hz=${info#*@}; hz=${hz%%.*}
+	ylw "目标: $name  ->  $info"
+
+	# 0) 首次运行留一份 uEnv.txt 原件
+	mkdir -p "$STATE"
+	[ -f "$STATE/uEnv.txt.orig" ] || cp "$UENV" "$STATE/uEnv.txt.orig"
+	cp "$UENV" "$STATE/uEnv.txt.before-$(date +%H%M%S)"
+
+	# 1) 换 active.bin（原子）
+	cp "$src" "$ACTIVE.tmp" && mv "$ACTIVE.tmp" "$ACTIVE"
+	grn "[1/4] active.bin <- $name ($info)"
+
+	# 2) 同步 video= 里的模式数字，保留 MR@..e 这些已验证的语法
+	ved="HDMI-A-1:${res}MR@${hz}e"
+	sed -i "s|video=HDMI-A-1:[^ ]*|video=$ved|" "$UENV"
+	grn "[2/4] video= -> $ved"
+	grep -q "video=$ved" "$UENV" || { red "uEnv.txt 改写失败"; exit 1; }
+
+	# 3) 重建 initrd
+	ylw "[3/4] 重建 initramfs（约 30-60s）..."
+	update-initramfs -u -k "$KVER" >/dev/null 2>&1 || { red "update-initramfs 失败"; exit 1; }
+
+	# 4) 校验 initrd 里确实是新文件
+	tmp=$(mktemp -d); trap 'rm -rf $tmp' EXIT
+	unmkinitramfs "$INITRD" "$tmp" 2>/dev/null
+	f=$(find "$tmp" -name "$EDID_NAME" | head -1)
+	if [ -z "$f" ]; then red "[4/4] initrd 里没有 $EDID_NAME，中止"; exit 1; fi
+	if ! cmp -s "$f" "$ACTIVE"; then red "[4/4] initrd 内容不符，中止"; exit 1; fi
+	grn "[4/4] initrd 校验通过: $(edidinfo "$f")"
+
+	printf '%s\n' "$name" > "$STATE/current"
+	echo "$(date '+%F %T') set $name $info" >> "$STATE/history.log"
+	echo
+	if [ "$auto" = yes ]; then
+		ylw "3 秒后重启..."; sleep 3; reboot
+	else
+		grn "改完待生效：执行 vmode reboot 或直接 reboot"
+	fi
+}
+
+do_rollback() {
+	auto=no; [ "${1:-}" = "-y" ] && auto=yes
+	b=$(ls -1t "$STATE"/uEnv.txt.before-* 2>/dev/null | head -1 || true)
+	[ -n "$b" ] || { red "没有可回退的备份"; exit 1; }
+	tgt=$(cur_video)
+	cp "$b" "$UENV"
+	grn "uEnv.txt 已回退（原 video=$tgt -> $(cur_video)）"
+	# active.bin 也跟着回退到对应池文件
+	case "$(cur_video)" in
+		*1280x720*)  do_set 720p60 true ;;
+		*1920x1080*) do_set 1080p60 true ;;
+		*2560x1440*) do_set 1440p60 true ;;
+		*3840x2160*) do_set 2160p30 true ;;
+		*) ylw "未知模式，只回退了 uEnv.txt，请手动 vmode set" ;;
+	esac
+}
+
+do_detect() {
+	ylw "尝试通过 DDC/CI 读取显示器 EDID ..."
+	if $PY - <<-'EOF' 2>/dev/null
+	import ctypes, fcntl, os
+	class M(ctypes.Structure):
+	    _fields_=[("addr",ctypes.c_uint16),("flags",ctypes.c_uint16),("len",ctypes.c_uint16),("buf",ctypes.POINTER(ctypes.c_uint8))]
+	class D(ctypes.Structure):
+	    _fields_=[("msgs",ctypes.POINTER(M)),("nmsgs",ctypes.c_uint32)]
+	for dev in ("/dev/i2c-0","/dev/i2c-1","/dev/i2c-2"):
+	    if not os.path.exists(dev): continue
+	    try:
+	        f=os.open(dev,os.O_RDWR)
+	        w=(ctypes.c_uint8*1)(0); r=(ctypes.c_uint8*8)()
+	        a=(M*2)(M(0x50,0,1,w),M(0x50,1,8,r))
+	        fcntl.ioctl(f,0x0706,0x50)
+	        fcntl.ioctl(f,0x0707,bytearray(bytes(D(a,2))))
+	        b=bytes(r)
+	        os.close(f)
+	        if b[:8]==b'\x00\xff\xff\xff\xff\xff\xff\x00': raise SystemExit(0)
+	    except OSError: pass
+	raise SystemExit(1)
+	EOF
+	then
+		grn "DDC 可读！可以走自动探测"
+	else
+		red "DDC 读取失败（本机 HDMI 的 DDC 通道不可用）"
+		echo "  -> 无法自动识别显示设备，请用 vmode set 手动指定；"
+		echo "     选择会记进 $STATE/current，下次 vmode auto 沿用它。"
+	fi
+}
+
+case "${1:-status}" in
+	status|"")   do_status ;;
+	list)        do_list ;;
+	set)         shift; do_set "$@" ;;
+	rollback)    shift; do_rollback "$@" ;;
+	detect)      do_detect ;;
+	auto)
+		if [ -f "$STATE/current" ]; then
+			n=$(cat "$STATE/current")
+			ylw "DDC 不可用，沿用上次选择: $n"
+			do_set "$n" -y
+		else
+			ylw "无历史选择，用最通用的 1080p60"
+			do_set 1080p60 -y
+		fi ;;
+	reboot)      ylw "重启中..."; reboot ;;
+	*)           sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac

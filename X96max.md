@@ -2828,6 +2828,34 @@ tools/x96-shot.sh -a -o /tmp/a.png  # 两个都抓（第二张自动加 -console
   只 `dd` 可见的 1440 行，否则下面多一大条白边。stride 10240 = 2560×4，32bpp 小端 BGRA。
 - 桌面在前台时 fb0 里只是打底壁纸，fbterm 的文字要 `chvt 2` 才有。
 
+### 22.0.2 回归对拍（tools/x96-check.sh）
+
+截图只是原料，判定要能自动出「通过/不通过」。`x96-check.sh` 把三层串成一条命令：
+**注入**（socket 的 key/click/call）→ **状态断言**（`brief` 的 sel/count/name）→ **画面对拍**（与基线比差异像素占比）。
+
+```bash
+tools/x96-check.sh --golden home                      # 录基线 → tools/golden/home.png
+tools/x96-check.sh --diff home                        # 比基线，0=过 1=画面不符 2=状态断言失败 3=环境/抓图失败
+tools/x96-check.sh --diff home --do "key:HOME;wait:400;key:RIGHT;wait:400" \
+    --assert-sel 机器学习 --max-diff 0.5
+tools/x96-check.sh --case tools/cases/list-home.case  # 跑一个用例
+tools/x96-check.sh --run-dir tools/cases              # 跑整目录，末尾出汇总、有失败即 exit 1
+tools/x96-check.sh --run-dir tools/cases --record     # 批量重录基线（改版式后执行）
+```
+
+- 判据是 ImageMagick `compare -metric AE -fuzz N%` 的**差异像素占比**。这块屏静止时实测**逐像素可重现**
+  （连抓两张差异 0），所以默认 `--fuzz 1 --max-diff 0.1`（≈3700px）足够严：实测「选区右移一格」3.4%、
+  「整屏下移 1px」7.9%、`-modulate` 调 0.5% 色偏也有 7% —— 真回归落不进容差里。
+  有动画/时钟的界面用 `--ignore x,y,w,h` 抹掉那块（可重复），或放宽 `--max-diff`。
+- 分辨率变了（换模式/换屏）会先缩放到基线尺寸再比，并在 stderr 提示一句；基线本身不会被动。
+- 失败自动留证：`logs/check-<name>-actual.png` 与 `check-<name>-diff.png`（IM 的红标差异图）。
+- 步骤语法（`--do`/用例里 `do` 行，**分隔符只认分号**，因为 JSON 参数里有逗号）：
+  `key:NAME`、`click:ID`、`wait:ms`、`call:FN`、`call:FN:{json}`、`raw:{json}`。
+  用例里另有 `restore` 行：**无论成败都执行**（例如进过阅读器要按 BACK 退回书架），别让失败把机器留在半开状态。
+- 用例（`tools/cases/*.case`）第一段通常固定 `call:app.goto:{"dir":...}` + `key:HOME` 归位，
+  这样每条都幂等、跟执行顺序无关；`assert-sel/assert-count/assert-name` 断言"注入真的生效"，
+  只靠截图比容易把「按了没反应 + 恰好长得像」判成通过。
+
 ### 22.1 两个落点
 
 | 件 | 位置 | 说明 |
@@ -2887,6 +2915,71 @@ MODE=$(head -1 /sys/class/graphics/fb0/modes)   # 期望 2560x1440p-0
 
 读不到才退回 `virtual_size`，最后兜底 2560x1440。
 
+### 22.2.1 分辨率池（vmode）：换屏/换分辨率不用改启动参数（2026-11-18 新方案）
+
+上一节是**画图那一层**的自适应（没模式就按屏算 W/H）。这一节是**更下面一层**：
+`video=` 与 `drm.edid_firmware=` 决定内核给这块屏走什么模式，原来写死 `2560x1440MR@60e`，
+换台只有 1080p 的显示器就黑屏。现在改成"**预置 EDID 池 + 一条命令切换**"。
+
+原理（三条必须同时对齐，缺一条白改）：
+
+```
+edid-pool/x96-<名字>.bin  ──cp──>  /lib/firmware/edid/active.bin
+                                        │ initramfs hook (hooks/edid) 每次构建时
+                                        └─cp──> edid/benq-pd2500q.bin
+uEnv.txt:  drm.edid_firmware=HDMI-A-1:edid/benq-pd2500q.bin   ← 名字固定，内容由 active.bin 决定
+           video=HDMI-A-1:2560x1440MR@60e                     ← 数字必须跟着改
+```
+
+- `uEnv.txt` 里的 EDID **文件名是固定的**（`benq-pd2500q.bin`），不改它；
+  盒子上的 `/etc/initramfs-tools/hooks/edid` 每次 `update-initramfs` 都把 `active.bin` 拷成这个名字塞进 initrd。
+  所以**换分辨率 = 换 `active.bin` + 同步改 `video=` 的数字 + 重建 initrd**。
+- 只改 `active.bin` 不重建 initrd = 重启后还是老的（initrd 里那份才是真的）。
+- 只改 EDID 不改 `video=` 数字 = 内核仍按 `video=` 要模式，可能被忽略或回落。
+
+池里四档（`edid-pool/`，`mk-pool.py` 可重生成，自校验 PASS）：
+
+| 名字 | 模式 | 来源 | 备注 |
+|---|---|---|---|
+| `720p60` | 1280x720@60 | 1080p 底稿里 DTD1 搬到 DTD0 | 最保守，兜底用 |
+| `1080p60` | 1920x1080@60 | 盒子空 HDMI 自报 EDID | 通用，换任何屏都亮 |
+| `1440p60` | 2560x1440@60 | BenQ PD2500Q 原生 DTD | **当前在用** |
+| `2160p30` | 3840x2160@30 | 手写 DTD（297MHz） | 4K 只能 30Hz，HDMI2.0 带宽不足 |
+
+盒子上一条命令切（脚本走 `/root/vmode`，仓库根 `vmode` 是源）：
+
+```bash
+vmode status            # 启动参数 / active.bin / initrd 里那份是否一致 / card0 现有模式
+vmode list              # 池里有什么
+vmode set 1080p60       # 换 EDID + 改 video= + 重建 initrd，四步都自校验
+vmode set 2160p30 -y    # 改完自动重启
+vmode rollback          # 回退 uEnv.txt 并同步把 active.bin 切回对应档
+```
+
+`set` 的四个步骤（任一步失败就中止，不会留半改状态）：① 原子换 `active.bin`（`cp` 到 `.tmp` 再 `mv`）
+② `sed` 只替换 `video=HDMI-A-1:[^ ]*`，保留已验证的 `MR@60e` 语法 ③ `update-initramfs -u`
+（30–60s）④ `unmkinitramfs` 拆开 initrd、`cmp` 确认里面那份 == `active.bin`。
+改之前自动留 `uEnv.txt.before-<时分秒>`，以及首次运行留一份 `uEnv.txt.orig`。
+
+验收（重启后）：
+
+```bash
+ssh x96 'vmode status'                       # 三段都该 green，不能有 !=
+ssh x96 'head -1 /sys/class/drm/card0-HDMI-A-1/modes'
+ssh x96 'head -1 /sys/class/graphics/fb0/modes'   # 应与上一条一致
+```
+
+换分辨率后**连带要动的东西**（容易漏）：
+
+- `console-wall.sh` 不用改：它读 `fb0/modes` 拿真实 W/H，字号也按高自动算（见 §22.4）。
+- `tools/golden/*.png` 基线会失效 —— 换模式后必须 `tools/x96-check.sh --run-dir tools/cases --record` 重录，
+  否则每条用例都报画面不符（判据里有缩放兜底，但录新的才准）。
+- 桌面 `desktop/` 走 KMSDRM，按 DRM 报的模式自己铺，不用改；确认它没被挤到半屏看 §22.0.2 的截图流程。
+
+> DDC 读不到：这台 HDMI 的 DDC/I2C 通道**实测不可用**（`vmode detect` 会报失败），
+> 所以做不到"插上屏自动认"，只能是"手动选一档 + 记住选择"。`vmode auto` 在 DDC 失败时
+> 沿用 `/var/lib/vmode/current` 里上次的选择，没有就用最通用的 `1080p60`。
+
 ### 22.3 背景处理链路
 
 ```bash
@@ -2902,24 +2995,30 @@ dd if=/run/console-wall.raw of=/dev/fb0 bs=$((W*4)) conv=notrunc status=none
 - `-pix_fmt bgra`：framebuffer 是 BGRA（`fb0` 的 `32bpp`），顺序错就是偏色/花屏。
 - 没有图时的兜底：`tr '\0' '\30'` 铺 `0x30` 深灰，**不能留空**（残留内容看起来像花屏）。
 
-### 22.4 字号 ↔ 屏幕网格（2560x1440 实测）
+### 22.4 字号 ↔ 屏幕网格（随分辨率自动算）
 
-字号决定行×列，选错了要么字太小要么行距挤：
+字号决定行×列，选错了要么字太小要么行距挤。**不要写死一个字号**：`-s` 是像素字号，
+1440p 合适的 20 号在 1080p 上偏挤、在 4K 上也偏小。脚本现在按真实高自动算：
 
-| `-s` | 行 × 列 | 单格（宽×高） | 说明 |
+```
+fs = H / 72，夹在 [12, 32]      # 1440 -> 20，正好等于原来实测的默认值
+```
+
+`CONSOLE_WALL_FONTSIZE` 仍可强行覆盖（临时试字号用）。
+
+| 分辨率 | 自动 `-s` | 行 × 列 | 说明 |
 |---|---|---|---|
-| 16 | ≈62 × 213 | 12 × 23 | 推算值，未实测 |
-| **20（默认）** | **49 × 170** | **15 × 29** | **实测**，`stty size` 读数，日常够用 |
-| 24 | ≈41 × 142 | 21 × 35 | 推算值，未实测 |
+| 1280x720 | 12（夹底） | ≈38 × 106 | 推算值 |
+| 1920x1080 | 15 | 45 × 128 | 推算值，与 1440p 密度相当 |
+| **2560x1440** | **20** | **49 × 170** | **实测**，`stty size` 读数，日常够用 |
+| 3840x2160 | 30 | 45 × 170 | 推算值，与 1440p 密度相当 |
 
-改字号（默认值就在脚本第 48 行，也认环境变量）：
+改字号（覆盖自动值；行号见脚本里 `FSIZE` 那段）：
 
 ```bash
 # 盒子执行
-sed -i 's/CONSOLE_WALL_FONTSIZE:-20/CONSOLE_WALL_FONTSIZE:-24/' /usr/local/bin/console-wall.sh
-systemctl restart console-wall
-# 或临时试
 CONSOLE_WALL_FONTSIZE=24 /usr/local/bin/console-wall.sh /root/backgrounds/xxx.jpg
+# 想永久固定某个字号，就把上面这行写进 service 的 Environment=
 ```
 
 字体默认 `Noto Sans Mono CJK SC`（`CONSOLE_WALL_FONT` 可换）。必须留 CJK 等宽字体，
@@ -2947,10 +3046,22 @@ ffmpeg -f rawvideo -pix_fmt bgra -s 2560x1440 -i /tmp/fb.raw -vf crop=1600:260:0
 cd /home/quqiufeng/kernel
 scp console-wall.sh x96:/tmp/console-wall.sh
 ssh x96 'install -m755 /tmp/console-wall.sh /usr/local/bin/console-wall.sh && systemctl restart console-wall'
-ssh x96 'systemctl is-active console-wall; stty size </dev/pts/0'
+ssh x96 'systemctl is-active console-wall; stty -F /dev/pts/0 size'
 ```
 
-验收：service `active`、`stty size` 给出 `49 170`、截图里中英混排对齐不叠行。
+> `stty size </dev/pts/0` 在 ssh 里读不到（那是**自己**的终端），要 `stty -F /dev/pts/0`。
+> 也别拿 fbterm 自己的 `fd/0`（=`/dev/tty2`）当结果，那是 fbcon 的网格（会给出 90 320），
+> 真正的网格在 fbterm 起的 bash 那个 pts 上。
+
+分辨率池/切换器一起发布（改分辨率时才动，平时不用）：
+
+```bash
+scp vmode x96:/tmp/vmode
+scp edid-pool/x96-*.bin x96:/tmp/pool/          # 先在盒子 mkdir -p /lib/firmware/edid/pool
+ssh x96 'install -m755 /tmp/vmode /root/vmode && cp /tmp/pool/*.bin /lib/firmware/edid/pool/ && vmode status'
+```
+
+验收：service `active`、`stty -F /dev/pts/0 size` 给出 `49 170`（1440p 下自动字号 20）、截图里中英混排对齐不叠行。
 
 ### 22.7 坑：老版 console-wall 会把桌面顶掉（已修）
 
@@ -2977,4 +3088,4 @@ systemctl disable desktop; systemctl stop desktop
 
 ---
 
-*文档版本: 2.1 · 更新: 2026-11-18 · 设备: X96 Max / S905X2*
+*文档版本: 2.2 · 更新: 2026-11-18 · 设备: X96 Max / S905X2*

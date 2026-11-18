@@ -60,3 +60,8 @@ meson-vdec/logs/
 
 # 本地临时脚本（rk.sh 之类的一次性调试，不入库）
 .scratch/
+
+# EDID 池的调试草稿（edid-pool/ 才是正式产物）
+/tmp/
+# 视觉回归的比对产物（actual/diff 随用例跑出来）
+/logs/check-*.png
