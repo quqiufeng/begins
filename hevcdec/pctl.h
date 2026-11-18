@@ -25,6 +25,10 @@ int  pctl_paused(void);
 double pctl_pause_seconds(void);
 /* 主循环在退出前调：关 socket / 释放遥控设备 */
 void pctl_stop(void);
+/* `-c quit`：play.sh 有 state（正常起播）时由脚本收链；没有 state 时
+ * 播放器得自己退，否则留下一个"还在放但控制口已关"的孤儿进程。
+ */
+int pctl_want_exit(void);
 
 /* 键位表（rcmap.h）打到 stdout：`player -K`。脚本/文档的唯一取处。 */
 void pctl_keymap_dump(void);

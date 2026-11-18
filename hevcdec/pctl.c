@@ -38,12 +38,13 @@
 #define MAXDEV 16
 
 static const char *g_sock = "/tmp/play.sock";
-static const char *g_play_sh = "/tmp/play.sh";
+static const char *g_play_sh;	/* 播放脚本：启动时按"二进制旁边"定位，见 resolve_play_sh() */
 static volatile int g_paused;
 static volatile int g_mute;
 static int g_saved_vol = 100;		/* 静音前的音量，取消静音要还原 */
 static double g_pause_acc, g_pause_t0;	/* 暂停累计秒：播放器时间轴要平移 */
 static volatile int g_quit;
+static volatile int g_want_exit;	/* 主循环该退了（-c quit） */
 static int g_lfd = -1;
 
 static double now_s(void)
@@ -111,6 +112,38 @@ static void set_paused(int on)
 
 /* ---------- 动作：能就地做的就地做，要重开链路的交给 play.sh ---------- */
 
+/* play.sh 在哪儿：以前写死 /tmp/play.sh，可 2026-11-18 起播放器落点是
+ * /root（/tmp 是 tmpfs，重启即空），遥控器每个走脚本的键位（home/字幕/
+ * 音轨…）都在日志里刷 "sh: cannot open /tmp/play.sh" 然后什么都不做。
+ * 按二进制自己所在目录找同目录 play.sh，找不到再退回 /root、/tmp。
+ */
+static void resolve_play_sh(void)
+{
+	static char buf[256];
+	const char *e = getenv("PLAY_SH");
+	char exe[200];
+	ssize_t n;
+	static const char *cand[] = { "/root/play.sh", "/tmp/play.sh", NULL };
+	int i;
+
+	if (e && *e) { g_play_sh = e; return; }
+	n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+	if (n > 0) {
+		char *sl;
+
+		exe[n] = 0;
+		sl = strrchr(exe, '/');
+		if (sl) {
+			*sl = 0;
+			snprintf(buf, sizeof buf, "%s/play.sh", exe);
+			if (access(buf, X_OK) == 0) { g_play_sh = buf; return; }
+		}
+	}
+	for (i = 0; cand[i]; i++)
+		if (access(cand[i], X_OK) == 0) { g_play_sh = cand[i]; return; }
+	g_play_sh = "/root/play.sh";
+}
+
 static void run_play_sh(const char *act)
 {
 	pid_t p = fork();
@@ -132,7 +165,18 @@ static void do_quit(void)
 {
 	/* 退出要连 ffmpeg 一起收：那是 play.sh 的活（它还管着 state 文件） */
 	run_play_sh("quit");
+	/* 但 play.sh 只在它自己起播时有 state 可收（/tmp/play.state）。裸跑
+	 * 的实例、或者 state 被清掉时，只关控制口等于留个还在解码上屏的
+	 * 孤儿进程——屏幕照放、遥控全哑，连再 `-c quit` 都连不上（socket
+	 * 已被 ctl_thread 收尾 unlink）。让主循环也退，两边都走得掉。
+	 */
+	g_want_exit = 1;
 	g_quit = 1;
+}
+
+int pctl_want_exit(void)
+{
+	return g_want_exit;
 }
 
 /* ---------- 控制口协议 ---------- */
@@ -234,7 +278,7 @@ static int handle_line(int fd, char *line)
 	if ((!strcmp(a, "seek") || !strcmp(a, "seekto")) && b) {
 		char act[32];
 		char *p = b;
-		int neg = 0, n;
+		int neg = 0, n = 0;	/* 只在数字分支赋值；下面的 *p 判断同条件，但 gcc 看不出来 */
 		int isabs = !strcmp(a, "seekto");
 
 		if (*p == '+' || *p == '-') { neg = (*p == '-'); p++; }
@@ -553,7 +597,7 @@ void pctl_start(void)
 	const char *e;
 
 	if ((e = getenv("PLAY_SOCK")) && *e) g_sock = e;
-	if ((e = getenv("PLAY_SH")) && *e) g_play_sh = e;
+	resolve_play_sh();
 	if (pthread_create(&th, NULL, ctl_thread, NULL) == 0)
 		pthread_detach(th);
 	if (!getenv("RC") || atoi(getenv("RC")) != 0) {

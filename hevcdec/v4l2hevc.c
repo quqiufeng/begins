@@ -2300,6 +2300,7 @@ static double g_dur_total = -1.0;
 /* 本次 seek 从哪儿来、目标多少：越界被弹回时要用它退回去 */
 static double g_seek_base = -1.0;
 static double g_seek_last = -1.0;
+static double g_seek_ts;	/* 最后一次 seek 请求到达的时刻（连按合并） */
 static int    g_seek_pending;	/* seek 已发、还没见到首帧 */
 static int    g_seek_clamped;	/* 这次 seek 被片尾钳住了（OSD 换词） */
 static double g_end_hi = -1.0;	/* 越界探到的片尾上界（没 DUR 时的兜底） */
@@ -2543,6 +2544,7 @@ static int player_seek_abs(double t)
 	g_seek_base = g_seek_to >= 0 ? g_seek_to : (double)pl_pos_ms() / 1000.0;
 	g_seek_to = seek_clamp(t);
 	g_seek_last = g_seek_to;
+	g_seek_ts = now_s();
 	g_seek_pending = 1;
 	kill(getpid(), SIGUSR1);	/* 打断阻塞的 read/poll */
 	return 1;
@@ -2564,6 +2566,7 @@ static int player_seek(int rel)
 	g_seek_base = base;
 	g_seek_to = seek_clamp(t);
 	g_seek_last = g_seek_to;
+	g_seek_ts = now_s();
 	g_seek_pending = 1;
 	kill(getpid(), SIGUSR1);	/* 打断阻塞的 read/poll */
 	return 1;
@@ -3456,11 +3459,21 @@ int main(int argc, char **argv)
 	for (;;) {
 		struct pollfd pf = { .fd = fd, .events = POLLIN };
 		int pr;
+		int seek_deb = 0;	/* 连按还在窗口里，本轮先不动手 */
 
 		/* 暂停：不喂流也不上屏，音频由 pctl 同步停写。上游 ffmpeg 被管子
 		 * 顶住（-re 供流本来就是阻塞的）——不需要再 SIGSTOP 整个进程组，
 		 * 也就不会再有"冻住过"那种要靠 HERE 时钟猜的误判。
 		 */
+		/* `-c quit`（遥控"退出"）：play.sh 接下就整链收掉，进程根本
+		 * 走不到这儿；走到这儿说明它没接住（裸跑 / state 丢了），
+		 * 那就自己退——spawn 的 ffmpeg 由 atexit(spawn_kill) 收。
+		 */
+		if (pctl_want_exit()) {
+			printf("QUIT: pctl quit（play.sh 没接住，播放器自己退）\n");
+			fflush(stdout);
+			break;
+		}
 		if (pctl_paused()) {
 			/* 暂停时没有新帧，提示条只能靠补画出现/擦掉：
 			 * 不补，冻住的那一帧会把"|| 暂停"永远挂在屏幕上。
@@ -3528,7 +3541,15 @@ int main(int argc, char **argv)
 		 * 清掉（BODY 里只升档位不排队），只剩 g_seek_to 这一份证据；
 		 * 只看 g_reinit 会让那次 seek 悄悄消失（-c 还回 ok）。
 		 */
-		if (g_reinit || g_seek_to >= 0) {
+		/* 连按合并：遥控器 ▶▶ 连按五下，如果不合并就是五次 kill+重开
+		 * ffmpeg + 五次重建事务，中间四个位置一帧都看不到，用户等五秒。
+		 * 等按键静默 SEEK_DEBOUNCE 秒再动手，连按只跳一次到最终目标。
+		 * g_reinit（真故障）不排队，立刻修。
+		 */
+		if (g_seek_to >= 0 && !g_reinit &&
+		    now_s() - g_seek_ts < 0.30) {
+			seek_deb = 1;
+		} else if (g_reinit || g_seek_to >= 0) {
 			int rr;
 
 			printf("REINIT: 开始重建事务（DRM/GL 保留）\n");
@@ -3748,8 +3769,8 @@ int main(int argc, char **argv)
 			 * 正常播放帧间隔 41ms，poll 由事件唤醒，缩短周期不增加
 			 * 唤醒次数——纯白拿的检测分辨率。
 			 */
-			pr = poll(&pf, 1, drained ? 50 :
-				  (out_nfree ? (g_rap_st == RAP_PLAY ? 200 : 2000) : 100));
+			pr = poll(&pf, 1, seek_deb ? 30 : (drained ? 50 :
+				  (out_nfree ? (g_rap_st == RAP_PLAY ? 200 : 2000) : 100)));
 			t_poll_acc += now_s() - tp;
 		}
 		if (pr < 0) {
