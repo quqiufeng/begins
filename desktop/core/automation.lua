@@ -119,6 +119,13 @@ function M:handle(line)
 	end
 	if cmd == "click" then
 		if self.busy then
+			-- 外部 app 独占屏幕期间只有一件事还能做：返回 = 收掉它回桌面。
+			-- 交给上层的 H.busy 判定（播放中按返回退出播放），其余照旧回 busy。
+			if H.busy then
+				local ok2, r2 = pcall(H.busy, tostring(req.id or ""), "click")
+
+				if ok2 and type(r2) == "table" then return json.encode(r2) end
+			end
 			return json.encode({ ok = false, error = "busy: 外部 app 正在独占屏幕" })
 		end
 		local ok, r = pcall(H.click, tostring(req.id or ""))
@@ -130,6 +137,12 @@ function M:handle(line)
 	end
 	if cmd == "key" then
 		if self.busy then
+			-- 同上：播放/阅读中，"返回"要能收掉外部 app（退出播放）
+			if H.busy then
+				local ok2, r2 = pcall(H.busy, tostring(req.name or ""), "key")
+
+				if ok2 and type(r2) == "table" then return json.encode(r2) end
+			end
 			return json.encode({ ok = false, error = "busy: 外部 app 正在独占屏幕" })
 		end
 		local ok, r = pcall(H.key, tostring(req.name or ""))

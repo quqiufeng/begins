@@ -9,7 +9,8 @@
 -- 遥控语义：
 --   左右     相邻项，上下  换行同列，上下翻页键  整屏翻
 --   OK/ENTER 进目录 / 开图片预览 / 交外部 app 打开书或片
---   BACK/ESC 返回上级（到顶就停在原地）
+--   BACK/ESC 返回上级（到顶就停在原地）；外部 app（播放器/阅读器）跑着时
+--            返回 = 收掉它回桌面，播放电影按返回就是退出播放
 --
 -- 用法：
 --   luajit main.lua                    # 真机（kmsdrm 全屏）
@@ -294,6 +295,23 @@ auto = automation.start(cfg.sock, {
 		return st
 	end,
 	click = function(id) return on_click(id) end,
+	-- 外部 app（播放器/阅读器）独占屏幕期间唯一放行的操作：「返回」= 收掉它。
+	-- 播放电影时按返回要能退出播放，而不是回一句 busy 让遥控器看着像失灵。
+	-- keybd 打过来的是 nav.back（click）或 BACK/ESC（key），两种都认。
+	busy = function(id, how)
+		local CLICK_BACK = { ["nav.back"] = true, ["view.quit"] = true }
+		local KEY_BACK = {
+			BACK = true, ESC = true, EXIT = true, QUIT = true, STOPCD = true,
+		}
+		local back = (how == "click") and CLICK_BACK[id] or false
+
+		if how ~= "click" then back = KEY_BACK[id] or false end
+
+		if back and launcher_:stop() then
+			return { ok = true, stopped = true, state = fs:state() }
+		end
+		return nil
+	end,
 	key = function(name)
 		if key_is_blocking(name) then
 			return defer(function() on_key(name) end, "key." .. tostring(name))

@@ -92,6 +92,24 @@ local function group_kill(pid)
 	return not alive(pid)
 end
 
+-- 收掉正在独占屏幕的外部 app（播放中按「返回」= 退出播放）。
+-- 只在 M:run 的等待期内有意义：pid 不在就返回 false，让调用方照常回 busy。
+function M:stop()
+	local pid = self.pid
+
+	if not pid or self.stopped or not alive(pid) then return false end
+	self.stopped = true
+	-- 进程组整组收：play.sh 的 trap 会跑 do_stop（放回 fbcon、清 state），
+	-- 真卡死了 group_kill 自己会升级到 SIGKILL。
+	group_kill(pid)
+	return true
+end
+
+-- 有个外部 app 正在独占屏幕？（pump 里用来判"返回"该不该收掉它）
+function M:busy()
+	return self.pid ~= nil
+end
+
 -- opts.watch = { log, pat = 上屏判据, fail = 失败判据, ms = 宽限毫秒 }
 -- 给了 watch 就边等边看：日志出现 fail 立刻收掉，宽限期内没出现 pat 也收掉。
 function M:run(label, cmd, opts)
@@ -117,6 +135,11 @@ function M:run(label, cmd, opts)
 	if h then h:close() end
 
 	local err, killed, why
+
+	-- 外部 app 跑着的时候，"返回"只有一个含义：收掉它回桌面。
+	-- 遥控器（keybd/自动化口）在 pump 里调 M:stop()，这里置 stopped，
+	-- 等待循环随即结束，退出码/看门狗都不再当错误报。
+	self.pid, self.stopped = pid, nil
 
 	local t0 = os.time()
 
@@ -162,19 +185,26 @@ function M:run(label, cmd, opts)
 	end
 
 	local ok, rerr = screen:resume()
+	local stopped = self.stopped
+
+	self.pid, self.stopped = nil, nil
 	do
 		local lf = io.open(cfg.launch_log, "a")
 
 		if lf then
 			lf:write(("[%s] %s pid=%s %s %.0fs\n"):format(
 				os.date("%H:%M:%S"), label, tostring(pid),
-				killed and ("killed:" .. tostring(why or "no-onscreen")) or "exit",
+				stopped and "stopped:user"
+					or killed and ("killed:" .. tostring(why or "no-onscreen"))
+					or "exit",
 				os.time() - t0))
 			lf:close()
 		end
 	end
 
 	if not ok then return false, "恢复桌面失败：" .. tostring(rerr) end
+	-- 用户按「返回」主动收掉的：算正常退出，别报成启动失败/退出码非 0
+	if stopped then return true end
 	if err then return false, err end
 	if killed then
 		if why then

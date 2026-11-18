@@ -35,7 +35,9 @@ return dofile(ROOT .. "/keys/base.lua").define("player", {
 	-- ── 菜单 / 状态 / 退出 ────────────────────────────────
 	{ "C-3",         4, "C", "menu" },    -- ☰ 菜单
 	{ "BLUE",      401, nil, "status" },  -- 看进度
-	{ "ESC",         1, nil, "quit" },    -- ↶ 退出
+	{ "ESC",         1, nil, "quit" },    -- ↶ 退出（遥控返回实测发的是 ESC=1）
+	{ "BACK",      158, nil, "quit" },    -- ↶ 返回（KEY_BACK=158：播放中=退出播放）
+	{ "EXIT",      174, nil, "quit" },
 	{ "STOPCD",    166, nil, "quit" },
 }, {
 	order = 30,
