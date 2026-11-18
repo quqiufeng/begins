@@ -2910,6 +2910,30 @@ ssh x96 'systemctl is-active console-wall; stty size </dev/pts/0'
 
 验收：service `active`、`stty size` 给出 `49 170`、截图里中英混排对齐不叠行。
 
+### 22.7 坑：启用 console-wall 会把桌面顶掉
+
+`console-wall.service` 里 `Conflicts=desktop.service` + `Before=getty@tty1.service`，
+所以 `systemctl enable console-wall` 之后重启，**桌面不会起来**（`desktop` 显示 `inactive (dead)`
+且 `is-enabled` 可能已被置 `disabled`），HDMI 上只剩壁纸终端 —— 2026-11-18 就是这样"桌面没启动"了一次。
+
+二选一，别同时 enable：
+
+```bash
+# 要桌面（默认形态）
+systemctl disable console-wall; systemctl stop console-wall
+systemctl enable desktop;       systemctl start desktop
+
+# 要壁纸终端
+systemctl disable desktop; systemctl stop desktop
+systemctl enable console-wall; systemctl start console-wall
+```
+
+排查：`systemctl is-active desktop console-wall` → 两个都 `inactive` 说明都没启用；
+`journalctl -u desktop -b` 空 = 根本没跑过（不是崩了）。
+
+注意：desktop 走 SDL2 KMSDRM，画面**不经过 `/dev/fb0`**，所以跑起来时 `dd if=/dev/fb0` 截出来是空白，
+别把它当"没渲染"的证据；看 `/proc/<pid>/fd` 里有没有 `/dev/dri/card0` 才是真在画。
+
 ---
 
 *文档版本: 2.1 · 更新: 2026-11-18 · 设备: X96 Max / S905X2*
