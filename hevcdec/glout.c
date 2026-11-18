@@ -77,7 +77,12 @@ static struct hdrcolor tp_hc(void)
 	c.curve = tp.curve;		/* TM_* 与 HC_* 数值一致 */
 	c.src_peak = tp.src_peak;
 	c.target = tp.target;
-	c.sat = 1.0;			/* sat 在着色器里用 mix() 做，不进 LUT */
+	/* sat 必须进 LUT：和软映射（hc_chroma709 的 1+sat*(nout/n-1)）同一条规则，
+	 * 色度增益插值，亮度 Y 守恒。以前这里写死 1.0、把 sat 留给片元的
+	 * mix(vec3(lum),o,uSat)，结果暗饱和色被按亮度压暗（col_R 65→43、
+	 * col_B 20→3），亮饱和色又给缺失通道灌能量（col_Y 255,255,0→253,253,24），
+	 * 同一部片 RENDER=drm / RENDER=gl 颜色对不上。 */
+	c.sat = tp.sat;
 	c.knee = tp.knee;
 	c.full = 0;
 	c.gain_mode = tp.gain;
@@ -235,8 +240,8 @@ static void build_lut(float *out)
 		  !strcmp(getenv("TM_GAIN"), "linear"))) ? HC_GAIN_LIN : HC_GAIN_CODE;
 	if (tp.src_peak < tp.target) tp.src_peak = tp.target;
 	if (tp.knee <= 0.05 || tp.knee >= 1.0) tp.knee = 0.7;
-	/* 不映射时 sat 必须回到 1.0：片元里 mix(vec3(lum),o,uSat) 是无条件的，
-	 * 未知色域算出来的 0.90 会把 SDR 片凭空去饱和 10%。 */
+	/* 不映射时 sat 必须回到 1.0：未知色域算出来的 0.90 会进 LUT 的色度增益，
+	 * 把 SDR 片凭空去饱和 10%。 */
 	if (!tp.on) tp.sat = 1.0;
 
 	{
@@ -561,7 +566,15 @@ static struct {
 	EGLConfig cfg;
 	GLuint prog, tex_y, tex_c, tex_lut, tex_noise, vao, vbo;
 	unsigned sw, sh;		/* 源尺寸 */
+	double par;		/* 像素宽高比 SAR（默认 1.0）；显示宽高比 =
+				 * sw*par/sh，老片源的 720x576/16:15 就靠它 */
 	unsigned dw, dh;		/* 屏幕尺寸 */
+	/* vw/vh：真正渲染的 target（= GBM surface 尺寸），DPU 负责把它放大到
+	 * dw/dh。DPUSCALE=0 时 vw/vh 恒等于屏幕，退回老行为（GL 整屏放大）。
+	 * 这就是 design_player.md §4.1 的目标形态 A：片元只在源分辨率上跑。
+	 */
+	unsigned vw, vh;
+	unsigned up;		/* 约定的最大放大倍数（DPU 放大超 4x 糊得明显） */
 	int dx, dy;
 	unsigned dW, dH;
 	uint32_t crtc_id, conn_id, cur_fb;
@@ -574,6 +587,9 @@ static struct {
 	/* 分布账：平均 fps 会把"偶尔 40ms"和"稳定 30ms"算成一样，这里分开记 */
 	struct ps_hist h_draw, h_swap, h_flip, h_int;
 	long drops;		/* 提交了但没上屏（swap/lock/SetCrtc/PageFlip 失败） */
+	long sub;		/* 提交次数（= 上屏 + 掉帧），分母不能只数成功的 */
+	long presented;		/* 真被扫描出去的帧数（atomic commit / flip 成功） */
+	int master;		/* 自己拿到了 DRM master；拿不到的话一次都上不了屏 */
 	int perf;		/* PERF=0 关掉逐帧 glFinish（会改流水线行为） */
 	double vbl_ms;		/* 一个刷新周期，判 vblank miss 的基准 */
 	double t_latch, t_latch_prev;
@@ -609,6 +625,27 @@ static struct {
 	 */
 	int last_fy, last_fc, have_last;
 	unsigned last_w, last_h, last_yp, last_cp;
+	/* atomic 上屏（ATOMIC=1）。为什么非要它：legacy SetCrtc/PageFlip 交
+	 * 「比 mode 小的 fb」一律 ENOSPC，于是「渲染目标缩到源分辨率、放大交给
+	 * DPU」这条路在 legacy 上根本不成立（§4.1.5 实测）；atomic 的平面提交
+	 * 带上 CRTC_W/H=整屏就等价于 drmModeSetPlane(dst=整屏)，放大成功。
+	 * 顺带两件 legacy 拿不到的东西：
+	 *   IN_FENCE_FD   —— GPU 画完的 fence 直接交给 KMS，省掉逐帧 glFinish
+	 *   OUT_FENCE_PTR —— 扫描完成的 fence，用来判断这块 bo 何时能重用
+	 */
+	int atomic;
+	uint32_t plane_id, mode_blob;
+	uint64_t p_fb, p_pcrtc, p_sx, p_sy, p_sw, p_sh, p_dx, p_dy, p_dw, p_dh;
+	uint64_t p_in_fence;
+	uint64_t c_act, c_mode, c_out_fence, n_crtc;
+	/* EGL native fence（EGL_ANDROID_native_fence_sync）；没有就退回 glFinish */
+	int nfence;
+	PFNEGLCREATESYNCKHRPROC p_eglCreateSync;
+	PFNEGLDESTROYSYNCKHRPROC p_eglDestroySync;
+	PFNEGLDUPNATIVEFENCEFDANDROIDPROC p_eglDupFenceFd;
+	unsigned long n_fence_ok, n_fence_none, n_fence_fail;
+	int nowait;		/* ATOMIC_WAIT=0：提交完立刻返回，不等 flip */
+	unsigned long n_commit_ebusy;
 } g;
 
 /* 收一次 GPU 完成时间。perf 开时 glFinish 把它变成真实耗时——不加 glFinish
@@ -692,6 +729,257 @@ static int kms_pick(void)
 	return 0;
 }
 
+/* ---------- atomic 上屏：属性 id 解析 + 平面提交 ----------
+ * 属性 id 只在 init 里查一次（每次 commit 去查属性表是最常见的性能坑：
+ * drmModeObjectGetProperties + GetProperty 每帧几十微秒，还带分配）。
+ */
+static uint32_t aprop(uint32_t obj, uint32_t type, const char *name)
+{
+	drmModeObjectProperties *op = drmModeObjectGetProperties(g.dfd, obj, type);
+	uint32_t k, id = 0;
+
+	if (!op) return 0;
+	for (k = 0; k < op->count_props; k++) {
+		drmModePropertyRes *pd = drmModeGetProperty(g.dfd, op->props[k]);
+
+		if (pd && !strcmp(pd->name, name)) id = pd->prop_id;
+		if (pd) drmModeFreeProperty(pd);
+		if (id) break;
+	}
+	drmModeFreeObjectProperties(op);
+	return id;
+}
+
+static int atomic_init(void)
+{
+	drmModeRes *res;
+	drmModePlaneRes *pr;
+	uint32_t crtc_idx = 32, i;
+
+	if (drmSetClientCap(g.dfd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1)) {
+		printf("GLOUT: 不支持 UNIVERSAL_PLANES: %s\n", strerror(errno));
+		return -1;
+	}
+	if (drmSetClientCap(g.dfd, DRM_CLIENT_CAP_ATOMIC, 1)) {
+		printf("GLOUT: 驱动不支持 atomic: %s\n", strerror(errno));
+		return -1;
+	}
+	res = drmModeGetResources(g.dfd);
+	pr = drmModeGetPlaneResources(g.dfd);
+	if (!res || !pr) {
+		printf("GLOUT: atomic 取资源失败: %s\n", strerror(errno));
+		if (res) drmModeFreeResources(res);
+		return -1;
+	}
+	for (i = 0; i < (uint32_t)res->count_crtcs; i++)
+		if (res->crtcs[i] == g.crtc_id) crtc_idx = i;
+	/* connector 必须取「接在 g.crtc_id 上」的那个：res->connectors[0]
+	 * 可能是没插线的口，把它的 CRTC_ID 写进请求会让整个 commit EINVAL
+	 * （atomicms 探针就是在这里空转了半小时）。
+	 */
+	for (i = 0; i < (uint32_t)res->count_connectors; i++) {
+		drmModeConnector *c = drmModeGetConnector(g.dfd, res->connectors[i]);
+
+		if (!c) continue;
+		if (c->encoder_id) {
+			drmModeEncoder *e = drmModeGetEncoder(g.dfd, c->encoder_id);
+
+			if (e) {
+				if (e->crtc_id == g.crtc_id)
+					g.conn_id = c->connector_id;
+				drmModeFreeEncoder(e);
+			}
+		}
+		drmModeFreeConnector(c);
+	}
+	for (i = 0; i < pr->count_planes && !g.plane_id; i++) {
+		drmModePlane *p = drmModeGetPlane(g.dfd, pr->planes[i]);
+		uint64_t ty;
+		uint32_t id;
+
+		if (!p) continue;
+		if (!(p->possible_crtcs & (1u << crtc_idx))) {
+			drmModeFreePlane(p);
+			continue;
+		}
+		id = aprop(p->plane_id, DRM_MODE_OBJECT_PLANE, "type");
+		ty = 0;
+		if (id) {
+			drmModeObjectProperties *op =
+				drmModeObjectGetProperties(g.dfd, p->plane_id,
+							   DRM_MODE_OBJECT_PLANE);
+			uint32_t k;
+
+			for (k = 0; op && k < op->count_props; k++)
+				if (op->props[k] == id) ty = op->prop_values[k];
+			if (op) drmModeFreeObjectProperties(op);
+		}
+		if (ty == DRM_PLANE_TYPE_PRIMARY) g.plane_id = p->plane_id;
+		drmModeFreePlane(p);
+	}
+	drmModeFreePlaneResources(pr);
+	drmModeFreeResources(res);
+	if (!g.plane_id) { printf("GLOUT: 找不到 primary plane\n"); return -1; }
+
+	g.p_fb = aprop(g.plane_id, DRM_MODE_OBJECT_PLANE, "FB_ID");
+	g.p_pcrtc = aprop(g.plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_ID");
+	g.p_sx = aprop(g.plane_id, DRM_MODE_OBJECT_PLANE, "SRC_X");
+	g.p_sy = aprop(g.plane_id, DRM_MODE_OBJECT_PLANE, "SRC_Y");
+	g.p_sw = aprop(g.plane_id, DRM_MODE_OBJECT_PLANE, "SRC_W");
+	g.p_sh = aprop(g.plane_id, DRM_MODE_OBJECT_PLANE, "SRC_H");
+	g.p_dx = aprop(g.plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_X");
+	g.p_dy = aprop(g.plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_Y");
+	g.p_dw = aprop(g.plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_W");
+	g.p_dh = aprop(g.plane_id, DRM_MODE_OBJECT_PLANE, "CRTC_H");
+	g.p_in_fence = aprop(g.plane_id, DRM_MODE_OBJECT_PLANE, "IN_FENCE_FD");
+	g.c_act = aprop(g.crtc_id, DRM_MODE_OBJECT_CRTC, "ACTIVE");
+	g.c_mode = aprop(g.crtc_id, DRM_MODE_OBJECT_CRTC, "MODE_ID");
+	g.c_out_fence = aprop(g.crtc_id, DRM_MODE_OBJECT_CRTC, "OUT_FENCE_PTR");
+	g.n_crtc = aprop(g.conn_id, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
+	if (!g.p_fb || !g.p_sw || !g.p_dw || !g.c_mode || !g.n_crtc) {
+		printf("GLOUT: atomic 属性不全 fb=%u sw=%u dw=%u mode=%u conn=%u\n",
+		       (unsigned)g.p_fb, (unsigned)g.p_sw, (unsigned)g.p_dw,
+		       (unsigned)g.c_mode, (unsigned)g.n_crtc);
+		return -1;
+	}
+	if (drmModeCreatePropertyBlob(g.dfd, &g.mode, sizeof(g.mode),
+				      &g.mode_blob)) {
+		printf("GLOUT: mode blob 失败: %s\n", strerror(errno));
+		return -1;
+	}
+	g.atomic = 1;
+	g.nowait = getenv("ATOMIC_WAIT") && !atoi(getenv("ATOMIC_WAIT"));
+	printf("GLOUT: atomic 上屏 plane=%u conn=%u in_fence=%s out_fence=%s%s\n",
+	       g.plane_id, g.conn_id, g.p_in_fence ? "有" : "无",
+	       g.c_out_fence ? "有" : "无", g.nowait ? " (不等 flip)" : "");
+	return 0;
+}
+
+/* GPU 画完的 fence：glout 不再 glFinish，让 KMS 等 GPU。
+ * eglDupNativeFenceFDANDROID 返回 -1 表示「没有未完成的活」（工作已经
+ * 做完），这时按 -1 属性提交，等价于「立刻可用」。
+ */
+static int make_fence(void)
+{
+	EGLSyncKHR s;
+	int fd;
+
+	if (!g.nfence) return -1;
+	s = g.p_eglCreateSync(g.dpy, EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
+	if (s == EGL_NO_SYNC_KHR) {
+		g.n_fence_fail++;
+		return -1;
+	}
+	fd = g.p_eglDupFenceFd(g.dpy, s);
+	g.p_eglDestroySync(g.dpy, s);
+	if (fd < 0) g.n_fence_none++;
+	else g.n_fence_ok++;
+	return fd;
+}
+
+/* 前向声明：这一段在 flip 记账函数之前（它们贴着 legacy 上屏路径） */
+static void wait_flip_to(int ms);
+static void wait_flip(void);
+static void record_flip(double t_req);
+
+/* 一次平面提交。首帧要带全套 modeset（让 CRTC 上有模式），之后只改
+ * FB_ID（+ 尺寸），这在本驱动上实测 43µs/次，比 legacy PageFlip 还快。
+ * 返回 0 表示已提交（fence fd 归内核），-1 表示失败。
+ */
+/* 每帧都失败时别刷屏：同一条错误只喊前 3 次，之后每 60 次喊一次。
+ * 屏幕不动的时候日志里 80 行一样的字，看不出是哪个错在先。
+ */
+static void err_ratelimit(const char *what, int e)
+{
+	static int last = -1;
+	static long n;
+
+	n = (e == last) ? n + 1 : 1;
+	last = e;
+	if (n > 3 && (n % 60)) return;
+	printf("GLOUT: %s 失败: %s%s\n", what, strerror(e),
+	       n > 3 ? "（同错持续，之后每 60 次喊一次）" : "");
+}
+
+static int present_atomic(uint32_t fbr, int fence_fd)
+{
+	drmModeAtomicReq *req = drmModeAtomicAlloc();
+	int ofd = -1, ret = -1, tries = 0;
+	double t_req = now_s();
+
+	if (!req) {
+		if (fence_fd >= 0) close(fence_fd);
+		return -1;
+	}
+	drmModeAtomicAddProperty(req, g.plane_id, g.p_fb, fbr);
+	drmModeAtomicAddProperty(req, g.plane_id, g.p_pcrtc, g.crtc_id);
+	drmModeAtomicAddProperty(req, g.plane_id, g.p_sx, 0);
+	drmModeAtomicAddProperty(req, g.plane_id, g.p_sy, 0);
+	drmModeAtomicAddProperty(req, g.plane_id, g.p_sw, (uint64_t)g.vw << 16);
+	drmModeAtomicAddProperty(req, g.plane_id, g.p_sh, (uint64_t)g.vh << 16);
+	/* dst 恒等于整屏：给子矩形 atomic 也回 EINVAL（见 glout_init 里的实测） */
+	drmModeAtomicAddProperty(req, g.plane_id, g.p_dx, 0);
+	drmModeAtomicAddProperty(req, g.plane_id, g.p_dy, 0);
+	drmModeAtomicAddProperty(req, g.plane_id, g.p_dw, g.dw);
+	drmModeAtomicAddProperty(req, g.plane_id, g.p_dh, g.dh);
+	if (g.p_in_fence)
+		drmModeAtomicAddProperty(req, g.plane_id, g.p_in_fence, fence_fd);
+	if (g.c_out_fence) {
+		ofd = -1;
+		drmModeAtomicAddProperty(req, g.crtc_id, g.c_out_fence,
+					 (uint64_t)(uintptr_t)&ofd);
+	}
+	if (g.first) {
+		drmModeAtomicAddProperty(req, g.conn_id, g.n_crtc, g.crtc_id);
+		drmModeAtomicAddProperty(req, g.crtc_id, g.c_act, 1);
+		drmModeAtomicAddProperty(req, g.crtc_id, g.c_mode, g.mode_blob);
+		ret = drmModeAtomicCommit(g.dfd, req,
+					  DRM_MODE_ATOMIC_ALLOW_MODESET,
+					  &g.flip_done);
+		if (ret && errno == EBUSY) {
+			wait_flip_to(20);
+			ret = drmModeAtomicCommit(g.dfd, req,
+						  DRM_MODE_ATOMIC_ALLOW_MODESET,
+						  &g.flip_done);
+		}
+		if (!ret) g.first = 0;
+	} else {
+		/* EBUSY = 上一次提交还挂在 CRTC 上（内核同一时刻只允许一个
+		 * pending flip）。收掉挂起事件再重试，和 legacy 路径同策略。
+		 */
+		while (tries++ < 60) {
+			ret = drmModeAtomicCommit(g.dfd, req,
+						  DRM_MODE_ATOMIC_NONBLOCK |
+						  DRM_MODE_PAGE_FLIP_EVENT,
+						  &g.flip_done);
+			if (!ret) break;
+			if (errno != EBUSY) break;
+			g.n_commit_ebusy++;
+			wait_flip_to(20);
+			usleep(1000);
+		}
+	}
+	drmModeAtomicFree(req);
+	/* IN_FENCE_FD 的 fd 归内核（commit 成功后内核 sync_file_get 走了引用，
+	 * fd 本身也由内核在 ioctl 里关掉）；失败时是我们自己负责关。
+	 * 关两次最多 EBADF，不会误伤——但为了不带病上线，这里只在失败时关。
+	 */
+	if (ret && fence_fd >= 0) close(fence_fd);
+	if (ret) {
+		err_ratelimit("atomic commit", errno);
+		g.drops++;
+		return -1;
+	}
+	if (ofd >= 0) close(ofd);
+	if (g.nowait) {
+		record_flip(t_req);	/* 只记请求时刻，不等事件 */
+	} else {
+		wait_flip();
+		record_flip(t_req);
+	}
+	return 0;
+}
+
 /* ---------- 两遍渲染：源分辨率色调映射 + 整屏纯拷贝放大 ----------
  * 单遍在 2560x1440 上做完整 CSC/色调映射实测只有 28fps（片元 ALU+3 采样器
  * 让 panfrost 掉一半吞吐）；拆成
@@ -725,6 +1013,27 @@ void glout_set_drm_fd(int fd)
 }
 
 /* ---------- 初始化：DRM + GBM + EGL + GL ---------- */
+/* 像素宽高比：必须在 glout_init 之前调用（比例守卫在 init 里定 target 尺寸）。
+ * 非方形像素的老片源（如 720x576 SAR 16:15）如果按容器宽高算比例，
+ * 会选错 target 并把黑边算歪。VUI 没写就保持默认 1.0。
+ */
+void glout_set_par(unsigned num, unsigned den)
+{
+	if (num && den && num < 4096 && den < 4096) {
+		g.par = (double)num / den;
+	} else {
+		g.par = 1.0;
+	}
+}
+
+/* 源在屏幕上的显示宽高比 */
+static double src_ar(unsigned w, unsigned h)
+{
+	double par = g.par > 0.0 ? g.par : 1.0;
+
+	return (double)w * par / (double)h;
+}
+
 int glout_init(unsigned sw, unsigned sh)
 {
 	const char *dev = getenv("DRMDEV") ? getenv("DRMDEV") : "/dev/dri/card0";
@@ -737,6 +1046,7 @@ int glout_init(unsigned sw, unsigned sh)
 	};
 
 	if (g.inited) return 0;
+	if (g.par <= 0.0) g.par = 1.0;
 	g.sw = sw;
 	g.sh = sh;
 	if (g.fd_in > 0) {
@@ -745,10 +1055,69 @@ int glout_init(unsigned sw, unsigned sh)
 		g.dfd = open(dev, O_RDWR | O_CLOEXEC);
 		if (g.dfd < 0) gdie("open card0");
 	}
+	/* 拿 master 是「能不能上屏」的前提：别人（kinfo/desktop 之类）拿着
+	 * master 时，SetCrtc/PageFlip 一律 EACCES，GBM 那边 eglSwapBuffers
+	 * 也随之 EGL_BAD_ALLOC——每帧都失败，但解码循环照跑，fps 看着还挺好。
+	 * 所以这里显式要一次，失败就喊出来，别让"解码正常"冒充"在放"。
+	 */
+	if (drmSetMaster(g.dfd) == 0) {
+		g.master = 1;
+	} else {
+		printf("GLOUT: 拿不到 DRM master (%s)：显示被别的进程占着，"
+		       "画面会一帧都上不去\n", strerror(errno));
+	}
 	if (kms_pick() < 0) return -1;
+	/* ATOMIC=1：上屏改走平面提交，这样「渲染 1280x720、由 DPU 放大到整屏」
+	 * 才成立（legacy SetCrtc/PageFlip 对小 fb 一律 ENOSPC）。初始化失败不算
+	 * 致命：退回 legacy 继续跑，只是不能开 DPUSCALE。
+	 */
+	if (getenv("ATOMIC") && atoi(getenv("ATOMIC")))
+		if (atomic_init() < 0)
+			printf("GLOUT: atomic 初始化失败，退回 legacy 上屏\n");
 	g.gbm = gbm_create_device(g.dfd);
 	if (!g.gbm) gdie("gbm_create_device");
-	g.gs = gbm_surface_create(g.gbm, g.dw, g.dh, GBM_FORMAT_XRGB8888,
+	/* 渲染目标取「源尺寸」，由 DPU 硬件放大到屏幕（§4.1 形态 A）：
+	 * 片元数从 dw*dh 降到 vw*vh，放大是 DPU 的免费能力。
+	 * 上限 4x：再往上 DPU 的单次放大插值会明显发虚，且 720p 以下源
+	 * 本来就是少数情况，退回屏幕尺寸做 GPU 放大更稳。
+	 */
+	/* 渲染目标取「源尺寸」，由 DPU 硬件放大到屏幕（§4.1 形态 A）：
+	 * 片元数从 dw*dh 降到 vw*vh，放大是 DPU 的免费能力。
+	 *
+	 * 两个死结都是实测的，别绕：
+	 *  1. legacy SetCrtc 不收「fb 比 mode 小」（ENOSPC）→ 只有 atomic 平面
+	 *     提交下这条路才成立，所以默认值跟着 atomic 走（ATOMIC=1 → 4x）。
+	 *  2. plane 的 dst 只能是整屏：给子矩形照样进 commit，但 atomic 回
+	 *     EINVAL —— 实测 192 帧帧帧失败、全靠 legacy 兜底才上屏
+	 *     （`DSTFIT` 那个实验就是这么否掉的）。所以黑边不能靠 dst 偏移，
+	 *     只能画进 target。
+	 * 两条合起来就是：**target 必须与屏幕同比例**。比例对不上还硬放，
+	 * DPU 会把整张拉成全屏 —— 2.35:1 的片子就是纵向 1.35 倍的变形。
+	 * 所以比例差超过 0.5% 就退回整屏 target，让 GL 自己画黑边。
+	 * 上限 4x：再往上 DPU 的单次放大插值明显发虚。
+	 */
+	g.up = getenv("DPUSCALE") ? (unsigned)atoi(getenv("DPUSCALE"))
+				  : (g.atomic ? 4 : 0);
+	g.vw = sw ? sw : g.dw;
+	g.vh = sh ? sh : g.dh;
+	if (g.vw > g.dw) g.vw = g.dw;
+	if (g.vh > g.dh) g.vh = g.dh;
+	g.vw &= ~1u;
+	g.vh &= ~1u;
+	if (!g.vw || !g.vh) { g.vw = g.dw; g.vh = g.dh; }
+	{
+		double asp_t = (double)g.vw / g.vh;
+		double asp_s = (double)g.dw / g.dh;
+
+		if (!g.up || g.vw * g.up < g.dw || g.vh * g.up < g.dh ||
+		    fabs(asp_t - asp_s) > asp_s * 0.005) {
+			g.vw = g.dw;
+			g.vh = g.dh;
+		}
+	}
+	printf("GLOUT: target %ux%u -> 屏 %ux%u（DPU %ux 放大）\n",
+	       g.vw, g.vh, g.dw, g.dh, g.up);
+	g.gs = gbm_surface_create(g.gbm, g.vw, g.vh, GBM_FORMAT_XRGB8888,
 				  GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
 	if (!g.gs) gdie("gbm_surface_create");
 	g.dpy = eglGetDisplay((EGLNativeDisplayType)g.gbm);
@@ -776,12 +1145,89 @@ int glout_init(unsigned sw, unsigned sh)
 		printf("GLOUT: eglMakeCurrent 失败 0x%x\n", eglGetError());
 		return -1;
 	}
+	/* EGL native fence：有它才能把「GPU 还没画完」交给 KMS 等，
+	 * 省掉逐帧 glFinish（实测 720p pass1 的 glFinish 要 8.3ms，
+	 * 其中大部分是等 GPU，本来可以流水到下一帧）。没有就退回 glFinish。
+	 */
+	{
+		const char *e = eglQueryString(g.dpy, EGL_EXTENSIONS);
+
+		if (e && strstr(e, "EGL_ANDROID_native_fence_sync")) {
+			g.p_eglCreateSync = (PFNEGLCREATESYNCKHRPROC)
+				eglGetProcAddress("eglCreateSyncKHR");
+			g.p_eglDestroySync = (PFNEGLDESTROYSYNCKHRPROC)
+				eglGetProcAddress("eglDestroySyncKHR");
+			g.p_eglDupFenceFd = (PFNEGLDUPNATIVEFENCEFDANDROIDPROC)
+				eglGetProcAddress("eglDupNativeFenceFDANDROID");
+			if (g.p_eglCreateSync && g.p_eglDestroySync &&
+			    g.p_eglDupFenceFd)
+				g.nfence = 1;
+		}
+		printf("GLOUT: EGL native fence %s\n",
+		       g.nfence ? "可用（不 glFinish，交给 KMS 等）"
+				: "不可用（退回逐帧 glFinish）");
+	}
 	g.twopass = getenv("GL1PASS") ? 0 : 1;
 	g.inited = 1;
 	g.first = 1;
-	printf("GLOUT: GL %s / 屏 %ux%u\n", glGetString(GL_VERSION), g.dw, g.dh);
+	printf("GLOUT: GL %s / 屏 %ux%u 渲染 %ux%u (%s)\n",
+	       glGetString(GL_VERSION), g.dw, g.dh, g.vw, g.vh,
+	       (g.vw == g.dw && g.vh == g.dh) ? "GPU 放大" : "DPU 放大");
 	printf("GLOUT: 渲染器 %s (%s)\n", glGetString(GL_RENDERER),
 	       glGetString(GL_VENDOR));
+	return 0;
+}
+
+/* 源尺寸变了就把渲染 target 跟着改（换片、自适应分辨率）。
+ * GBM surface 换尺寸只能重建：gbm_surface_destroy 会释放全部 bo，
+ * 上面挂的 fb_id 必须一起删，否则内核对已释放的 GEM 还留着 fb 引用。
+ */
+static int ensure_surface(unsigned w, unsigned h)
+{
+	unsigned nw = w ? w : g.dw, nh = h ? h : g.dh;
+
+	if (!g.up) return 0;
+	if (nw > g.dw) nw = g.dw;
+	if (nh > g.dh) nh = g.dh;
+	if (!g.up || nw * g.up < g.dw || nh * g.up < g.dh) { nw = g.dw; nh = g.dh; }
+	nw &= ~1u;
+	nh &= ~1u;
+	if (!nw || !nh) { nw = g.dw; nh = g.dh; }
+	if (nw == g.vw && nh == g.vh) return 0;
+	/* 差距 10% 以内不值得重建：recreate 要丢两帧 */
+	if (abs((int)nw - (int)g.vw) * 10 < (int)g.vw &&
+	    abs((int)nh - (int)g.vh) * 10 < (int)g.vh)
+		return 0;
+	{
+		int i;
+
+		for (i = 0; i < g.nfly; i++) {
+			uint32_t *slot = gbm_bo_get_user_data(g.fly[i]);
+
+			if (slot && *slot) { drmModeRmFB(g.dfd, *slot); *slot = 0; }
+		}
+	}
+	eglMakeCurrent(g.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+	eglDestroySurface(g.dpy, g.surf);
+	gbm_surface_destroy(g.gs);
+	g.gs = gbm_surface_create(g.gbm, nw, nh, GBM_FORMAT_XRGB8888,
+				  GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+	if (!g.gs) { printf("GLOUT: 重建 gbm_surface 失败\n"); return -1; }
+	g.surf = eglCreateWindowSurface(g.dpy, g.cfg,
+					(EGLNativeWindowType)g.gs, NULL);
+	if (g.surf == EGL_NO_SURFACE) {
+		printf("GLOUT: 重建 egl surface 失败 0x%x\n", eglGetError());
+		return -1;
+	}
+	if (!eglMakeCurrent(g.dpy, g.surf, g.surf, g.ctx)) {
+		printf("GLOUT: 重建后 makeCurrent 失败 0x%x\n", eglGetError());
+		return -1;
+	}
+	g.vw = nw;
+	g.vh = nh;
+	g.first = 1;	/* 老 fb 都删了，下一帧必须 SetCrtc 重新点名 */
+	printf("GLOUT: 渲染 target 改为 %ux%u（源 %ux%u → 屏 %ux%u）\n",
+	       nw, nh, w, h, g.dw, g.dh);
 	return 0;
 }
 
@@ -991,6 +1437,18 @@ void glout_stats(double *draw_sum, double *draw_max, double *swap_sum,
 	if (frames) *frames = g.frames;
 }
 
+/* 上屏质量：提交了多少次、真上屏多少帧、是不是 master。
+ * 调用方（播放器的 PERF 行）必须两者都报：只报成功次数时，
+ * 「一帧都没上屏」和「上屏很慢」在数字上长得一模一样。
+ */
+void glout_present_stats(long *sub, unsigned *shown, long *drops, int *master)
+{
+	if (sub) *sub = g.sub;
+	if (shown) *shown = (unsigned)g.presented;
+	if (drops) *drops = g.drops;
+	if (master) *master = g.master;
+}
+
 void glout_reset(void)
 {
 	if (!g.inited) return;
@@ -1014,7 +1472,12 @@ void glout_perf_print(void)
 		       g.h_flip.maxv, g.vbl_ms > 0 ? g.h_flip.maxv / g.vbl_ms : 0);
 	}
 	ps_print(&g.h_int);
-	printf("PERF 掉帧 %ld 帧 / 提交 %u 帧\n", g.drops, g.frames);
+	printf("PERF 上屏 %ld 帧 / 提交 %ld 帧（丢弃 %ld）%s\n",
+	       g.presented, g.sub, g.drops,
+	       g.presented ? "" : "  ← 一帧都没上屏，屏幕不会变！");
+	if (!g.presented && g.sub)
+		printf("GLOUT: 全部帧丢弃%s\n",
+		       g.master ? "" : "（本进程不是 DRM master，见上面那行）");
 }
 
 /* 上屏前抓一帧（GLDUM=/tmp/x.ppm），用来核对色调映射对不对 */
@@ -1028,26 +1491,29 @@ static void dump_frame(void)
 
 	if (!p || done || !g.dw || !g.dh) return;
 	done = 1;
-	buf = malloc((size_t)g.dw * g.dh * 4);
+	buf = malloc((size_t)g.vw * g.vh * 4);
 	if (!buf) return;
-	glReadPixels(0, 0, g.dw, g.dh, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+	glReadPixels(0, 0, g.vw, g.vh, GL_RGBA, GL_UNSIGNED_BYTE, buf);
 	f = fopen(p, "wb");
 	if (!f) { free(buf); return; }
-	fprintf(f, "P6\n%u %u\n255\n", g.dw, g.dh);
-	for (y = 0; y < g.dh; y++) {
-		unsigned char *r = buf + (size_t)(g.dh - 1 - y) * g.dw * 4;
+	fprintf(f, "P6\n%u %u\n255\n", g.vw, g.vh);
+	for (y = 0; y < g.vh; y++) {
+		unsigned char *r = buf + (size_t)(g.vh - 1 - y) * g.vw * 4;
 
-		for (x = 0; x < g.dw; x++) fwrite(r + x * 4, 1, 3, f);
+		for (x = 0; x < g.vw; x++) fwrite(r + x * 4, 1, 3, f);
 	}
 	fclose(f);
 	free(buf);
-	printf("GLOUT: 抓帧 → %s (%ux%u)\n", p, g.dw, g.dh);
+	printf("GLOUT: 抓帧 → %s (%ux%u)\n", p, g.vw, g.vh);
 }
 
 static void flip_handler(int fd, unsigned seq, unsigned sec, unsigned usec, void *data)
 {
 	(void)fd; (void)seq; (void)sec; (void)usec;
-	*(int *)data = 1;
+	/* atomic 提交的 user_data 是 commit 时给的指针；万一没给（NULL），
+	 * 这里绝不能写 —— 一写就是段错误，整链重启闪屏。
+	 */
+	if (data) *(int *)data = 1;
 }
 
 static void wait_flip_to(int ms)
@@ -1122,11 +1588,14 @@ static uint32_t bo_to_fb(struct gbm_bo *bo)
 	pitches[0] = gbm_bo_get_stride(bo);
 	flags = (mod == DRM_FORMAT_MOD_LINEAR || mod == 0x00ffffffffffffffULL) ?
 		DRM_MODE_FB_MODIFIERS : 0;
-	ret = drmModeAddFB2WithModifiers(g.dfd, g.dw, g.dh,
+	/* fb 尺寸 = bo 尺寸 = 渲染 target。比 CRTC 小就是 DPU 硬件放大，
+	 * 比它大就是硬件缩小（源比屏大时老路径也在用），两种都免费。
+	 */
+	ret = drmModeAddFB2WithModifiers(g.dfd, g.vw, g.vh,
 					 DRM_FORMAT_XRGB8888, handles, pitches,
 					 offsets, mods, &fb, flags);
 	if (ret && !(flags & DRM_MODE_FB_MODIFIERS))
-		ret = drmModeAddFB2(g.dfd, g.dw, g.dh, DRM_FORMAT_XRGB8888,
+		ret = drmModeAddFB2(g.dfd, g.vw, g.vh, DRM_FORMAT_XRGB8888,
 				    handles, pitches, offsets, &fb, 0);
 	if (ret) {
 		printf("GLOUT: AddFB2 失败: %s\n", strerror(errno));
@@ -1182,7 +1651,10 @@ static void osd_draw(void)
 	}
 	if (!g.osd_w || !g.osd_h)
 		return;
-	k = (double)g.dh / 1080.0;
+	/* 提示条画在渲染 target 的坐标系里（DPU 会把它一起放大），
+	 * 缩放基准因此是 vh，不是屏幕的 dh。
+	 */
+	k = (double)g.vh / 1080.0;
 	qw = (unsigned)(g.osd_w * k + 0.5);
 	qh = (unsigned)(g.osd_h * k + 0.5);
 	m = (int)(40.0 * k);
@@ -1283,7 +1755,8 @@ static int twopass_frame(unsigned w, unsigned h)
 	glUniform1i(glGetUniformLocation(g.prog, "uC"), 1);
 	glUniform1i(glGetUniformLocation(g.prog, "uLut"), 2);
 	glUniform1i(glGetUniformLocation(g.prog, "uNoise"), 3);
-	glUniform1f(glGetUniformLocation(g.prog, "uSat"), (float)tp.sat);
+	/* sat 已在 LUT 的色度增益里，片元里那次 mix 保持恒等，避免算两遍。 */
+	glUniform1f(glGetUniformLocation(g.prog, "uSat"), 1.0f);
 	gm_upload(g.prog);
 	glUniform1fv(glGetUniformLocation(g.prog, "uPc"), 12, poly_c);
 	glUniform1fv(glGetUniformLocation(g.prog, "uPg"), 12, poly_g);
@@ -1291,17 +1764,21 @@ static int twopass_frame(unsigned w, unsigned h)
 	tB = now_s();
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 	tC = now_s();
-	/* pass2 */
+	/* pass2：目标是渲染 target（vw x vh），不是屏幕 —— 放大交给 DPU。
+	 * 片元数因此从 dw*dh 降到 vw*vh（720p 源在 1080p 屏上是 25%）。
+	 * 等比黑边在 target 坐标系里算：DPU 把整张 target 一起放大，
+	 * 黑边比例不变，所以在任意宽高比的源上依然是对的。
+	 */
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	ar_s = (double)w / h;
-	ar_d = (double)g.dw / g.dh;
-	if (ar_s > ar_d) { dW = g.dw; dH = (unsigned)(g.dw / ar_s + 0.5) & ~1u; }
-	else { dH = g.dh; dW = (unsigned)(g.dh * ar_s + 0.5) & ~1u; }
-	dx = (g.dw - dW) / 2;
-	dy = (g.dh - dH) / 2;
+	ar_s = src_ar(w, h);
+	ar_d = (double)g.vw / g.vh;
+	if (ar_s > ar_d) { dW = g.vw; dH = (unsigned)(g.vw / ar_s + 0.5) & ~1u; }
+	else { dH = g.vh; dW = (unsigned)(g.vh * ar_s + 0.5) & ~1u; }
+	dx = (g.vw - dW) / 2;
+	dy = (g.vh - dH) / 2;
 	glClearColor(0, 0, 0, 1);
 	glClear(GL_COLOR_BUFFER_BIT);
-	glViewport(dx, g.dh - dy - dH, dW, dH);
+	glViewport(dx, g.vh - dy - dH, dW, dH);
 	glUseProgram(g.prog2);
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, g.tex_rgb);
@@ -1360,6 +1837,8 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 		drop_tex();
 		g.sw = w;
 		g.sh = h;
+		/* 渲染 target 跟着源走（DPUSCALE=0 时 ensure_surface 直接返回） */
+		if (ensure_surface(w, h)) return -1;
 	}
 	{
 		int i, k = -1;
@@ -1418,21 +1897,21 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 		if (twopass_frame(w, h)) return -1;
 		goto swap;
 	}
-	ar_s = (double)w / h;
-	ar_d = (double)g.dw / g.dh;
+	ar_s = src_ar(w, h);
+	ar_d = (double)g.vw / g.vh;
 	if (ar_s > ar_d) {
-		dW = g.dw;
-		dH = (unsigned)(g.dw / ar_s + 0.5) & ~1u;
+		dW = g.vw;
+		dH = (unsigned)(g.vw / ar_s + 0.5) & ~1u;
 	} else {
-		dH = g.dh;
-		dW = (unsigned)(g.dh * ar_s + 0.5) & ~1u;
+		dH = g.vh;
+		dW = (unsigned)(g.vh * ar_s + 0.5) & ~1u;
 	}
-	dx = (g.dw - dW) / 2;
-	dy = (g.dh - dH) / 2;
-	glViewport(0, 0, g.dw, g.dh);
+	dx = (g.vw - dW) / 2;
+	dy = (g.vh - dH) / 2;
+	glViewport(0, 0, g.vw, g.vh);
 	glClearColor(0, 0, 0, 1);
 	glClear(GL_COLOR_BUFFER_BIT);
-	glViewport(dx, g.dh - dy - dH, dW, dH);
+	glViewport(dx, g.vh - dy - dH, dW, dH);
 	glUseProgram(g.prog);
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, g.tex_y);
@@ -1447,7 +1926,8 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 	glUniform1i(glGetUniformLocation(g.prog, "uC"), 1);
 	glUniform1i(glGetUniformLocation(g.prog, "uLut"), 2);
 	glUniform1i(glGetUniformLocation(g.prog, "uNoise"), 3);
-	glUniform1f(glGetUniformLocation(g.prog, "uSat"), (float)tp.sat);
+	/* sat 已在 LUT 的色度增益里，片元里那次 mix 保持恒等，避免算两遍。 */
+	glUniform1f(glGetUniformLocation(g.prog, "uSat"), 1.0f);
 	gm_upload(g.prog);
 	glUniform1fv(glGetUniformLocation(g.prog, "uPc"), 12, poly_c);
 	glUniform1fv(glGetUniformLocation(g.prog, "uPg"), 12, poly_g);
@@ -1468,13 +1948,25 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 	osd_draw();
 
 swap:
+	g.sub++;
 	tg2 = now_s();
 	dump_frame();
 	{
 		double ts = now_s(), dt;
 
 		if (!eglSwapBuffers(g.dpy, g.surf)) {
-			printf("GLOUT: swap 失败 0x%x\n", eglGetError());
+			{
+				static int en;
+				unsigned e = eglGetError();
+
+				/* 0x3003 = EGL_BAD_ALLOC：GBM 分不出新 back buffer，
+				 * 常见于「不是 DRM master」或 surface 尺寸被改过。
+				 */
+				if (en++ < 3 || !(en % 60))
+					printf("GLOUT: eglSwapBuffers 失败 0x%x%s\n",
+					       e, e == 0x3003 ?
+					       " (EGL_BAD_ALLOC：分不出 back buffer)" : "");
+			}
 			g.drops++;
 			return -1;
 		}
@@ -1505,7 +1997,21 @@ swap:
 		*slot = fbr;
 		gbm_bo_set_user_data(bo, slot, NULL);
 	}
-	{
+	if (g.atomic) {
+		int ff = -1;
+		double tf;
+
+		if (g.nfence) ff = make_fence();
+		else glFinish();	/* 没有 in-fence，只能自己等 GPU 画完 */
+		tf = now_s();
+		if (present_atomic(fbr, ff) == 0)
+			g.presented++;
+		else if (g.drops == 1)
+			/* 第一次就失败：一次性说清「解码还在跑但屏幕不会变」 */
+			printf("GLOUT: 上屏被拒——解码和渲染继续，但这帧没上屏\n");
+		g.s_flip += now_s() - tf;
+		tg5 = now_s();
+	} else {
 	double tf = now_s();
 
 	if (g.first) {
@@ -1514,7 +2020,7 @@ swap:
 		while (drmModeSetCrtc(g.dfd, g.crtc_id, fbr, 0, 0, &g.conn_id, 1,
 				      &g.mode)) {
 			if (errno != EBUSY || ++tries > 20) {
-				printf("GLOUT: SetCrtc 失败: %s\n", strerror(errno));
+				err_ratelimit("SetCrtc", errno);
 				return -1;
 			}
 			wait_flip_to(20);
@@ -1567,7 +2073,8 @@ swap:
 		g.prev_bo = NULL;
 	}
 	g.prev_bo = bo;
-	g.frames++;
+	g.frames++;		/* 画完并交出去了（= 提交，未必上屏） */
+	if (!g.atomic) g.presented++;	/* legacy 走到这里是真的 flip 成功了 */
 	if (g.split) {
 		g.s_in += tg1 - tg0;
 		g.s_draw += tg2 - tg1;
@@ -1737,6 +2244,12 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	if (argc > 4) n = atoi(argv[4]);
+	if (getenv("PAR")) {		/* PAR=16:15 模拟非方形像素，看黑边对不对 */
+		unsigned a = 1, b = 1;
+
+		sscanf(getenv("PAR"), "%u:%u", &a, &b);
+		glout_set_par(a, b);
+	}
 	if (glout_init(w, h) < 0) return 1;
 	if (gen_testcard(w, h, &fdy, &fdc, &sy, &sc) < 0) return 1;
 	t0 = now_s();

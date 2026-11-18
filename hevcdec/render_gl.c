@@ -19,10 +19,12 @@
 #include <unistd.h>
 
 #include "render.h"
+#include "csig.h"		/* g_cm：VUI 的 sample aspect ratio（弱符号，独立链接也安全） */
 
 #ifdef HAVE_GLOUT
 void glout_set_drm_fd(int fd);
 int  glout_init(unsigned sw, unsigned sh);
+void glout_set_par(unsigned num, unsigned den);
 int  glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 		 unsigned ypitch, unsigned cpitch);
 int  glout_repaint(void);
@@ -30,6 +32,7 @@ void glout_reset(void);
 void glout_perf_print(void);
 void glout_stats(double *draw_sum, double *draw_max, double *swap_sum,
 		 unsigned *frames);
+void glout_present_stats(long *sub, unsigned *shown, long *drops, int *master);
 #endif
 
 /* 和 v4l2hevc.c 的 now_s() 同一个时钟域，只为本文件记上屏时刻 */
@@ -44,7 +47,7 @@ static double gl_now(void)
 struct gl_priv {
 	int dfd;
 	unsigned sw, sh;
-	unsigned frames, latch;
+	unsigned frames, latch, subs;	/* frames=真上屏；subs=提交尝试 */
 	double draw_sum, draw_max, swap_sum;
 	double t_first, t_last;
 };
@@ -70,6 +73,10 @@ static int gl_init(struct renderer *r, unsigned sw, unsigned sh)
 		return -1;
 	}
 	glout_set_drm_fd(p->dfd);
+	/* 非方形像素的源（720x576 SAR 16:15 那类）靠它算对黑边；VUI 还没到就
+	 * 先按 1:1，gl_submit 每帧会再刷一次。 */
+	glout_set_par(g_cm.sar_num > 0 ? (unsigned)g_cm.sar_num : 1u,
+		      g_cm.sar_den > 0 ? (unsigned)g_cm.sar_den : 1u);
 	if (glout_init(sw, sh) < 0) {
 		close(p->dfd);
 		free(p);
@@ -87,10 +94,19 @@ static int gl_submit(struct renderer *r, const int fd[2], unsigned w, unsigned h
 	struct gl_priv *p = r->priv;
 
 	(void)pts;
-	if (glout_frame(fd[0], fd[1], w, h, ypitch, cpitch) < 0)
-		return -1;		/* 没画上去：owner 留在调用方，它自己回收 */
-	if (!p->frames)
+	/* VUI 常在第一帧之后才解析出来，所以每帧同步一次（只写一个 double） */
+	glout_set_par(g_cm.sar_num > 0 ? (unsigned)g_cm.sar_num : 1u,
+		      g_cm.sar_den > 0 ? (unsigned)g_cm.sar_den : 1u);
+	if (!p->frames && !p->subs)
 		p->t_first = gl_now();
+	p->subs++;
+	if (glout_frame(fd[0], fd[1], w, h, ypitch, cpitch) < 0) {
+		/* 没画上去：owner 留在调用方，它自己回收。
+		 * 时间戳前面已经打过 —— 否则 shown=0 时 t_first/t_last 都是 0，
+		 * elapsed 变 0.00s，看上去像"一帧都没提交"。 */
+		p->t_last = gl_now();
+		return -1;
+	}
 	p->t_last = gl_now();
 	p->frames++;
 	p->latch++;
@@ -147,9 +163,19 @@ static void gl_get_stats(struct renderer *r, struct render_stats *st)
 	struct gl_priv *p = r->priv;
 	unsigned frames = 0;
 
+	long sub = 0, drops = 0;
+	unsigned shown = 0;
+	int master = 0;
+
 	glout_stats(&p->draw_sum, &p->draw_max, &p->swap_sum, &frames);
-	st->submitted = p->frames;
-	st->shown = p->frames;
+	glout_present_stats(&sub, &shown, &drops, &master);
+	/* 提交 ≠ 上屏：swap/SetCrtc 失败的帧也在 submitted 里，
+	 * 只有 shown 才是真被扫描出去的。两个数分开报，否则
+	 * 「解码流畅但屏幕不动」会被算成 100% 上屏。 */
+	st->submitted = (int)sub;
+	st->shown = (int)shown;
+	st->dropped = (int)drops;
+	p->frames = frames;
 	st->sw = p->sw;
 	st->sh = p->sh;
 	st->t_first = p->t_first;

@@ -434,6 +434,12 @@ static int primary_bring_up(struct vout *v, const struct drm_mode_modeinfo *m)
 	set.mode = *m;
 	set.mode_valid = 1;	/* 少这行内核 mode=NULL → SETCRTC EINVAL */
 	if (ioctl(v->dfd, DRM_IOCTL_MODE_SETCRTC, &set) < 0) {
+		/* EACCES 几乎只有一个原因：本进程不是 DRM master（被别人占着）。
+		 * 光打 "Permission denied" 会让人去查权限/属组，这里直接指路。 */
+		if (errno == EACCES || errno == EPERM)
+			fprintf(stderr, "VOUT: SetCrtc 需要 DRM master，但显示被别的进程"
+				"占着（desktop/kinfo 之类）。先 `systemctl stop desktop`，"
+				"或改用 RENDER=gl（拿不到 master 也只冻屏不退出）\n");
 		vdie("SETCRTC"); goto bad;
 	}
 	/* dumb 留在内核里跟着 CRTC 用到底，只还内存句柄会黑屏，所以不 destroy */
