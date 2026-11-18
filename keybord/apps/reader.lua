@@ -30,7 +30,10 @@ M.map = {
 	-- 面板
 	ENTER = "app.toc", KPENTER = "app.toc", OK = "app.toc", SELECT = "app.toc",
 	MENU = "app.toc", EPG = "app.toc", TEXT = "app.toc", SUBTITLE = "app.toc",
-	HELP = "app.toc", BACK = "app.toc", ESC = "app.toc",
+	HELP = "app.toc",
+	-- BACK/ESC 走「后退」：关面板 → 退全屏 → 回书库 → 退出程序。
+	-- 阅读器没有别的退出键，映射成 app.toc 会让用户永远退不出来。
+	BACK = "app.back", ESC = "app.back",
 	HOME = "app.library", HOMEPAGE = "app.library", HOMEPAGE2 = "app.library",
 	MEDIA = "app.library", ALL_APPS = "app.library",
 	INFO = "app.bookmarks", BLUE = "app.bookmarks", GREEN = "bookmark.add",
