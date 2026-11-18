@@ -64,6 +64,8 @@ MODULE_PARM_DESC(dbg_ms, "Periodic VDECDBG state dump interval in ms (0=off)");
 
 #define VDEC_HR_FULL	6
 
+static unsigned int hr_count;
+
 static struct amvdec_core *vdec_reset_core;
 
 /*
@@ -143,6 +145,8 @@ static int vdec_hr_run(struct amvdec_core *core, unsigned int n)
 	amvdec_write_dos(core, DOS_SW_RESET3, 0);
 
 done:
+	if (n >= VDEC_HR_FULL)
+		hr_count++;
 	if (n >= 4)
 		pr_info("meson-vdec: hard reset n=%u ret=%d gclk=%08x mempd=%08x\n",
 			n, ret, amvdec_read_dos(core, DOS_GCLK_EN3),
@@ -184,27 +188,94 @@ module_param_cb(hard_reset, &vdec_hard_reset_ops, &hard_reset, 0200);
 MODULE_PARM_DESC(hard_reset,
 	"Write 1 (or 0) to power-cycle VDEC_HEVC; 2..6 runs a partial step (debug)");
 
+/*
+ * 卡死自愈：固件在某一帧 hang 住后只认 AO 全块掉电（见
+ * docs/freeze-20261117-0402.md）。用户态的 REINIT 只有 streamoff/streamon，
+ * 实测 5/5 救不回。所以把硬复位接进会话销毁路径：卡死之后的第一次
+ * REINIT 就变成真复位，播放器自愈闭环。
+ *
+ *   hr_mode=0  从不复位（老行为，卡死就废）
+ *   hr_mode=1  只在检测到卡帧时复位
+ *   hr_mode=2  每次 stop 都复位（默认：稳妥，代价是一次 ~10ms 的掉电）
+ *   hr_stall_ms 多久没有帧完成算卡死（默认 500ms，24fps 约 12 帧）
+ */
+static unsigned int hr_mode = 2;
+module_param(hr_mode, uint, 0644);
+MODULE_PARM_DESC(hr_mode, "Hard reset VDEC_HEVC on session stop: 0=never, 1=only when stalled, 2=always");
+
+static unsigned int hr_stall_ms = 500;
+module_param(hr_stall_ms, uint, 0644);
+MODULE_PARM_DESC(hr_stall_ms, "No frame done for this long = firmware stalled");
+
+module_param(hr_count, uint, 0444);
+MODULE_PARM_DESC(hr_count, "Number of hard resets performed (read-only)");
+
+/* 距上一帧完成多久了（ms）；还没出过帧时返回 0 */
+static u32 vdec_frame_age_ms(struct amvdec_session *sess)
+{
+	if (!sess->last_frame_jiffies)
+		return 0;
+	return jiffies_to_msecs(get_jiffies_64() - sess->last_frame_jiffies);
+}
+
+static unsigned int vdec_pending_bufs(struct amvdec_session *sess)
+{
+	if (!sess->priv || !sess->fmt_out->codec_ops->num_pending_bufs)
+		return 0;
+	return sess->fmt_out->codec_ops->num_pending_bufs(sess);
+}
+
+/*
+ * 运行期卡死检测：有活要干（队列非空）却长时间没有帧完成 → 认为固件 hang。
+ * 只打一次现场（dbg_dump），别把 dmesg 刷爆；真正复位交给 stop 路径。
+ */
+static bool vdec_check_stall(struct amvdec_session *sess)
+{
+	u32 age;
+
+	if (sess->status != STATUS_RUNNING || !sess->last_frame_jiffies)
+		return false;
+	age = vdec_frame_age_ms(sess);
+	if (age < hr_stall_ms || !vdec_pending_bufs(sess))
+		return false;
+	if (!sess->stalled) {
+		sess->stalled = 1;
+		dev_warn(sess->core->dev_dec,
+			 "STALL: no frame done for %ums (pending=%u), firmware is hung; next stop will power-cycle VDEC_HEVC\n",
+			 age, vdec_pending_bufs(sess));
+		return true;
+	}
+	return false;
+}
+
 static void vdec_dbg_work(struct work_struct *work)
 {
 	struct delayed_work *dw = to_delayed_work(work);
 	struct amvdec_core *core = container_of(dw, struct amvdec_core, dbg_work);
 	struct amvdec_session *sess = core->cur_sess;
+	bool dump = !!dbg_ms;
 
-	if (sess && sess->fmt_out && sess->fmt_out->codec_ops->dbg_dump)
-		sess->fmt_out->codec_ops->dbg_dump(sess);
+	if (sess && sess->fmt_out && sess->fmt_out->codec_ops->dbg_dump) {
+		if (!dump)
+			dump = vdec_check_stall(sess);
+		if (dump)
+			sess->fmt_out->codec_ops->dbg_dump(sess);
+	}
 
-	if (dbg_ms)
+	if (core->cur_sess && (dbg_ms || hr_mode))
 		schedule_delayed_work(&core->dbg_work,
-				      msecs_to_jiffies(dbg_ms));
+				      msecs_to_jiffies(dbg_ms ? dbg_ms :
+						       hr_stall_ms));
 }
 
 static void vdec_dbg_start(struct amvdec_core *core)
 {
-	if (!dbg_ms)
+	if (!dbg_ms && !hr_mode)
 		return;
 
 	cancel_delayed_work(&core->dbg_work);
-	schedule_delayed_work(&core->dbg_work, msecs_to_jiffies(dbg_ms));
+	schedule_delayed_work(&core->dbg_work,
+			      msecs_to_jiffies(dbg_ms ? dbg_ms : hr_stall_ms));
 }
 
 static u32 get_output_size(u32 width, u32 height)
@@ -291,18 +362,45 @@ static void vdec_wait_inactive(struct amvdec_session *sess)
 
 static void vdec_poweroff(struct amvdec_session *sess)
 {
+	struct amvdec_core *core = sess->core;
 	struct amvdec_ops *vdec_ops = sess->fmt_out->vdec_ops;
 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+	u32 age = vdec_frame_age_ms(sess), pend = 0;
+	bool hr;
 
 	sess->should_stop = 1;
-	cancel_delayed_work_sync(&sess->core->dbg_work);
+	cancel_delayed_work_sync(&core->dbg_work);
+
+	/*
+	 * 停之前最后判一次：卡帧后用户态可能比定时 work 更早 streamoff
+	 * （播放器 12s 超时，work 500ms 一跳，通常赶得上，但不赌）。
+	 */
+	if (!sess->stalled && sess->status == STATUS_RUNNING) {
+		pend = vdec_pending_bufs(sess);
+		if (age >= hr_stall_ms && pend)
+			sess->stalled = 1;
+	}
+
 	vdec_wait_inactive(sess);
 	if (codec_ops->drain)
 		codec_ops->drain(sess);
 
 	vdec_ops->stop(sess);
-	clk_disable_unprepare(sess->core->dos_clk);
-	clk_disable_unprepare(sess->core->dos_parser_clk);
+	clk_disable_unprepare(core->dos_clk);
+	clk_disable_unprepare(core->dos_parser_clk);
+
+	/*
+	 * 真复位：vdec_ops->stop() 只做了「隔离+关存储+掉电」，固件状态还在，
+	 * 下一会话装进去的固件照样不动（这就是 5/5 自愈失败的根因）。
+	 * 这里补一次 AO 全块掉电+上电，硬件回到 probe 完的干净状态。
+	 */
+	hr = hr_mode == 2 || (hr_mode == 1 && sess->stalled);
+	if (hr) {
+		dev_warn(core->dev_dec,
+			 "meson-vdec: power-cycling VDEC_HEVC on stop (mode=%u stalled=%u age=%ums pending=%u)\n",
+			 hr_mode, sess->stalled, age, pend);
+		vdec_hr_run(core, VDEC_HR_FULL);
+	}
 }
 
 static void

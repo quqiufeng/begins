@@ -289,6 +289,9 @@ struct amvdec_session {
 	spinlock_t ts_spinlock; /* timestamp list lock */
 
 	u64 last_irq_jiffies;
+	/* 上一次「帧完成」的时刻：卡死检测靠它（IRQ 仍会零星进来，不可用） */
+	u64 last_frame_jiffies;
+	unsigned int stalled;	/* 检测到固件卡帧，stop 时做硬复位 */
 	u32 last_offset;
 	u32 wrap_count;
 	u32 fw_idx_to_vb2_idx[32];

@@ -286,6 +286,9 @@ static void dst_buf_done(struct amvdec_session *sess,
 	struct device *dev = sess->core->dev_dec;
 	u32 output_size = amvdec_get_output_size(sess);
 
+	/* 帧完成的唯一可靠时间戳（卡死时 IRQ 还在零星进来，只看 IRQ 会漏判） */
+	sess->last_frame_jiffies = get_jiffies_64();
+
 	switch (sess->pixfmt_cap) {
 	case V4L2_PIX_FMT_NV12M:
 		vb2_set_plane_payload(&vbuf->vb2_buf, 0, output_size);
