@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "csig.h"
 #include "render.h"
 #include "vout.h"
 
@@ -62,6 +63,10 @@ static int drm_init(struct renderer *r, unsigned sw, unsigned sh)
 		vout_set_scale(p->v, VOUT_FIT);
 	if (getenv("REFRESH"))
 		vout_set_refresh(p->v, (unsigned)atoi(getenv("REFRESH")));
+	/* 非方形像素的源（720x576 SAR 16:15 那类）不传这个就会横向压扁；
+	 * VUI 往往第一帧之后才解析出来，drm_submit 每帧会再同步一次。 */
+	vout_set_par(p->v, g_cm.sar_num > 0 ? (unsigned)g_cm.sar_num : 1u,
+		     g_cm.sar_den > 0 ? (unsigned)g_cm.sar_den : 1u);
 	vout_set_queue(p->v, p->depth);
 	vout_set_displayed_cb(p->v, drm_done, r);
 	r->priv = p;
@@ -78,6 +83,8 @@ static int drm_submit(struct renderer *r, const int fd[2], unsigned w, unsigned 
 		p->sw = w;
 		p->sh = h;
 	}
+	vout_set_par(p->v, g_cm.sar_num > 0 ? (unsigned)g_cm.sar_num : 1u,
+		     g_cm.sar_den > 0 ? (unsigned)g_cm.sar_den : 1u);
 	ret = vout_submit(p->v, fd, w, h, ypitch, cpitch, pts, owner);
 	return ret;
 }

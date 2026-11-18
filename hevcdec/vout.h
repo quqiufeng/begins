@@ -115,6 +115,10 @@ int vout_drain(struct vout *v);
 void vout_set_displayed_cb(struct vout *v, vout_displayed_cb cb, void *ctx);
 
 void vout_set_scale(struct vout *v, enum vout_scale m);
+/* 像素宽高比（VUI SAR）：num:den，0 或非法值按 1:1。
+ * 老片源 720x576 SAR 16:15 的显示宽高比是 16:9 而不是 5:4，不传就会变形。
+ * 可以在 submit 之前任意时刻改（改了当帧生效），会重算目标矩形。 */
+void vout_set_par(struct vout *v, unsigned num, unsigned den);
 /* 覆盖 EDID 报告的刷新率（某些盒子报 60 实际 59.94，长时间会有节拍漂移） */
 void vout_set_refresh(struct vout *v, unsigned hz);
 

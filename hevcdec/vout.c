@@ -58,9 +58,11 @@ struct vout {
 	unsigned crtc_idx;	/* WAIT_VBLANK 的 HIGH_CRTC 编码要它 */
 	unsigned dw, dh, refresh;
 	enum vout_scale scale;
+	double par;		/* 像素宽高比 SAR，默认 1.0（方形像素） */
 
-	/* 目标矩形：只跟源尺寸有关，算一次缓存 */
+	/* 目标矩形 + 源裁剪矩形：只跟源尺寸/比例有关，算一次缓存 */
 	unsigned rsw, rsh, dW, dH;
+	unsigned csx, csy, csw, csh;	/* 源裁剪（像素，crop 模式才有意义） */
 	int dx, dy, rect_ok;
 
 	struct fbc fbc[VOUT_FB_MAX];
@@ -351,16 +353,39 @@ static struct fbc *fb_get(struct vout *v, int yfd, int cfd, unsigned w, unsigned
 /* ---------- 目标矩形 ---------- */
 static void rect_calc(struct vout *v, unsigned sw, unsigned sh)
 {
-	if (v->rect_ok && v->rsw == sw && v->rsh == sh) return;
+	/* 显示用的等效源宽：非方形像素（SAR != 1）按像素宽高比放大后再算比例，
+	 * 否则 720x576 SAR 16:15 会被当成 5:4 铺成 1440x1080（横向压扁）。 */
+	double par = v->par > 0.0 ? v->par : 1.0;
+	double ew = (double)sw * par;
+
+	if (sw != v->rsw || sh != v->rsh) v->rect_ok = 0;
+	if (v->rect_ok) return;
 	v->rsw = sw; v->rsh = sh;
 
+	v->csx = v->csy = 0;
+	v->csw = sw;
+	v->csh = sh;
+	if (v->scale == VOUT_CROP) {
+		/* 源按 SAR 展开后的显示宽高比 vs 屏幕宽高比，多出来的那一边裁掉 */
+		double sa = ew / (double)sh, da = (double)v->dw / (double)v->dh;
+
+		if (sa > da) {			/* 源更宽：左右各裁一半 */
+			v->csw = (unsigned)((double)sh * da / par + 0.5);
+			if (v->csw > sw) v->csw = sw;
+		} else if (sa < da) {		/* 源更高：上下各裁一半 */
+			v->csh = (unsigned)(ew / da + 0.5);
+			if (v->csh > sh) v->csh = sh;
+		}
+		v->csx = (sw - v->csw) / 2;
+		v->csy = (sh - v->csh) / 2;
+	}
 	if (v->scale != VOUT_FIT) {
 		v->dx = 0; v->dy = 0; v->dW = v->dw; v->dH = v->dh;
 	} else {
-		double s = (double)v->dw / sw, sv = (double)v->dh / sh;
+		double s = (double)v->dw / ew, sv = (double)v->dh / sh;
 
 		if (sv < s) s = sv;
-		v->dW = (unsigned)(sw * s + 0.5);
+		v->dW = (unsigned)(ew * s + 0.5);
 		v->dH = (unsigned)(sh * s + 0.5);
 		if (v->dW > v->dw) v->dW = v->dw;
 		if (v->dH > v->dh) v->dH = v->dh;
@@ -368,9 +393,14 @@ static void rect_calc(struct vout *v, unsigned sw, unsigned sh)
 		v->dy = (int)(v->dh - v->dH) / 2;
 	}
 	v->rect_ok = 1;
-	printf("VOUT: scale=%s src=%ux%u -> %ux%u @ +%d+%d (screen %ux%u)\n",
+	printf("VOUT: scale=%s src=%ux%u%s -> %ux%u @ +%d+%d (screen %ux%u)\n",
 	       v->scale == VOUT_CROP ? "crop" : v->scale == VOUT_FILL ? "fill" : "fit",
-	       sw, sh, v->dW, v->dH, v->dx, v->dy, v->dw, v->dh);
+	       sw, sh,
+	       v->csw != sw || v->csh != sh ? " (裁剪后)" : "",
+	       v->dW, v->dH, v->dx, v->dy, v->dw, v->dh);
+	if (v->csw != sw || v->csh != sh)
+		printf("VOUT: 源裁剪 %ux%u @ +%u+%u（SAR %g）\n",
+		       v->csw, v->csh, v->csx, v->csy, par);
 }
 
 /* ---------- 建 CRTC：全透明 ARGB 打底 ---------- */
@@ -467,6 +497,7 @@ struct vout *vout_open(const char *drmdev)
 	if (!v) return NULL;
 	for (i = 0; i < VOUT_FB_MAX; i++) v->fbc[i].yfd = v->fbc[i].cfd = -1;
 	v->scale = VOUT_FIT;
+	v->par = 1.0;
 	v->refresh = 60;
 	ps_init(&v->h_int, "intv", "ms", 1500.0 / 60);
 	ps_init(&v->h_late, "late", "ms", 0);
@@ -628,15 +659,11 @@ static int plane_commit(struct vout *v, const struct vframe *f)
 	sp.fb_id = f->fb;
 	/* src 是 16.16 定点 */
 	if (v->scale == VOUT_CROP) {
-		unsigned cw = w, ch = h;
-		double sa = (double)w / h, da = (double)v->dw / v->dh;
-
-		if (sa > da) cw = (unsigned)(h * da + 0.5);
-		else if (sa < da) ch = (unsigned)(w / da + 0.5);
-		sp.src_x = ((w - cw) / 2) << 16;
-		sp.src_y = ((h - ch) / 2) << 16;
-		sp.src_w = cw << 16;
-		sp.src_h = ch << 16;
+		/* 裁剪矩形由 rect_calc 按 SAR 算好，这里只是搬到 16.16 */
+		sp.src_x = v->csx << 16;
+		sp.src_y = v->csy << 16;
+		sp.src_w = v->csw << 16;
+		sp.src_h = v->csh << 16;
 	} else {
 		sp.src_w = w << 16;
 		sp.src_h = h << 16;
@@ -994,6 +1021,17 @@ void vout_set_scale(struct vout *v, enum vout_scale m)
 	if (!v) return;
 	if (v->scale != m) v->rect_ok = 0;
 	v->scale = m;
+}
+
+void vout_set_par(struct vout *v, unsigned num, unsigned den)
+{
+	double p;
+
+	if (!v) return;
+	/* 和 glout_set_par 同一套守卫：0 / 越界都当"VUI 没写" */
+	p = (num && den && num < 4096 && den < 4096) ? (double)num / den : 1.0;
+	if (fabs(p - v->par) > 1e-9) v->rect_ok = 0;
+	v->par = p;
 }
 
 void vout_set_refresh(struct vout *v, unsigned hz)
