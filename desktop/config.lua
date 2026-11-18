@@ -88,6 +88,14 @@ for _, p in ipairs({ M.home, "/mnt", "/media", "/sata" }) do
 			kind = "local" }
 	end
 end
+-- USB 热插拔：插上自动只读挂到 /media/<卷标>，拔了自动卸；TAB 在根之间切换
+M.usb = {
+	enabled = env("DESKTOP_USB", "1") ~= "0",
+	root = env("DESKTOP_USB_ROOT", "/media"),
+	rw = env("DESKTOP_USB_RW", "") ~= "",
+	all = env("DESKTOP_USB_ALL", "") ~= "",
+}
+
 M.show_hidden = env("DESKTOP_HIDDEN", "") ~= ""
 
 -- 自动化口（和 reader 同协议）

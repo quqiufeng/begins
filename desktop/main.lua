@@ -32,6 +32,7 @@ local preview = require("ui.preview")
 local window = require("ui.window")
 local FS = require("core.fs")
 local launcher = require("core.launcher")
+local hotplug = require("core.hotplug")
 local automation = require("core.automation")
 local png = require("util.png")
 local json = require("util.json")
@@ -64,6 +65,54 @@ local bar = chrome.new(cfg, theme, ttf)
 local pv = preview.new(cfg, sdl, img, ttf)
 local launcher_ = launcher.new(cfg, win, bar)
 local auto
+
+-- ---------- 热插拔（U 盘）----------
+-- cfg.roots 是"切根"的候选列表：NAS → 本机 → 每个挂上的 U 盘。
+-- base_roots 存一份静态的（NAS/home），U 盘进出时在它上面重算，不能就地改基数。
+local base_roots = {}
+local hp -- 前向声明：下面的 on_change 闭包里要用到
+local rescan
+
+for i, r in ipairs(cfg.roots) do base_roots[i] = r end
+
+local function refresh_roots()
+	local roots = {}
+
+	for i, r in ipairs(base_roots) do roots[i] = r end
+	for _, v in ipairs(hp and hp:list() or {}) do
+		roots[#roots + 1] = { path = v.mnt, label = v.label, kind = "usb" }
+	end
+	cfg.roots = roots
+end
+
+hp = cfg.usb.enabled and hotplug.new(cfg, {
+	root = cfg.usb.root, rw = cfg.usb.rw, all = cfg.usb.all,
+	on_change = function(kind, v)
+		refresh_roots()
+		local name = v.label or v.mnt
+
+		if kind == "add" then
+			logf(("U 盘挂上 %s → %s"):format(v.dev, v.mnt))
+			toast(("U 盘 %s 已就绪（TAB 切换）"):format(name), 3)
+			-- 正停在挂载点父目录（/media）上：直接刷新，新盘立刻出现在网格里
+			if fs.dir == v.mnt or fs.dir == (v.mnt:match("^(.*)/[^/]+$") or v.mnt) then
+				rescan()
+			end
+		else
+			logf(("U 盘拔了 %s"):format(v.dev))
+			toast(("U 盘 %s 已移除"):format(name), 3)
+			-- 正在看被拔走的盘：退回起始目录，别留在空气里
+			if fs.dir == v.mnt or fs.dir:sub(1, #v.mnt + 1) == v.mnt .. "/" then
+				fs:scan(cfg.start_dir)
+				layout()
+			else
+				rescan()
+			end
+		end
+	end,
+}) or nil
+
+refresh_roots()
 
 local running = true
 local dirty = true
@@ -98,7 +147,7 @@ local function open_current()
 		end
 		-- 外部 app 把 KMS 抢走过，纹理全废了，清缓存重画
 		ico:destroy()
-		g.thumb_cache = {}
+		g:clear_thumbs(false)  -- KMS 被抢过，纹理已失效：只丢引用，不销毁
 		pv:clear_tex()
 		layout()
 		dirty = true
@@ -130,6 +179,40 @@ local function key_is_blocking(name)
 	return BLOCKING_KEYS[tostring(name or ""):upper()] == true
 end
 
+-- 在根之间切换（NAS / 本机 / 每个 U 盘）。dir 是子目录时按前缀归到所属根。
+local function root_index()
+	for i, r in ipairs(cfg.roots) do
+		if fs.dir == r.path then return i end
+	end
+	local best, blen = nil, -1
+
+	for i, r in ipairs(cfg.roots) do
+		local p = r.path .. "/"
+
+		if #fs.dir >= #p and fs.dir:sub(1, #p) == p and #p > blen then
+			best, blen = i, #p
+		end
+	end
+	return best or 1
+end
+
+local function cycle_root(step)
+	local roots = cfg.roots
+
+	if #roots == 0 then return false end
+	local i = root_index()
+	local nxt = ((i - 1 + (step or 1)) % #roots) + 1
+	local r = roots[nxt]
+
+	if not r then return false end
+	local ok, err = fs:scan(r.path)
+
+	if not ok then toast(tostring(err), 2, theme.warn); return false end
+	layout()
+	toast(("→ %s（%d 个根）"):format(r.label or r.path, #roots), 2)
+	return true
+end
+
 local function go_up()
 	local dir, err = fs:up()
 
@@ -141,7 +224,7 @@ local function go_up()
 	end
 end
 
-local function rescan()
+function rescan()
 	fs:scan(fs.dir, fs:current() and fs:current().name)
 	layout()
 	dirty = true
@@ -169,6 +252,10 @@ local function on_key(name)
 	elseif name == "REFRESH" or name == "F5" then rescan()
 	elseif name == "QUIT" or name == "EXIT" then running = false
 	elseif name == "UP_DIR" then go_up()
+	elseif name == "ROOTS" or name == "TAB" or name == "NEXTROOT" then
+		if not cycle_root(1) then
+			toast("只有这一个根", 1.5, theme.text_dim)
+		end
 	elseif name == "T" or name == "THEME" then
 		-- 换色系：和 lite 的 12 套同一份调色板，T 循环（不改版式）
 		theme.cycle(1)
@@ -192,6 +279,7 @@ do
 		{ K.ESCAPE, "BACK" }, { K.BACKSPACE, "BACK" }, { K.PAGEUP, "PAGEUP" },
 		{ K.PAGEDOWN, "PAGEDOWN" }, { K.HOME, "HOME" }, { K.END, "END" },
 		{ K.F5, "REFRESH" }, { K.Q, "QUIT" }, { K.T, "THEME" },
+		{ K.TAB, "ROOTS" },
 	}) do KEYSYM[p[1]] = p[2] end
 end
 
@@ -214,7 +302,7 @@ end
 
 local ACTIONS = {
 	"nav.left", "nav.right", "nav.up", "nav.down", "nav.pageup", "nav.pagedown",
-	"nav.home", "nav.end", "nav.ok", "nav.back", "nav.refresh",
+	"nav.home", "nav.end", "nav.ok", "nav.back", "nav.refresh", "nav.roots",
 	"view.screenshot", "view.quit",
 }
 
@@ -233,6 +321,7 @@ local function action_map()
 		end,
 		["nav.back"] = function() return on_key("BACK") end,
 		["nav.refresh"] = function() return on_key("REFRESH") end,
+		["nav.roots"] = function() return on_key("ROOTS") end,
 		["view.screenshot"] = function()
 			local p = capture(("/tmp/desktop-%s.png"):format(os.date("%H%M%S")))
 			return { ok = p ~= nil, path = p }
@@ -290,6 +379,16 @@ auto = automation.start(cfg.sock, {
 		st.window = { w = win.W, h = win.H, driver = win.driver }
 		st.cols, st.rows = g.cols, g.rows
 		st.visible = g.rows * g.cols
+		st.roots = {}
+
+		for i, r in ipairs(cfg.roots) do
+			st.roots[i] = { path = r.path, label = r.label, kind = r.kind }
+		end
+		st.mounts = {}
+
+		for i, v in ipairs(hp and hp:list() or {}) do
+			st.mounts[i] = { dev = v.dev, label = v.label, mnt = v.mnt, owned = v.owned }
+		end
 		st.reader = launcher_:has_reader()
 		st.player = launcher_:has_player()
 		return st
@@ -425,6 +524,7 @@ while running do
 		end
 	end
 
+	if hp and hp:poll(sdl.ticks()) then dirty = true end
 	handled = auto:poll()
 	if handled > 0 then dirty = true end
 	-- 回包已经 send 出去，这时再跑阻塞动作（开视频 = 桌面挂起到播放结束）
@@ -452,9 +552,10 @@ while running do
 	if spent < frame_ms then sdl.delay(frame_ms - spent) end
 end
 
+if hp then hp:close() end
 auto:close()
 pv:close()
-g.thumb_cache = {}
+g:clear_thumbs(true)
 ico:destroy()
 win:close()
 logf("退出")

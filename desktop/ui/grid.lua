@@ -11,6 +11,8 @@ local M = {}
 M.__index = M
 
 local floor, min, max = math.floor, math.min, math.max
+-- 缩略图纹理上限（张）。256x256 RGBA ≈ 256KB/张，默认 48 张 ≈ 12MB 上界。
+local THUMB_MAX = tonumber(os.getenv("DESKTOP_THUMB_CACHE") or "") or 48
 
 function M.new(cfg, theme, ttf, txt, img, icons, sdl)
 	return setmetatable({
@@ -21,6 +23,8 @@ function M.new(cfg, theme, ttf, txt, img, icons, sdl)
 		cols = 4, rows = 3, cell_w = 240, cell_h = 190,
 		ax = 0, ay = 0, aw = 0, ah = 0, row0 = 0,
 		thumb_cache = {},
+		thumb_lru = {},
+		thumb_max = THUMB_MAX,
 	}, M)
 end
 
@@ -173,7 +177,45 @@ function M:draw_badge(ren, x, y, w, h, kind, label, sel)
 		x + floor(w / 2), y + floor(h * 0.55), c, "center")
 end
 
--- 缩略图：懒加载 + 按 path/mtime 缓存
+-- 缩略图：懒加载 + 按 path/mtime 缓存，真 LRU（超限只淘汰最久没用的那张）
+--
+-- 旧写法「一超上限就全清」在快速翻目录时会连续触发全量销毁重建：既抖屏，
+-- 又把刚建好的纹理立刻扔掉。这里改成标准 LRU，纹理数有硬上界、行为可预测。
+
+local function lru_touch(self, key)
+	local l = self.thumb_lru
+
+	for i = 1, #l do
+		if l[i] == key then
+			table.remove(l, i)
+			break
+		end
+	end
+	l[#l + 1] = key
+end
+
+-- 腾出位置：只淘汰已解码的真纹理，解码失败的 false 标记留着（免得反复重试坏文件）
+function M:thumb_evict(limit)
+	local l, c, sdl = self.thumb_lru, self.thumb_cache, self.sdl
+	local ntex, i = 0, 1
+
+	for _, k in ipairs(l) do
+		if c[k] then ntex = ntex + 1 end
+	end
+	while ntex >= limit and i <= #l do
+		local k = l[i]
+
+		if c[k] then
+			if sdl and sdl.destroy_texture then sdl.destroy_texture(c[k]) end
+			c[k] = nil
+			table.remove(l, i)
+			ntex = ntex - 1
+		else
+			i = i + 1
+		end
+	end
+end
+
 function M:thumb(ren, item)
 	local img = self.img
 
@@ -181,26 +223,35 @@ function M:thumb(ren, item)
 	local key = item.path .. "@" .. tostring(item.mtime or 0)
 	local hit = self.thumb_cache[key]
 
-	if hit ~= nil then return hit or nil end
+	if hit ~= nil then
+		if hit then lru_touch(self, key) end
+		return hit or nil
+	end
 	local tex = img.texture(ren, item.path)
 
 	if tex == nil then
 		self.thumb_cache[key] = false
+		self.thumb_lru[#self.thumb_lru + 1] = key
 		return nil
 	end
+	self:thumb_evict(self.thumb_max or THUMB_MAX)
 	self.thumb_cache[key] = tex
-	-- 缓存别无限长
-	local cnt = 0
-
-	for _ in pairs(self.thumb_cache) do cnt = cnt + 1 end
-	if cnt > 96 then
-		for k, v in pairs(self.thumb_cache) do
-			if v then self.sdl.destroy_texture(v) end
-			self.thumb_cache[k] = nil
-		end
-		self.thumb_cache[key] = tex
-	end
+	self.thumb_lru[#self.thumb_lru + 1] = key
 	return tex
+end
+
+-- 外部 app 抢过 KMS 之后纹理全废：destroy=false 时只丢引用不销毁（上下文已丢，
+-- 交给 SDL 内部回收更安全）；正常退出/换目录用 destroy=true 真正释放。
+function M:clear_thumbs(destroy)
+	local c = self.thumb_cache
+
+	if destroy and self.sdl and self.sdl.destroy_texture then
+		for _, v in pairs(c) do
+			if v then self.sdl.destroy_texture(v) end
+		end
+	end
+	self.thumb_cache = {}
+	self.thumb_lru = {}
 end
 
 function M:draw(ren, fs, W, H)
