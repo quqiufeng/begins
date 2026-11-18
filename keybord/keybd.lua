@@ -214,11 +214,16 @@ local function run_action(app, action, key)
 		-- 没有才退回 act.lua <app> <action>（探索期的临时调法）。
 		local cmd
 
+		-- 一律套 timeout：动作进程自己卡住（对端 socket 满/没应答）时，
+		-- os.execute 会把整个 keybd 主循环一起拖死——表现就是"所有按键都没反应"。
 		if app.keysfile then
-			cmd = ("luajit -e 'dofile(%q)' %q >/dev/null 2>&1")
-				:format(app.keysfile, key or action)
+			-- 传「动作名」而不是键名：键→动作的映射只该有一份（apps/<app>.lua 的
+			-- M.map）。以前传键名，keys/<app>.lua 表里漏一个键（比如 BACK=158）
+			-- 就被当成未知动作悄悄空转，遥控器按了没反应。
+			cmd = ("timeout 6 luajit -e 'dofile(%q)' %q >/dev/null 2>&1")
+				:format(app.keysfile, action)
 		else
-			cmd = ("luajit -e 'dofile(%q)' %s %q >/dev/null 2>&1")
+			cmd = ("timeout 6 luajit -e 'dofile(%q)' %s %q >/dev/null 2>&1")
 				:format(ROOT .. "/act.lua", app.name, action)
 		end
 		local rc = os.execute(cmd)

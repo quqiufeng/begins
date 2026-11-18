@@ -39,7 +39,7 @@ keyreq() {
 }
 
 while [ $# -gt 0 ]; do
-	k=$1; shift
+	k=$(echo "$1" | tr 'a-z' 'A-Z'); shift
 	n=1
 	if [ $# -gt 0 ] && [[ $1 == x* ]]; then n=${1#x}; shift; fi
 	for ((i = 0; i < n; i++)); do
@@ -50,8 +50,10 @@ done
 
 [ "$SHOT" = 0 ] && exit 0
 
-timeout 20 ssh -n -p "$PORT" "$H" \
-	"cd $DEST && $LUAJIT -e 'local a=require(\"apps.reader\"); local s=require(\"sock\"); print(s.req(a.socket, [[{\"cmd\":\"call\",\"fn\":\"app.capture\",\"args\":{\"path\":\"/tmp/r0.png\"}}]], 6000))'" >/dev/null
+# 截图：先试当前焦点 app 的 socket（桌面 / 阅读器），都不行再报错
+SHOT_LUA='local s=require("sock") local p="/tmp/r0.png" local body=[[{"cmd":"call","fn":"app.capture","args":{"path":"%s"}}]] local ok=false for _,sock in ipairs({"/tmp/desktop-automation.sock","/tmp/native-reader-automation.sock"}) do local r=s.json_req(sock, body:format(p), 6000) if r and r.ok then ok=true break end end print(ok)'
+timeout 25 ssh -n -p "$PORT" "$H" \
+	"cd $DEST && $LUAJIT -e '$SHOT_LUA'" >/dev/null || true
 
 if timeout 20 scp -q -P "$PORT" "$H:/tmp/r0.png" "$OUT"; then
 	echo "shot -> $OUT"

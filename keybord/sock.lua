@@ -25,11 +25,16 @@ int unlink(const char *path);
 int bind(int fd, const struct kb_sockaddr_un *addr, unsigned int len);
 int listen(int fd, int backlog);
 int accept(int fd, void *addr, unsigned int *len);
+int fcntl(int fd, int cmd, int arg);
+int getsockopt(int fd, int level, int optname, void *optval, unsigned int *optlen);
 int shutdown(int fd, int how);
 ]]
 
 local C = ffi.C
 local AF_UNIX, SOCK_STREAM = 1, 1
+local F_GETFL, F_SETFL, O_NONBLOCK = 3, 4, 0x800
+local SOL_SOCKET, SO_ERROR = 1, 4
+local EINPROGRESS, ECONNREFUSED = 115, 111
 local M = {}
 
 local function addr(path)
@@ -42,17 +47,39 @@ local function addr(path)
 end
 
 -- 连一个 unix socket，返回 fd 或 nil, err
-function M.connect(path)
+-- ms：连接超时。对端 accept 队列满了（桌面卡在打开视频里就是这种情况）时，
+-- 阻塞式 connect 会一直挂着——keybd 主循环跟着冻死，全部按键失灵。所以默认
+-- 走非阻塞 connect + select 等可写，超时就报错返回。
+function M.connect(path, ms)
 	local sa, len = addr(path)
 
 	if not sa then return nil, len end
 	local fd = C.socket(AF_UNIX, SOCK_STREAM, 0)
 
 	if fd < 0 then return nil, "socket() failed" end
+	local fl = C.fcntl(fd, F_GETFL, 0)
+
+	if fl >= 0 then C.fcntl(fd, F_SETFL, bit.bor(fl, O_NONBLOCK)) end
 	if C.connect(fd, sa, len) ~= 0 then
-		C.close(fd)
-		return nil, "connect failed: " .. path
+		if ffi.errno() ~= EINPROGRESS then
+			local e = ffi.errno()
+
+			C.close(fd)
+			return nil, "connect failed: " .. path .. (e == ECONNREFUSED and " (refused)" or "")
+		end
+		if not M.wait_w(fd, ms or 800) then
+			C.close(fd)
+			return nil, "connect timeout: " .. path
+		end
+		local so = ffi.new("int[1]")
+		local sl = ffi.new("unsigned int[1]", 4)
+
+		if C.getsockopt(fd, SOL_SOCKET, SO_ERROR, so, sl) ~= 0 or so[0] ~= 0 then
+			C.close(fd)
+			return nil, "connect failed: " .. path
+		end
 	end
+	if fl >= 0 then C.fcntl(fd, F_SETFL, fl) end
 	return fd
 end
 
@@ -69,6 +96,18 @@ function M.wait(fd, ms)
 	tv.tv_sec = math.floor(ms / 1000)
 	tv.tv_usec = (ms % 1000) * 1000
 	return C.select(fd + 1, set, nil, nil, tv) > 0
+end
+
+-- 等 fd 可写（connect 进度），毫秒超时
+function M.wait_w(fd, ms)
+	local tv = ffi.new("struct kb_timeval")
+	local set = ffi.new("char[128]")
+
+	ffi.fill(set, 128, 0)
+	ffi.cast("uint64_t*", set)[math.floor(fd / 64)] = bit.lshift(1, fd % 64)
+	tv.tv_sec = math.floor(ms / 1000)
+	tv.tv_usec = (ms % 1000) * 1000
+	return C.select(fd + 1, nil, set, nil, tv) > 0
 end
 
 -- 往 fd 写整个字符串（短写要循环）
@@ -106,10 +145,10 @@ end
 -- 一次性请求：连上 → 写 req(+换行) → 读回 → 关
 -- 返回 ok, 回复文本 | ok, nil, 错误
 function M.req(path, req, ms, half_close)
-	local fd, err = M.connect(path)
+	ms = ms or 1000
+	local fd, err = M.connect(path, math.min(ms, 800))
 
 	if not fd then return false, nil, err end
-	ms = ms or 1000
 	if half_close == nil then half_close = true end
 	if req and #req > 0 then
 		if req:sub(-1) ~= "\n" then req = req .. "\n" end

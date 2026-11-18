@@ -33,10 +33,12 @@ M.map = {
 }
 
 -- pctl 命令（不走 play.sh，零 fork，长按连发才跟得上）
+-- 注意 quit 故意不在这里：pctl quit 只停播放器自己的渲染线程，play.sh 的
+-- do_stop（杀进程组、放回 fbcon、清 state）不会跑——按下"返回"看着像退出，
+-- 实际 ffmpeg 还在放、桌面也回不来。所以 quit 走 play.sh key quit。
 local PCTL = {
 	toggle = "toggle",
 	mute = "mute",
-	quit = "quit",
 	volup = "vol +10",
 	voldn = "vol -10",
 	fwd = "seek 30",
