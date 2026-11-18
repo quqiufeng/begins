@@ -37,7 +37,7 @@ GL_CFLAGS := -O2 -Wall -Wformat
 PLAY_SRC := v4l2hevc.c spscolor.c render.c render_drm.c render_gl.c vout.c aout.c pctl.c osd.c
 PLAY_HDR := render.h vout.h hdrcolor.inc csig.h spscolor.h aout.h pctl.h rcmap.h osd.h
 
-.PHONY: all clean pctlffi drm gl vout voutprobe glselftest aout aoutprobe hdrselftest mpvctl rcd
+.PHONY: all clean probe pctlffi drm gl vout voutprobe glselftest aout aoutprobe hdrselftest mpvctl rcd
 
 all: $(BIN)
 
@@ -142,6 +142,32 @@ hdr-selftest: hdr-selftest.c $(PLAY_HDR)
 raptest: raptest.c $(PLAY_SRC) $(PLAY_HDR)
 	$(CC_HOST) -O1 -Wall -DUSE_DRM -I. -o $@ raptest.c spscolor.c render.c render_drm.c render_gl.c vout.c -lm
 
+# ── DRM 探针：回答「这块 meson 到底能不能 xxx」的一次性小工具 ──────────────
+# 结论都写进 design_player.md 了，留在仓库是为了能复查现场，不是成品：
+#   atomicms       atomic modeset 到底行不行（带 ALLOW_MODESET 就 EINVAL 的定界）
+#   atomicpresent  只改平面属性的 atomic commit + 每帧有多大开销
+#   crtctest       legacy SetCrtc 的 fb 尺寸/位置边界
+#   drmplane       裸 ioctl 打包踩坑记录（改用 libdrm 的前因）
+#   drmplane2      plane 属性全量打印（找 IN_FENCE_FD）
+#   scaletest      primary plane 能不能缩放（形态 A 的 ENOSPC 溯源）
+#   make probe CROSS=1  六个一起编（盒子 libdrm 走 crosslib）
+ifeq ($(CROSS),1)
+  PROBE_CC  := $(CC_CROSS)
+  PROBE_EXT := -aarch64
+  PROBE_LD  := -idirafter /usr/include/libdrm $(CROSSLIB)/libdrm.so.2
+else
+  PROBE_CC  := $(CC_HOST)
+  PROBE_EXT :=
+  PROBE_LD  := -ldrm
+endif
+PROBES    := atomicms atomicpresent crtctest drmplane drmplane2 scaletest
+PROBE_BIN := $(addsuffix $(PROBE_EXT),$(PROBES))
+
+probe: $(PROBE_BIN)
+
+$(PROBE_BIN): %$(PROBE_EXT): %.c
+	$(PROBE_CC) -O2 -Wall -o $@ $< $(PROBE_LD)
+
 # ── libpctl.so：播放器控制面的 FFI 薄层（pctl_ffi.c）──────────────────────
 # lua/luajit 直接 ffi.load 就能暂停/快进/音量/起播，不再 fork `player -c`。
 #   make pctlffi            本机 libpctl.so
@@ -155,7 +181,7 @@ $(PCTL_SO): pctl_ffi.c
 
 
 clean:
-	rm -f v4l2hevc v4l2hevc-aarch64 v4l2hevc-drm v4l2hevc-drm-aarch64 \
+	rm -f $(PROBE_BIN)  v4l2hevc v4l2hevc-aarch64 v4l2hevc-drm v4l2hevc-drm-aarch64 \
 	      v4l2hevc-gl-aarch64 glout glout-aarch64 *.yuv \
 	      glselftest glselftest-aarch64 \
 	      aout aout-aarch64 aoutctl aoutctl-aarch64 aoutprobe-aarch64 \
