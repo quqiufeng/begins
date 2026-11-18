@@ -102,16 +102,39 @@ local STATUS_DARK = { ok = {126, 200, 140}, warn = {230, 118, 118}, err = {230, 
 
 -- ---------- 尺寸 / 字号（换肤不动版式） ----------
 
-M.top_bar_h = 56
-M.bottom_bar_h = 44
+M.top_bar_h = 64
+M.bottom_bar_h = 50
 M.gap = 14
-M.padding = 24
+M.padding = 26
 
-M.font_title = 26
-M.font_path = 20
-M.font_name = 18
-M.font_small = 14
-M.font_badge = 13
+-- 字号整体放宽一档（盒子离沙发远，原来的 18/14 太细）；改这里会连带顶栏、
+-- 底栏、网格卡片的排布，grid:layout 里 cell_h 的下限和它配套，改要一起看。
+M.font_title = 30
+M.font_path = 24
+M.font_name = 22
+M.font_small = 16
+M.font_badge = 15
+
+-- 上面是 720p 基准；大屏按高度再放大一档（1920x1080 的电视上 22px 名字太小）。
+-- 幂等：每次都以 BASE 为底乘 k，重复调用不会越放越大。
+local BASE = {
+	font_title = M.font_title, font_path = M.font_path, font_name = M.font_name,
+	font_small = M.font_small, font_badge = M.font_badge,
+	top_bar_h = M.top_bar_h, bottom_bar_h = M.bottom_bar_h,
+}
+
+function M.fit(h)
+	local k = 1
+
+	if h >= 2000 then k = 1.7
+	elseif h >= 1400 then k = 1.45
+	elseif h >= 1000 then k = 1.25
+	elseif h >= 800 then k = 1.08 end
+
+	for key, v in pairs(BASE) do M[key] = math.floor(v * k + 0.5) end
+	M.font_scale = k
+	return k
+end
 
 -- ---------- 选色系（原地刷新整张表） ----------
 
@@ -167,6 +190,24 @@ function M.cycle(step)
 	end
 	step = step or 1
 	return M.use(M.ORDER[(cur - 1 + step) % #M.ORDER + 1])
+end
+
+-- 随机换一套色系，但绝不给当前这套（MENU 刷新时用；连按两次保证看着有变化）
+function M.random()
+	local n = #M.ORDER
+
+	if n <= 1 then return M.use(M.ORDER[1] or M.DEFAULT) end
+
+	local cur = 0
+
+	for i, name in ipairs(M.ORDER) do
+		if name == M.name then cur = i; break end
+	end
+	-- 在 n-1 个候选中抽，跳过 cur，映射回真实下标
+	local i = math.random(n - 1)
+
+	if cur > 0 and i >= cur then i = i + 1 end
+	return M.use(M.ORDER[i] or M.DEFAULT)
 end
 
 M.mix = mix

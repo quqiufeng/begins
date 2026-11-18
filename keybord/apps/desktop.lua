@@ -24,6 +24,9 @@ M.map = {
 	BACK = "nav.back", ESC = "nav.back",
 	REFRESH = "nav.refresh", F5 = "nav.refresh",
 	EXIT = "view.quit", QUIT = "view.quit", STOPCD = "view.quit",
+	-- 遥控器上的 ☰ 键实测报 KEY_3 带 Ctrl 修饰（C-3）；键盘上也认 MENU/CONTEXT_MENU
+	["C-3"] = "nav.menu", MENU = "nav.menu",
+	OPTION = "nav.menu", CONTEXT_MENU = "nav.menu",
 }
 
 -- 长按连发：只放行方向键（翻列表）

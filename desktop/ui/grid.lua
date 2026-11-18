@@ -38,13 +38,19 @@ function M:layout(W, H)
 	self.aw = max(200, W - t.padding * 2)
 	self.ah = max(120, H - t.top_bar_h - t.bottom_bar_h - 16)
 
-	local min_w = 190
+	local min_w = 200
 	local cols = floor((self.aw + t.gap) / (min_w + t.gap))
 
 	cols = max(3, min(8, cols))
 	self.cols = cols
 	self.cell_w = floor((self.aw - t.gap * (cols - 1)) / cols)
-	self.cell_h = floor(max(132, min(240, self.cell_w * 0.80)))
+	-- 卡片高度：图标区占 52%，下面要放两行文件名 + 右下角小字；
+	-- 下限跟着字号走（三行字 + 图标余量），大屏放大字号时卡片跟着长高，
+	-- 不然 1080p 上名字会压到下一行卡片。
+	-- 常数 116 = 图标上下留白 + 名字与图标间距 + 小字行，按大屏字号试出来的
+	local h_min = floor(t.font_name * 2 + t.font_small + 116)
+
+	self.cell_h = floor(max(h_min, min(h_min * 1.55, self.cell_w * 0.80)))
 	self.rows = max(1, floor((self.ah + t.gap) / (self.cell_h + t.gap)))
 	-- 内容不满一屏时也保持顶部对齐，不做居中（居中选择器会"跳"）
 	self.row0 = 0
@@ -287,9 +293,10 @@ function M:draw(ren, fs, W, H)
 			local col, row = idx % self.cols, floor(idx / self.cols)
 			local x, y = self:cell_xy(col, row)
 			local sel = (i == fs.sel)
-			local pad = 12
+			-- 内边距跟着字号走：大屏字号大时留白太窄会显得局促
+			local pad = floor(self.theme.font_small * 0.75)
 			local ix, iy = x + pad, y + pad
-			local iw, ih = self.cell_w - pad * 2, floor(self.cell_h * 0.52)
+			local iw, ih = self.cell_w - pad * 2, floor(self.cell_h * 0.48)
 
 			-- 卡底
 			sdl.fill(ren, x, y, self.cell_w, self.cell_h, sel and t.card_sel or t.card, 255)
@@ -335,27 +342,27 @@ function M:draw(ren, fs, W, H)
 			local name_w = self.cell_w - pad * 2
 			local lines = self.txt.wrap(self.ttf, self.font_path, item.name,
 				t.font_name, name_w, 2)
+			local line_h = t.font_name + 4
+			local name_h = #lines * line_h
 			local ly = iy + ih + 10
+			local bottom = y + self.cell_h - pad
+			-- 右下角小字：文件夹给项数做不了（要再扫），这里给类别/大小
+			local meta = item.dir and "文件夹" or fs.human_size(item.size)
+			-- 两行长名 + 小字会打架：空间不够时不画小字（名字更重要），
+			-- 名字块再整体上移贴底，别溢出到下一张卡片。
+			local show_meta = (ly + name_h + 4 + t.font_small) <= bottom
 
+			if not show_meta and ly + name_h > bottom then ly = bottom - name_h end
 			for li, line in ipairs(lines) do
 				self.ttf.draw(ren, self.font_path, line, t.font_name,
-					x + floor(self.cell_w / 2), ly + (li - 1) * (t.font_name + 4),
+					x + floor(self.cell_w / 2), ly + (li - 1) * line_h,
 					sel and t.text_sel or t.text, "center")
 			end
-
-			-- 右下角小字：文件夹给项数做不了（要再扫），这里给类别/大小
-			local meta
-
-			if item.dir then
-				meta = "文件夹"
-			elseif item.kind == "other" then
-				meta = fs.human_size(item.size)
-			else
-				meta = fs.human_size(item.size)
+			if show_meta then
+				self.ttf.draw(ren, self.font_path, meta, t.font_small,
+					x + self.cell_w - pad, bottom - t.font_small,
+					sel and t.accent or t.text_dim, "right")
 			end
-			self.ttf.draw(ren, self.font_path, meta, t.font_small,
-				x + self.cell_w - pad, y + self.cell_h - pad - t.font_small,
-				sel and t.accent or t.text_dim, "right")
 		end
 	end
 	sdl.clip(ren)

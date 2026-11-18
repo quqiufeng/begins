@@ -242,7 +242,12 @@ local function on_key(name)
 	elseif name == "PAGEUP" or name == "CHANNELUP" then g:page(fs, -1)
 	elseif name == "PAGEDOWN" or name == "CHANNELDOWN" then g:page(fs, 1)
 	elseif name == "HOME" then g:home(fs)
-	elseif name == "MENU" then rescan()
+	elseif name == "MENU" then
+		-- 刷新顺手换一套随机配色（同一份 12 套调色板，版式不动）
+		rescan()
+		theme.random()
+		toast(("已刷新 · 配色：%s"):format(theme.label or theme.name), 2)
+		logf("MENU 刷新 + 随机配色 → " .. tostring(theme.name))
 	elseif name == "END" then g:endk(fs)
 	elseif name == "OK" or name == "ENTER" or name == "RETURN" or name == "SPACE" then
 		open_current()
@@ -303,6 +308,7 @@ end
 local ACTIONS = {
 	"nav.left", "nav.right", "nav.up", "nav.down", "nav.pageup", "nav.pagedown",
 	"nav.home", "nav.end", "nav.ok", "nav.back", "nav.refresh", "nav.roots",
+	"nav.menu",
 	"view.screenshot", "view.quit",
 }
 
@@ -322,6 +328,7 @@ local function action_map()
 		["nav.back"] = function() return on_key("BACK") end,
 		["nav.refresh"] = function() return on_key("REFRESH") end,
 		["nav.roots"] = function() return on_key("ROOTS") end,
+		["nav.menu"] = function() return on_key("MENU") end,
 		["view.screenshot"] = function()
 			local p = capture(("/tmp/desktop-%s.png"):format(os.date("%H%M%S")))
 			return { ok = p ~= nil, path = p }
@@ -468,10 +475,14 @@ local function boot()
 		io.stderr:write("窗口起不来：" .. tostring(err) .. "\n")
 		os.exit(1)
 	end
+	-- 随机配色要真随机：LuaJIT 不喂种子，每次开机都是同一条序列
+	math.randomseed(os.time() * 1000 + math.floor(os.clock() * 1e6) % 1000)
+	-- 字号按屏幕高度自适应（1080p 上 22px 的名字在沙发上太细）
+	theme.fit(win.H)
 	layout()
 	rescan()
-	logf(("启动 dir=%s %dx%d driver=%s"):format(fs.dir, win.W, win.H,
-		tostring(win.driver)))
+	logf(("启动 dir=%s %dx%d driver=%s 字号x%.2f"):format(fs.dir, win.W, win.H,
+		tostring(win.driver), theme.font_scale or 1))
 end
 
 local function draw()
@@ -508,7 +519,12 @@ while running do
 		elseif ty == sdl.WINDOWEVENT then
 			if ev.window.event == sdl.WINDOWEVENT_SIZE_CHANGED
 				or ev.window.event == sdl.WINDOWEVENT_RESIZED then
-				if win:refresh_size() then layout() end
+				if win:refresh_size() then
+					-- 拉窗口也可能跨过字号档位：先算字号，再重排网格
+					theme.fit(win.H)
+					layout()
+					dirty = true
+				end
 			elseif ev.window.event == sdl.WINDOWEVENT_EXPOSED then
 				dirty = true
 			end
@@ -540,8 +556,8 @@ while running do
 		dirty = true
 	end
 
-	-- 时钟每分钟才变一次，别每帧 set dirty
-	local now = os.date("%H:%M")
+	-- 顶栏时间是秒级的：每秒变一次 → 每秒重画一帧，别每帧都 set dirty
+	local now = os.date("%H:%M:%S")
 
 	if now ~= last_clock then last_clock = now; dirty = true end
 	if bar:tick() then dirty = true end
