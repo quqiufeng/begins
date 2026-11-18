@@ -4,6 +4,9 @@
 # 盒子现在有两套显示栈（见 X96max.md §22.0），所以有两条抓法：
 #   desk（默认）  tty1 桌面：走它自己的自动化 unix socket，调 app.capture 内部抓帧。
 #                 /dev/fb0 里没有桌面像素（桌面走 DRM planes），别用 fb 抓桌面。
+#   drm(-d)       兜底/无侵入：直接读 DRM 当前扫描缓冲（card0 crtc46 的 fb），
+#                 不需要 app 配合、不需要那个 unix socket、app 卡死也能抓；
+#                 代价是抓到的是"屏上此刻的帧"，可能正卡在半帧（撕裂）。
 #   console(-c)   tty2 壁纸终端：读 /dev/fb0（fbterm 走 fbcon），原始 BGRA 拉回来再转 PNG。
 #                 只 dd 上屏的 h 行（fb0 virtual_size 是 2560x2160，比屏高，全读会多一大条白边）。
 #                 桌面在前台时抓到的只是打底壁纸，终端文字要 chvt 2 之后才有。
@@ -12,6 +15,7 @@
 # 用法:
 #   tools/x96-shot.sh                 # 桌面 → ~/x96-desktop-YYYYmmdd-HHMMSS.png
 #   tools/x96-shot.sh -c              # 壁纸终端 → ~/x96-console-....png
+#   tools/x96-shot.sh -d              # DRM 直读（不依赖 app，兜底用）
 #   tools/x96-shot.sh -a              # 两个都抓
 #   tools/x96-shot.sh -o /tmp/a.png   # 指定输出（多张时自动加后缀）
 #   tools/x96-shot.sh -O <盒子路径>   # 只留在盒子上，不 scp 回来
@@ -28,6 +32,7 @@ MODE=desk; OUT=""; REMOTE_ONLY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -c|--console) MODE=console ;;
+    -d|--drm)     MODE=drm ;;
     -a|--all)     MODE=all ;;
     -o)           OUT="$2"; shift ;;
     -O)           REMOTE_ONLY="$2"; shift ;;
@@ -56,6 +61,32 @@ print(b.decode(errors=\"replace\").strip())'" 2>&1)
     *'"ok":true'*) echo "desktop ok: $(echo "$rp" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')" ;;
     *) echo "desktop FAIL: $rp" >&2; return 1 ;;
   esac
+  return 0
+}
+
+# DRM 直读：盒子上编译一次 tools/drmcap/drmcap.c，之后每次只跑它 + 拉 raw
+grab_drm() {
+  local dst="$1" raw=/tmp/drmcap.raw
+  local here; here=$(cd "$(dirname "$0")/.." && pwd)
+  timeout 20 $SSH 'test -x /tmp/drmcap' || {
+    timeout 30 scp -q -o BatchMode=yes "$here/tools/drmcap/drmcap.c" "$HOST:/tmp/" &&
+    timeout 60 $SSH 'cd /tmp && cc -O2 -I/usr/include/libdrm -o drmcap drmcap.c -ldrm' ||
+      { echo "drm FAIL: 盒子上编译 drmcap 失败（缺 cc 或 libdrm-dev）" >&2; return 1; }
+  }
+  local out; out=$(timeout 20 $SSH "/tmp/drmcap /dev/dri/card0 $raw" 2>&1)
+  local w h pitch
+  w=$(echo "$out" | sed -n 's/^WROTE .* \([0-9]*\) \([0-9]*\) \([0-9]*\)$/\1/p')
+  h=$(echo "$out" | sed -n 's/^WROTE .* \([0-9]*\) \([0-9]*\) \([0-9]*\)$/\2/p')
+  pitch=$(echo "$out" | sed -n 's/^WROTE .* \([0-9]*\) \([0-9]*\) \([0-9]*\)$/\3/p')
+  [ -n "$w" ] || { echo "drm FAIL: $out" >&2; return 1; }
+  timeout 40 scp -q -o BatchMode=yes "$HOST:$raw" "$raw" || { echo "drm FAIL: scp" >&2; return 1; }
+  local vf=""
+  [ "$pitch" != "$((w * 4))" ] && vf=",crop=${w}:${h}:0:0"
+  ffmpeg -y -loglevel error -f rawvideo -pix_fmt bgra -s ${pitch}x${h} -i "$raw" -vf "crop=${w}:${h}:0:0" "$dst" 2>/dev/null ||
+    ffmpeg -y -loglevel error -f rawvideo -pix_fmt bgra -s ${w}x${h} -i "$raw" "$dst" ||
+    { echo "drm FAIL: ffmpeg" >&2; rm -f "$raw"; return 1; }
+  rm -f "$raw"
+  echo "drm ok: $dst (${w}x${h})"
   return 0
 }
 
@@ -88,13 +119,21 @@ case "$MODE" in
     [ -n "$REMOTE_ONLY" ] && { grab_desk "$(basename "${REMOTE_ONLY%.png}")" || rc=1; exit $rc; }
     dst="${OUT:-$HOME/x96-desktop-$stamp.png}"
     base="$(basename "${dst%.png}")"  # 名字已经带时间戳，别再拼一遍
-    grab_desk "$base" || exit 1
+    if ! grab_desk "$base"; then
+      echo "desk 失败，回落 drm 直读" >&2
+      grab_drm "$dst" || exit 1
+      exit 0
+    fi
     timeout 30 scp -q -o BatchMode=yes "$HOST:/tmp/$base.png" "$dst" && echo "→ $dst" || rc=1
     ;;
   console)
     [ -n "$REMOTE_ONLY" ] && { echo "-O 只对 desk 有效" >&2; exit 1; }
     dst="${OUT:-$HOME/x96-console-$stamp.png}"
     grab_console "$dst" || rc=1
+    ;;
+  drm)
+    dst="${OUT:-$HOME/x96-drm-$stamp.png}"
+    grab_drm "$dst" || rc=1
     ;;
   all)
     d1="${OUT:-$HOME/x96-desktop-$stamp.png}"; d2="${OUT:+${OUT%.png}-console.png}"
