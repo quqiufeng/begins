@@ -1875,7 +1875,18 @@ static void tm_build(void)
 			tm.tf = g_cm.transfer;
 			return;
 		} else {
-			tm.on = (hdr && (!strcmp(hdr, "1") || !strcmp(hdr, "on")));
+			/* VUI 没写：HDR= 显式优先，否则按位深判（hc_auto_on：
+			 * 10bit 才当 HDR）。别再无脑兜底成 PQ——8bit SDR 片会被
+			 * 压一遍，中灰发白、高光削平。 */
+			if (hdr && (!strcmp(hdr, "1") || !strcmp(hdr, "on")))
+				tm.on = 1;
+			else if (hdr && (!strcmp(hdr, "0") || !strcmp(hdr, "off")))
+				tm.on = 0;
+			else
+				tm.on = hc_auto_on(g_cm.transfer, g_cm.bit_depth);
+			printf("TM: VUI=未标，按位深判 %s（bd=%d，HDR= 可覆盖）\n",
+			       tm.on ? "HDR" : "SDR 透传",
+			       g_cm.bit_depth ? g_cm.bit_depth : 0);
 		}
 	}
 	tm.tf = g_cm.transfer;		/* 0=未标，按 PQ 兜底（hc_is_hdr） */

@@ -58,6 +58,30 @@ static int hc_is_hdr(const struct hdrcolor *c)
 	       c->transfer == HC_TF_UNKNOWN;
 }
 
+/* 自动开关：软映射（v4l2hevc.c tm_build）和 GL（glout.c build_lut）共用一份
+ * 判定，避免两边各写一遍又漂移（GL 那条曾经无条件 on）。
+ *   PQ(16)        → 映射
+ *   HLG(18)       → 本期只识别不映射（design_color §4.3.7）
+ *   其它非 0      → VUI 明说是 SDR：透传
+ *   0（没写 VUI） → 只有 10/12bit 才当 HDR，8bit 一律 SDR 透传
+ * 8bit 兜底的根据：H.264 的 SPS VUI 常常整段不写（本播放器也只解析 HEVC
+ * 的 VUI），transfer 恒为 0；而 HDR 内容事实上都是 10bit。此前 0 无条件按
+ * PQ 处理，SDR 片被 PQ→709 压一遍：实测 limited 8bit Y=128→183、
+ * Y≥144 全部削到 237..255（高光平掉、中灰发白），外加 primaries=0 当 2020
+ * 带来的 sat=0.90 去饱和 —— 就是"画质损失/发灰"。
+ * HDR=1 / TM= 仍可在调用侧强开，HDR=0 强关。
+ */
+static int hc_auto_on(int transfer, int bit_depth)
+{
+	if (transfer == HC_TF_PQ)
+		return 1;
+	if (transfer == HC_TF_HLG)
+		return 0;
+	if (transfer != HC_TF_UNKNOWN)
+		return 0;
+	return bit_depth >= 10;
+}
+
 static const char *hc_tf_name(int tf)
 {
 	switch (tf) {

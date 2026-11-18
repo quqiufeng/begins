@@ -177,6 +177,8 @@ static double fit_poly(const float *lut, int which, float *coef, int deg)
 /* 256 项 RGBA32F：r = 输出码(0..1)，g = 色度增益 */
 /* 这次 LUT 是按多少 nits 编的；SEI 后到时用来判断要不要重建 */
 static double tp_peak_used;
+static int tp_tf_used = -1;		/* 编表时的传递函数（VUI 可能后到） */
+static int tp_bd_used = -1;		/* 编表时的位深（决定未标时开不开） */
 static int tp_peak_env;		/* TM_SRC_PEAK 显式给了，就不跟 SEI */
 static int tp_sat_env;		/* TM_SAT 显式给了，就不跟色域 */
 static int tp_pri;		/* 编表时用的 colour_primaries */
@@ -206,9 +208,26 @@ static void build_lut(float *out)
 	}
 	tp_pri = g_cm.primaries;
 	tp.knee = getenv("TM_KNEE") ? atof(getenv("TM_KNEE")) : 0.7;
-	tp.tf = g_cm.transfer;	/* 0=未标 → hc_is_hdr 按 PQ 兜底 */
-	tp.on = 1;
-	if (e && (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "no"))) tp.on = 0;
+	tp.tf = g_cm.transfer;	/* 0=未标 → 见 hc_auto_on() */
+	/* 开关必须和 v4l2hevc.c 的 tm_build() 用同一杆秤。这里原来无条件
+	 * tp.on = 1，于是同一部片：CPU 后端透传（对），GL 后端被当 PQ 压一遍
+	 * （发白、高光削平、sat=0.90 去饱和）。 */
+	{
+		const char *hdr = getenv("HDR");
+		int h1 = hdr && (!strcmp(hdr, "1") || !strcmp(hdr, "on"));
+		int h0 = hdr && (!strcmp(hdr, "0") || !strcmp(hdr, "off"));
+
+		if (e && (!strcmp(e, "0") || !strcmp(e, "off") || !strcmp(e, "no")))
+			tp.on = 0;
+		else if (e)
+			tp.on = 1;	/* TM=1/clip/curve/... 显式要映射 */
+		else if (h1)
+			tp.on = 1;
+		else if (h0)
+			tp.on = 0;
+		else
+			tp.on = hc_auto_on(tp.tf, g_cm.bit_depth);
+	}
 	if (e && !strcmp(e, "clip")) tp.curve = TM_CLIP;
 	if (e && !strcmp(e, "reinhard")) tp.curve = TM_REINHARD;
 	if (e && !strcmp(e, "hable")) tp.curve = TM_HABLE;
@@ -216,6 +235,9 @@ static void build_lut(float *out)
 		  !strcmp(getenv("TM_GAIN"), "linear"))) ? HC_GAIN_LIN : HC_GAIN_CODE;
 	if (tp.src_peak < tp.target) tp.src_peak = tp.target;
 	if (tp.knee <= 0.05 || tp.knee >= 1.0) tp.knee = 0.7;
+	/* 不映射时 sat 必须回到 1.0：片元里 mix(vec3(lum),o,uSat) 是无条件的，
+	 * 未知色域算出来的 0.90 会把 SDR 片凭空去饱和 10%。 */
+	if (!tp.on) tp.sat = 1.0;
 
 	{
 		struct hdrcolor c = tp_hc();
@@ -237,6 +259,8 @@ static void build_lut(float *out)
 		printf("GLOUT: poly 误差 code=%.4f gain=%.4f\n", e1, e2);
 	}
 	tp_peak_used = tp.src_peak;
+	tp_tf_used = tp.tf;
+	tp_bd_used = g_cm.bit_depth;
 	printf("GLOUT: TM %s tf=%s curve=%d peak=%.0f(%s) target=%.0f sat=%.2f knee=%.2f\n",
 	       tp.on ? "on" : "off", hc_tf_name(tp.tf), tp.curve, tp.src_peak,
 	       tp_peak_env ? "env" : csig_peak() > 0.0 ? "sei" : "默认",
@@ -335,7 +359,9 @@ static const char *FS =
  * mat3 构造按列主序收参数，所以上行主序时要转置一次。 */
 static void gm_upload(GLuint prog)
 {
-	const double *m = hc_mat(tp_pri);
+	/* 不映射就当 709 直通：primaries=0 的兜底是"当 2020"，套在 SDR 片上
+	 * 就是额外偏色（正是这次画质问题的第二个来源）。 */
+	const double *m = hc_mat(tp.on ? tp_pri : HC_PRI_709);
 	float c[9];
 	int i, j;
 
@@ -827,7 +853,7 @@ static void tm_peak_sync(void)
 		double s;
 
 		tp_pri = g_cm.primaries;
-		s = hc_sat_from_primaries(tp_pri, 0.90);
+		s = tp.on ? hc_sat_from_primaries(tp_pri, 0.90) : 1.0;
 		if (fabs(s - tp.sat) > 0.001) {
 			tp.sat = s;
 			build_lut(lut);
@@ -835,6 +861,17 @@ static void tm_peak_sync(void)
 			printf("GLOUT: 色域 -> %s，sat=%.2f，LUT 重建\n",
 			       cm_gamut(), tp.sat);
 		}
+	}
+	/* VUI/位深后到（GL 在开流前就建好表）：SDR↔HDR 判定可能整片翻过来，
+	 * 不重建就会一直按错的开关跑。 */
+	if (g_cm.transfer != tp_tf_used || g_cm.bit_depth != tp_bd_used) {
+		struct hdrcolor c;
+
+		build_lut(lut);
+		lut_upload(lut);
+		c = tp_hc();
+		printf("GLOUT: VUI 后到 tf=%d bd=%d → TM %s，LUT 重建\n",
+		       g_cm.transfer, g_cm.bit_depth, c.on ? "on" : "off");
 	}
 	if (tp_peak_env)
 		return;
