@@ -2800,7 +2800,7 @@ apt-get update                    # rc=0，无 E:/W:
 - trim 的 `src-clean` 仍然必须保留：它是原样解压的全量树（1.8G，未裁剪；裁剪只在 `.config` 层），解压要重来一遍 160M 包 + 时间
   （删了用 `kernel/gen-trim.sh` 重生成，耗时远大于解压）。
 
-## 22. tty1 壁纸终端（console-wall，2026-11-18）
+## 22. 壁纸终端（console-wall，2026-11-18）
 
 需求：开机不进桌面时，HDMI 上的命令行也要能用 —— **高清壁纸打底 + 半透明终端**，
 不是黑底白字，也不要花屏。做法不是改 framebuffer 驱动，而是「先把图画进 `/dev/fb0`，
@@ -2811,17 +2811,16 @@ apt-get update                    # rc=0，无 E:/W:
 | 件 | 位置 | 说明 |
 |---|---|---|
 | 脚本（装机源） | 仓库根 `console-wall.sh` → 盒子 `/usr/local/bin/console-wall.sh`（755） | 画背景 + exec fbterm |
-| 服务 | `/etc/systemd/system/console-wall.service` | 绑 `/dev/tty1`，`WantedBy=multi-user.target` |
+| 服务 | `/etc/systemd/system/console-wall.service` | 绑 `/dev/tty2`（**默认形态：藏在桌面后面**），`WantedBy=multi-user.target` |
 | 壁纸库 | `/root/backgrounds/`，`/root/backgrounds/.pinned` 写第一行=固定那张 | 不给参数时按此顺序挑图 |
 
 service 关键字段（出错基本都在这几条）：
 
 ```ini
 [Unit]
-Conflicts=desktop.service getty@tty1.service
-Before=getty@tty1.service
+Conflicts=getty@tty2.service
 [Service]
-TTYPath=/dev/tty1
+TTYPath=/dev/tty2
 StandardInput=tty
 StandardOutput=tty
 TTYReset=yes
@@ -2831,7 +2830,28 @@ Environment=TERM=fbterm
 ExecStart=/usr/local/bin/console-wall.sh
 ```
 
-`Conflicts=desktop.service` 是硬约束：桌面一起来，壁纸终端就让位，两个不能同时占 tty1。
+### 22.0 默认形态：桌面在 tty1 前台，壁纸终端在 tty2 后台（2026-11-18 定）
+
+开机 = **桌面**（`desktop.service`，SDL2 KMSDRM 占 tty1）；壁纸终端同时在 **tty2** 起好并等着，
+只要 `Ctrl+Alt+F2` 就切过去，`Ctrl+Alt+F1` 回桌面 —— 两边都是常驻，不用互相停服务。
+
+要点（踩过的）：
+
+- 服务里**不要**写 `Conflicts=desktop.service`（那是老的一山不容二虎版，会把桌面顶掉，见 §22.7）；
+  只跟自己的 `getty@tty2` 冲突即可，tty1 不碰。
+- fbterm 只在 tty2 画：它走 fbcon/`/dev/fb0`，而桌面走 DRM planes，两套缓冲互不干扰 —— 实测反复
+  `chvt 1 ↔ 2` 三次，`desktop` 仍 `active`、pid 不变、无 warning。
+- 开机 `cat /sys/class/tty/tty0/active` 应为 `tty1`（桌面在前台）。
+- 想改成"开机就进终端"：把 service 的 `TTYPath` 换回 `/dev/tty1`，再加回
+  `Conflicts=desktop.service getty@tty1.service` 与 `Before=getty@tty1.service`，
+  同时 `systemctl disable desktop`。二者在 tty1 上是硬互斥。
+
+一键切换（默认形态）：
+
+```bash
+systemctl enable --now desktop        # tty1 桌面
+systemctl enable --now console-wall   # tty2 壁纸终端（可同时开）
+```
 
 ### 22.2 分辨率：取 `modes`，不要取 `virtual_size`
 
@@ -2910,22 +2930,21 @@ ssh x96 'systemctl is-active console-wall; stty size </dev/pts/0'
 
 验收：service `active`、`stty size` 给出 `49 170`、截图里中英混排对齐不叠行。
 
-### 22.7 坑：启用 console-wall 会把桌面顶掉
+### 22.7 坑：老版 console-wall 会把桌面顶掉（已修）
 
-`console-wall.service` 里 `Conflicts=desktop.service` + `Before=getty@tty1.service`，
-所以 `systemctl enable console-wall` 之后重启，**桌面不会起来**（`desktop` 显示 `inactive (dead)`
-且 `is-enabled` 可能已被置 `disabled`），HDMI 上只剩壁纸终端 —— 2026-11-18 就是这样"桌面没启动"了一次。
+**旧版** `console-wall.service` 写的是 `Conflicts=desktop.service` + `Before=getty@tty1.service`
+且绑 tty1，于是 `systemctl enable console-wall` 后重启，**桌面不会起来**（`desktop` 显示
+`inactive (dead)`，`is-enabled` 被置 `disabled`），HDMI 上只剩壁纸终端 —— 2026-11-18 就是这样
+"桌面没启动"了一次。
 
-二选一，别同时 enable：
+现在改成 §22.0 的 tty2 双活版（备份在盒子 `/root/console-wall.service.bak-tty1`），两个服务可以同时
+enabled。若真要回到互斥的老形态，才需要二选一：
 
 ```bash
-# 要桌面（默认形态）
+# 只要桌面
 systemctl disable console-wall; systemctl stop console-wall
-systemctl enable desktop;       systemctl start desktop
-
-# 要壁纸终端
+# 只要 tty1 壁纸终端
 systemctl disable desktop; systemctl stop desktop
-systemctl enable console-wall; systemctl start console-wall
 ```
 
 排查：`systemctl is-active desktop console-wall` → 两个都 `inactive` 说明都没启用；

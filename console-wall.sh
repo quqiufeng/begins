@@ -1,5 +1,6 @@
 #!/bin/bash
-# console-wall: tty1 命令行 + 高清图背景 + 半透明 fbterm
+# console-wall: 命令行 + 高清图背景 + 半透明 fbterm（默认 tty2，藏在桌面后面；
+# 要 tty1 前台终端就把 console-wall.service 的 TTYPath 改成 /dev/tty1）
 # 用法: console-wall.sh [图片路径]
 #   1 给路径       -> 用这张
 #   2 没给路径     -> 用 /root/backgrounds/.pinned 里写的那张
