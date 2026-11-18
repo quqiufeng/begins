@@ -21,6 +21,9 @@ double pctl_pause_seconds(void);
 /* 主循环在退出前调：关 socket / 释放遥控设备 */
 void pctl_stop(void);
 
+/* 键位表（rcmap.h）打到 stdout：`player -K`。脚本/文档的唯一取处。 */
+void pctl_keymap_dump(void);
+
 /* 客户端模式：`player -c <命令>`。返回进程退出码。 */
 int  pctl_client(int argc, char **argv);
 

@@ -46,3 +46,12 @@ x96max/trim-tools/disable.list
 
 # VDECDBG 抓现场样本（几十万行，用 meson-vdec/tools/vdecdbg-analyze.sh 重出图表）
 meson-vdec/logs/
+
+# mupdf 交叉编译现场（源码 + 391M 构建产物，make 可重建）
+/mupdf-build/
+# readerd 端到端测试现场（build/rtlibs/样本/截图，219M）
+/reader-test/
+# bench.sh 里写着 NAS 账号密码，只在本机用，绝不入库
+/bench.sh
+# 遥控器实物照片（本地参考）
+/remote.jpg

@@ -32,6 +32,7 @@
 #include "aout.h"
 #include "osd.h"
 #include "pctl.h"
+#include "rcmap.h"
 
 #define RC_LOGF "/tmp/play.rc.log"
 #define MAXDEV 16
@@ -270,59 +271,62 @@ static int g_mods;
 static const char *g_last_act;
 static time_t g_last_t;
 
-#define M_CTRL	1
-#define M_SHIFT	2
-#define M_ALT	4
-
 static int mod_of(int code)
 {
 	switch (code) {
-	case KEY_LEFTCTRL: case KEY_RIGHTCTRL: return M_CTRL;
-	case KEY_LEFTSHIFT: case KEY_RIGHTSHIFT: return M_SHIFT;
-	case KEY_LEFTALT: case KEY_RIGHTALT: return M_ALT;
+	case KEY_LEFTCTRL: case KEY_RIGHTCTRL: return RC_M_CTRL;
+	case KEY_LEFTSHIFT: case KEY_RIGHTSHIFT: return RC_M_SHIFT;
+	case KEY_LEFTALT: case KEY_RIGHTALT: return RC_M_ALT;
 	}
 	return 0;
 }
 
-/* 组合键：这台遥控器（XING WEI 2.4G）上排 5 个功能键发的是 Ctrl+1..Ctrl+5，
- * 不是标准媒体键。首页键（Ctrl+1）按需求不响应，故不登记。 */
-static const struct { int mods; int code; const char *act; } COMBO[] = {
-	{ M_CTRL, KEY_2, "mute"   },
-	{ M_CTRL, KEY_3, "menu"   },
-	{ M_CTRL, KEY_4, "volup"  },
-	{ M_CTRL, KEY_5, "voldn"  },
+/* 键位表就是 rcmap.h 那一份：这里只是把 x-macro 展开成数组，
+ * 没有第二处按键定义，改键只改 rcmap.h。 */
+#define RC_ENTRY(m, c, a) { m, c, a },
+static const struct { int mods; int code; const char *act; } RCMAP[] = {
+	RCMAP_KEYS(RC_ENTRY)
 };
+#undef RC_ENTRY
 
+#define RC_NAME(m, c, a) #c,
+static const char *const RCMAP_NAMES[] = {
+	RCMAP_KEYS(RC_NAME)
+};
+#undef RC_NAME
+
+#define RCMAP_N (sizeof RCMAP / sizeof RCMAP[0])
+
+/* 先按「修饰键 + 码」精确匹配（Ctrl+2 静音不会和裸 2 打架）；
+ * 没命中再退回裸键，这样按住 Ctrl 按媒体键也不会突然失灵。 */
 static const char *action_of(int code)
 {
 	size_t i;
 
-	for (i = 0; i < sizeof COMBO / sizeof COMBO[0]; i++)
-		if (COMBO[i].mods == g_mods && COMBO[i].code == code)
-			return COMBO[i].act;
-
-	switch (code) {
-	case KEY_PLAYPAUSE: case KEY_PLAY: case KEY_PAUSE:
-	case KEY_ENTER: case KEY_KPENTER: case KEY_OK: case KEY_SPACE:
-		return "toggle";
-	case KEY_RIGHT: case KEY_FASTFORWARD: case KEY_NEXTSONG:
-		return "fwd";
-	case KEY_LEFT: case KEY_REWIND: case KEY_PREVIOUSSONG:
-		return "back";
-	case KEY_UP: case KEY_PAGEUP:
-		return "fwdmore";
-	case KEY_DOWN: case KEY_PAGEDOWN:
-		return "backmore";
-	case KEY_VOLUMEUP:
-		return "volup";
-	case KEY_VOLUMEDOWN:
-		return "voldn";
-	case KEY_MUTE:
-		return "mute";
-	case KEY_STOP: case KEY_BACK: case KEY_ESC: case KEY_EXIT: case KEY_HOMEPAGE:
-		return "quit";
-	}
+	for (i = 0; i < RCMAP_N; i++)
+		if (RCMAP[i].mods == g_mods && RCMAP[i].code == code)
+			return RCMAP[i].act;
+	if (g_mods)
+		for (i = 0; i < RCMAP_N; i++)
+			if (RCMAP[i].mods == 0 && RCMAP[i].code == code)
+				return RCMAP[i].act;
 	return NULL;
+}
+
+/* `player -K`：把整张表打出来，play.sh / 文档都从这取，不要再手抄一遍。
+ * 制表符分隔：修饰键<TAB>键名<TAB>动作，脚本用 cut/awk 就能解析。 */
+void pctl_keymap_dump(void)
+{
+	size_t i;
+
+	printf("# 遥控键位表（rcmap.h）：修饰<TAB>KEY_名<TAB>动作\n");
+	for (i = 0; i < RCMAP_N; i++) {
+		const char *m = RCMAP[i].mods & RC_M_CTRL ? "CTRL"
+			      : RCMAP[i].mods & RC_M_SHIFT ? "SHIFT"
+			      : RCMAP[i].mods & RC_M_ALT ? "ALT" : "-";
+
+		printf("%s\t%s\t%s\n", m, RCMAP_NAMES[i], RCMAP[i].act);
+	}
 }
 
 static void rc_log(const char *act, int code, int val)

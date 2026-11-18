@@ -35,7 +35,7 @@ GL_CFLAGS := -O2 -Wall -Wformat
 
 # 播放器 = 主循环 + Renderer 分发 + 两个后端 + vout
 PLAY_SRC := v4l2hevc.c spscolor.c render.c render_drm.c render_gl.c vout.c aout.c pctl.c osd.c
-PLAY_HDR := render.h vout.h hdrcolor.inc csig.h spscolor.h aout.h pctl.h osd.h
+PLAY_HDR := render.h vout.h hdrcolor.inc csig.h spscolor.h aout.h pctl.h rcmap.h osd.h
 
 .PHONY: all clean drm gl vout voutprobe glselftest aout aoutprobe hdrselftest mpvctl rcd
 

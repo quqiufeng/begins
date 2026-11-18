@@ -959,19 +959,22 @@ tvplay-node.sh key   ← 语义全在这里（暂停/拖动/音量/退出）
     填 `COMBO_SCAN[]` 表兜底；
   - 日志 `/tmp/tvplay-rc.log`：每次 `open`、每个键的 `code/mods/scan/val → 动作`
     或 `→ 忽略`。
-- 这台遥控器（XING WEI 2.4G；`rcinputd.c` 注释里引用的 `docs/remote.md` 键位图当前仓库未包含）实测是**键盘模式**：
-  上排功能键发 `Ctrl+1..Ctrl+5`，不是标准媒体键。`COMBO[]` 表：
+- 键位表**只写一处**：`hevcdec/rcmap.h`（x-macro，`RC_KEY(修饰, KEY_码, 动作)`）。
+  播放器把它展开成查表函数，同一张表再通过 `player -K` 打印出来；脚本不抄表，
+  `play.sh keys` 就是去问播放器要（`play.sh key <动作>` 的未知动作提示也从这取）。
+  改一个键只改 `rcmap.h`，二进制和脚本同时生效。
+- 这台遥控器（XING WEI 2.4G）实测是**键盘模式**：上排功能键发 `Ctrl+1..Ctrl+5`，
+  不是标准媒体键（`Ctrl+1` 首页键按需求不登记，按下静默）。完整表以
+  `player -K` 为准，当前是：
 
-  | 组合 | 动作 |
+  | 键 | 动作 |
   |---|---|
-  | Ctrl+2 | `mute` 🔇 |
-  | Ctrl+3 | `menu` ≡（无 UI，忽略） |
-  | Ctrl+4 / Ctrl+5 | `volup` / `voldn` |
-  | Ctrl+1 | 首页 —— 按需求**不响应**，只记一行"忽略"日志 |
-
-  普通键：OK/ENTER/SPACE → `toggle`；▶/FASTFWD/NEXTSONG → `fwd`；
-  ◀/REWIND/PREVSONG → `back`；▲/PGUP → `fwdmore`；▼/PGDN → `backmore`；
-  STOP/BACK/ESC/EXIT → `quit`。
+  | Ctrl+2 / Ctrl+3 / Ctrl+4 / Ctrl+5 | `mute` / `menu`（无 UI，忽略）/ `volup` / `voldn` |
+  | OK·ENTER·SPACE·PLAYPAUSE | `toggle` |
+  | ▶·FASTFWD·NEXTSONG / ◀·REWIND·PREVSONG | `fwd` / `back` |
+  | ▲·PGUP / ▼·PGDN | `fwdmore` / `backmore` |
+  | VOLUMEUP / VOLUMEDOWN / MUTE | `volup` / `voldn` / `mute` |
+  | STOP·BACK·ESC·EXIT·HOMEPAGE | `quit` |
 
 - 长按（`value==2`）处理：
   - `toggle` 只认按下那一下 —— 长按连发会把播放/暂停反复来回切（实测一次长按 4~5 个 val=2）；

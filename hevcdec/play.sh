@@ -156,7 +156,8 @@ usage() {
 	cat <<EOF
 用法：play.sh [选项] <片源> [起播秒] [时长秒]
       play.sh {pause|resume|stop|status|log}
-      play.sh key <动作>      # 遥控器入口：toggle/fwd/back/fwdmore/backmore/volup/voldn/mute/quit
+      play.sh key <动作>      # 遥控器入口（动作表见 `play.sh keys`）
+      play.sh keys            # 列遥控键位表（键码/动作，来自播放器 rcmap.h）
 
 片源可以是 mkv/mp4/ts（走 ffmpeg 解封装）或裸流 .265/.h265/.hevc（直接喂）。
 也可以给 NAS 上完整的路径（/sata11-.../av/xxx.mp4，或 nas:/av/xxx.mp4），
@@ -555,8 +556,21 @@ do_status() {
 	printf '日志：%s\n' "$LOGF"
 }
 
-# ── 遥控器动作（rcinputd 每按一次键 exec 一次本脚本）─────────────
-# 动作名与 rcinputd.c 的 action_of() 一一对应：
+# ── 遥控键位表 ──────────────────────────────────────────────
+# 键码 → 动作只有一处定义：播放器源码里的 rcmap.h。脚本不抄表，
+# 运行时用 `player -K` 问播放器要（二进制里编进去的就是同一份）。
+keys() {
+	[ -x "$BIN" ] || { say "找不到播放器 $BIN，列不出键位表"; return 1; }
+	"$BIN" -K
+}
+
+# 表里出现过的动作名（去重，保持首次出现顺序）
+actions() {
+	keys 2>/dev/null | awk -F'\t' '!/^#/ && NF>=3 && !seen[$3]++ {print $3}'
+}
+
+# ── 遥控器动作（按一次键 exec 一次本脚本）────────────────────
+# 动作名与 rcmap.h 里的动作一致：
 #   toggle 暂停/继续        fwd/back ±10s     fwdmore/backmore ±60s
 #   volup/voldn ±10         mute 静音          quit 停播
 # 视频这条链没有 IPC，seek 只能整条重开（约 1s 黑屏），所以：
@@ -646,7 +660,7 @@ do_key() {
 		if [ "$_WAS" = 1 ]; then sleep 0.5; load_state && do_pause; fi
 		;;
 	menu|home) say "动作 $ACT：没有 UI，忽略" ;;
-	*) say "遥控器：未知动作 $ACT"; return 1 ;;
+	*) say "遥控器：未知动作 $ACT（可用：$(actions | tr '\n' ' ')）"; return 1 ;;
 	esac
 	return 0
 }
@@ -655,7 +669,7 @@ do_key() {
 [ $# -gt 0 ] || { usage; exit 1; }
 
 case "$1" in
-pause|resume|stop|status|log|key)
+pause|resume|stop|status|log|key|keys)
 	_act=$1; shift
 	case "$_act" in
 	pause)  do_pause  ;;
@@ -664,6 +678,7 @@ pause|resume|stop|status|log|key)
 	status) do_status ;;
 	log)    load_state >/dev/null 2>&1; exec tail -f "${LOGF:-$LOG}" ;;
 	key)    do_key "${1:-}" ;;
+	keys)   keys ;;
 	esac
 	exit 0
 	;;

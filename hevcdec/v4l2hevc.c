@@ -2822,6 +2822,11 @@ int main(int argc, char **argv)
 	 */
 	if (argc > 2 && !strcmp(argv[1], "-c"))
 		return pctl_client(argc - 2, argv + 2);
+	/* `player -K`：打印键位表（rcmap.h 是唯一真源），play.sh keys 用的就是它 */
+	if (argc > 1 && !strcmp(argv[1], "-K")) {
+		pctl_keymap_dump();
+		return 0;
+	}
 
 	const char *path = argc > 1 ? argv[1] : "/tmp/test.265";
 	struct stat st;
