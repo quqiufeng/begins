@@ -147,6 +147,24 @@ P.pctl_seek(-30)                        -- 回退 30 秒
 print(ffi.string(P.pctl_cmd("status")))
 ```
 
+### seek 的三种说法（play.sock 协议）
+
+| 命令 | 含义 |
+| --- | --- |
+| `seek 10` / `seek -10` | 相对跳，以上一次未落定的目标为基准（连按 ▶▶ 不会跳飞） |
+| `seek 0` | 回片头（绝对 0；以前是"回 ok 什么都不做"） |
+| `seekto 1234` | 跳到绝对 1234 秒 |
+
+spawn 模式（播放器自己 fork ffmpeg）下这三条都**就地**跳：只换子进程，
+DRM/GL 不放手、屏幕不黑；非 spawn 模式翻成 `fwd:N`/`back:N`/`seekto:N`
+交给 `play.sh` 整链重开。
+
+片尾处理：目标会被钳在"片尾前 1s"，因为 ffmpeg `-ss` 超过时长后直接 EOF、
+一帧不出，主循环只会当"播完了"退出——用户看到的就是一按 ▶▶ 黑屏剩命令行。
+片长来源有两个：`play.sh` 导出的 `DUR`；裸跑没有就在后台跑一次
+`ffprobe format=duration`（从 `SPAWN` 模板的 `-i` 取输入）。两者都没有时，
+万一真的一帧没出就 EOF，播放器会退回原位置并记住这个片尾上界。
+
 盒子这边已经包好一层：`keybord/pctl.lua`（自动找 `.so`，找不到退回
 `sock.lua`；动作表 `status/pos/pause/resume/toggle/mute/vol/set_vol/seek/quit/play/run`），
 命令行演示是 `keybord/tools/movie.lua status|pos|seek -30|vol +10|play <片源>`。

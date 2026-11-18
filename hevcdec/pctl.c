@@ -70,6 +70,8 @@ static void osd_pause(int on)
 
 static long (*g_pos_ms)(void);
 static int  (*g_au)(void);
+static int  (*g_seek)(int rel);
+static int  (*g_seek_abs)(double sec);
 
 /* ---------- 观测值 ---------- */
 
@@ -78,6 +80,9 @@ void pctl_set_sources(long (*pos_ms)(void), int (*au)(void))
 	g_pos_ms = pos_ms;
 	g_au = au;
 }
+
+void pctl_set_seek(int (*fn)(int rel)) { g_seek = fn; }
+void pctl_set_seek_abs(int (*fn)(double sec)) { g_seek_abs = fn; }
 
 int pctl_paused(void) { return g_paused; }
 
@@ -137,7 +142,12 @@ static void reply(int fd, const char *s)
 	size_t n = strlen(s);
 
 	while (n) {
-		ssize_t w = write(fd, s, n);
+		/* 必须 MSG_NOSIGNAL：客户端 write 完就 close（-c 不等应答），
+		 * 服务端这条 write 撞上已关闭的对端会收 SIGPIPE，默认动作是
+		 * 整个播放进程直接消失——seek 时最明显：跳一下片子自己没了，
+		 * 屏幕上只剩命令行。
+		 */
+		ssize_t w = send(fd, s, n, MSG_NOSIGNAL);
 
 		if (w <= 0) return;
 		s += w;
@@ -221,19 +231,42 @@ static int handle_line(int fd, char *line)
 	 * play.sh 只认 fwd/back/fwdmore/backmore，未知动作直接空转 ——
 	 * 遥控器 ▶ 显示"ok"、画面原地不动，就是这个。现在翻成 fwd:<秒>/back:<秒>。
 	 * 非数字参数（fwd/back/fwdmore/backmore…）原样透传。 */
-	if (!strcmp(a, "seek") && b) {
+	if ((!strcmp(a, "seek") || !strcmp(a, "seekto")) && b) {
 		char act[32];
 		char *p = b;
 		int neg = 0, n;
+		int isabs = !strcmp(a, "seekto");
 
 		if (*p == '+' || *p == '-') { neg = (*p == '-'); p++; }
 		if (*p >= '0' && *p <= '9') {
 			n = atoi(p);
 			if (n < 0) { neg = !neg; n = -n; }
-			if (n == 0) { reply(fd, "{\"ok\":1}\n"); return 0; }
-			snprintf(act, sizeof act, "%s:%d", neg ? "back" : "fwd", n);
+			/* seek 0 以前直接回 ok 什么都不做（屏幕上就是"按了没
+			 * 反应"）；它真实意思是回片头，按绝对跳走。
+			 */
+			if (!isabs && n == 0)
+				isabs = 1;
+			if (isabs)
+				snprintf(act, sizeof act, "seekto:%s%d",
+					 neg ? "-" : "", n);
+			else
+				snprintf(act, sizeof act, "%s:%d",
+					 neg ? "back" : "fwd", n);
 		} else {
 			snprintf(act, sizeof act, "%s", b);
+		}
+		/* 播放器能就地跳就别重开链路（spawn 模式：DRM 不放手，屏幕不黑） */
+		if (*p >= '0' && *p <= '9') {
+			if (isabs && g_seek_abs &&
+			    g_seek_abs(neg ? -(double)n : (double)n)) {
+				reply(fd, "{\"ok\":1,\"seek\":\"abs\"}\n");
+				return 0;
+			}
+			if (!isabs && g_seek &&
+			    g_seek(neg ? -atoi(p) : atoi(p))) {
+				reply(fd, "{\"ok\":1,\"seek\":\"inplace\"}\n");
+				return 0;
+			}
 		}
 		run_play_sh(act);
 		reply(fd, "{\"ok\":1}\n");
@@ -483,6 +516,13 @@ static void *rc_thread(void *arg)
 				}
 				else if (!strcmp(act, "quit"))
 					do_quit();
+				else if ((!strcmp(act, "fwd") || !strcmp(act, "back") ||
+					  !strcmp(act, "fwdmore") || !strcmp(act, "backmore")) &&
+					 g_seek && g_seek(!strcmp(act, "fwd") ? 10 :
+							   !strcmp(act, "back") ? -10 :
+							   !strcmp(act, "fwdmore") ? 60 : -60)) {
+					/* 就地跳完（spawn 模式），不用整链重开 */
+				}
 				else		/* seek/menu：整链重开或忽略，交给 play.sh */
 					run_play_sh(act);
 			}

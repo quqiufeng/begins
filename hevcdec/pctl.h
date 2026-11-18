@@ -14,6 +14,11 @@
 void pctl_start(void);
 /* 待播前的"打到哪儿了"：毫秒 + 已解出帧数，由主循环注册 */
 void pctl_set_sources(long (*pos_ms)(void), int (*au)(void));
+/* 就地 seek 回调：返回 1 表示播放器自己接管（spawn 模式，DRM 不放），
+ * 返回 0 交回 play.sh 整链重开。参数是相对秒数（可为负）。 */
+void pctl_set_seek(int (*fn)(int rel));
+/* 绝对跳回调（"seekto 秒" 和 "seek 0" 回片头）：返回 1 = 已接管。 */
+void pctl_set_seek_abs(int (*fn)(double sec));
 /* 主循环每轮问一次：暂停就让出 CPU，不喂流也不上屏 */
 int  pctl_paused(void);
 /* 累计暂停秒，播放器加到时间轴原点上（resume 不补放欠帧） */

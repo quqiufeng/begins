@@ -692,6 +692,30 @@ do_key() {
 		fi
 		;;
 	quit)   do_stop ;;
+	seekto:*)
+		# 绝对跳（pctl 把 "seekto 秒" / "seek 0" 转成这个）：整链重开，
+		# 目标就是给的秒数，不再拿当前 pos 相加。
+		T=${ACT#*:}
+		case "$T" in ''|*[!0-9]*) say "seekto 参数不对：$ACT"; return 1 ;; esac
+		[ "$T" -lt 0 ] && T=0
+		P=$(pos_of); [ -n "$P" ] || P=0
+		_r=0
+		if [ "${DUR:-0}" -gt 0 ]; then
+			[ "$T" -ge "$DUR" ] && T=$((DUR - 1))
+			_r=$((DUR - (T - SS))); [ "$_r" -le 0 ] && _r=$DUR
+		fi
+		seek_guard || return 0
+		_WAS=0; is_paused && _WAS=1
+		say "跳到 ${T}s（绝对，原 ${P}s）"
+		SRC=$(dec "${SRCB64:-}")
+		[ -n "$SRC" ] || { say "state 里没有片源，无法重开"; return 1; }
+		PLAY_OSD="位置 $(fmt_pos "$T")"
+		export PLAY_OSD
+		setsid sh "$0" -d -a "${AUDIO:-1}" -r "${RENDER:-gl}" -s "${SCALE:-fit}" \
+			${FPS:+-f "$FPS"} -B "$BIN" \
+			"$SRC" "$T" "$_r" >/dev/null 2>&1 </dev/null
+		if [ "$_WAS" = 1 ]; then sleep 0.5; load_state && do_pause; fi
+		;;
 	fwd|back|fwdmore|backmore|fwd:*|back:*)
 		# 也认「fwd:<秒>」「back:<秒>」这种带秒数的形式（pctl 的 seek N 转出来）：
 		# 播放器没有 IPC，seek 只能整链重开，秒数由调用方给，档位别写死在两档。

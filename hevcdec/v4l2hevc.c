@@ -17,7 +17,9 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <time.h>
 #include <linux/videodev2.h>
@@ -2281,6 +2283,292 @@ static long pl_pos_ms(void)
 
 static int pl_au(void) { return g_au_pub; }
 
+/* ---------- SPAWN：ffmpeg 收成子进程，seek 不整链重开 ----------
+ * 以前 seek = play.sh 重开整条链，持 DRM master 的进程被杀 → 黑 0.8s。
+ * 现在 kill 子进程 + 新 -ss 重开 + L2 重建 V4L2，DRM/GL 不动。
+ * 模板按空白切词，词里的 {SS} 换成秒数。SS 给起播位置。
+ */
+static char   g_spawn_tpl[1024];
+static int    g_spawn_mode;
+static pid_t  g_child = -1;
+static double g_seek_to = -1.0;
+static double g_ss0;
+/* 片源总长（DUR 环境变量，play.sh 会导出；裸跑没给就是 -1 = 不知道）。
+ * 知道长度就能把 seek 钳在片尾之前，不至于跳到 EOF 一帧不出。
+ */
+static double g_dur_total = -1.0;
+/* 本次 seek 从哪儿来、目标多少：越界被弹回时要用它退回去 */
+static double g_seek_base = -1.0;
+static double g_seek_last = -1.0;
+static int    g_seek_pending;	/* seek 已发、还没见到首帧 */
+static int    g_seek_clamped;	/* 这次 seek 被片尾钳住了（OSD 换词） */
+static double g_end_hi = -1.0;	/* 越界探到的片尾上界（没 DUR 时的兜底） */
+
+static void spawn_kill(void)
+{
+	int st, k;
+
+	if (g_child <= 0)
+		return;
+	kill(g_child, SIGTERM);
+	for (k = 0; k < 200; k++) {
+		pid_t w = waitpid(g_child, &st, WNOHANG);
+
+		if (w == g_child || w < 0)
+			break;
+		usleep(10000);
+	}
+	if (k == 200) {
+		kill(g_child, SIGKILL);
+		waitpid(g_child, &st, 0);
+	}
+	g_child = -1;
+}
+
+/* 模板切词 + {SS} 替换，argv 以 NULL 收尾 */
+static int spawn_argv(double ss, char *argv[], int max)
+{
+	static char store[32][512];
+	char num[32];
+	const char *p = g_spawn_tpl;
+	int n = 0;
+
+	snprintf(num, sizeof num, "%.3f", ss);
+	while (*p) {
+		const char *s0, *e0, *q;
+		char *o;
+		size_t k = 0;
+
+		if (*p == ' ' || *p == '\t' || *p == '\n') {
+			p++;
+			continue;
+		}
+		if (n >= max - 1 || n >= 32)
+			break;
+		o = store[n];
+		s0 = p;
+		while (*p && *p != ' ' && *p != '\t' && *p != '\n')
+			p++;
+		e0 = p;
+		for (q = s0; q < e0 && k < 511; ) {
+			if (q + 4 <= e0 && !memcmp(q, "{SS}", 4)) {
+				k += snprintf(o + k, 512 - k, "%s", num);
+				q += 4;
+			} else {
+				o[k++] = *q++;
+			}
+		}
+		o[k] = 0;
+		argv[n++] = o;
+	}
+	argv[n] = NULL;
+	return n;
+}
+
+/* 起一个供流子进程，返回它的 stdout 管道读端（-1 = 失败） */
+static int spawn_start(double ss)
+{
+	char *argv[32];
+	int pf[2], j;
+	pid_t p;
+
+	if (spawn_argv(ss, argv, 32) < 1) {
+		printf("SPAWN: 模板为空\n");
+		return -1;
+	}
+	if (pipe(pf) < 0)
+		return -1;
+	p = fork();
+	if (p < 0) {
+		close(pf[0]);
+		close(pf[1]);
+		return -1;
+	}
+	if (p == 0) {
+		setsid();
+		dup2(pf[1], STDOUT_FILENO);
+		close(pf[0]);
+		/* 遥控 fd 不能漏（EVIOCGRAB 被继承会让新实例 grab 全 EBUSY），
+		 * DRM fd 也不该给 ffmpeg */
+		for (j = 3; j < 256; j++)
+			close(j);
+		execvp(argv[0], argv);
+		_exit(127);
+	}
+	close(pf[1]);
+	g_child = p;
+	printf("SPAWN: pid=%d -ss %.3f\n", (int)p, ss);
+	fflush(stdout);
+	return pf[0];
+}
+
+/* 从 spawn 模板里取输入（-i 后面那个词）：ffprobe 量片长用 */
+static int spawn_input(char *out, size_t n)
+{
+	const char *p = g_spawn_tpl;
+	int want = 0;
+
+	out[0] = 0;
+	while (*p) {
+		const char *s0;
+		size_t k;
+
+		while (*p == ' ' || *p == '\t' || *p == '\n')
+			p++;
+		if (!*p)
+			break;
+		s0 = p;
+		while (*p && *p != ' ' && *p != '\t' && *p != '\n')
+			p++;
+		k = (size_t)(p - s0);
+		if (want) {
+			if (k >= n)
+				k = n - 1;
+			memcpy(out, s0, k);
+			out[k] = 0;
+			return out[0] != 0;
+		}
+		if (k == 2 && s0[0] == '-' && s0[1] == 'i')
+			want = 1;
+	}
+	return 0;
+}
+
+/* 片长探测线程：spawn 模板里没给 DUR（裸跑 / 手动起播）时兜底。
+ * 知道片长 seek 才能钳在片尾之前，不然 ▶▶ 跳过头就是"一按黑屏"。
+ */
+static void *dur_probe_thread(void *arg)
+{
+	char in[512], buf[128];
+	int pf[2];
+	pid_t p;
+	ssize_t n;
+
+	(void)arg;
+	if (!spawn_input(in, sizeof in))
+		return NULL;
+	if (pipe(pf) < 0)
+		return NULL;
+	p = fork();
+	if (p == 0) {
+		dup2(pf[1], STDOUT_FILENO);
+		close(pf[0]);
+		close(pf[1]);
+		execlp("ffprobe", "ffprobe", "-v", "error", "-show_entries",
+		       "format=duration", "-of", "csv=p=0", in, (char *)0);
+		_exit(127);
+	}
+	close(pf[1]);
+	n = read(pf[0], buf, sizeof buf - 1);
+	close(pf[0]);
+	if (p > 0)
+		waitpid(p, NULL, 0);
+	if (n > 0) {
+		double d;
+
+		buf[n] = 0;
+		d = atof(buf);
+		if (d > 1.0) {
+			g_dur_total = d;
+			printf("SEEK: ffprobe 片长 %.1fs\n", d);
+			fflush(stdout);
+		}
+	}
+	return NULL;
+}
+
+/* 就地 seek：杀子进程 → 新 -ss 重开 → 码流状态归零（不读空新管道，
+ * 那会把新流头部丢掉）→ 时间轴挪到目标位置。DRM/GL 不动。
+ */
+static int spawn_reseek(double ss)
+{
+	int fd;
+
+	printf("SEEK: 就地重开供流 → %.3f s（DRM/GL 不动）\n", ss);
+	fflush(stdout);
+	spawn_kill();
+	if (s_fd >= 0) {
+		close(s_fd);
+		s_fd = -1;
+	}
+	fd = spawn_start(ss);
+	if (fd < 0)
+		return -1;
+	s_fd = fd;
+	s_len = s_pos = s_au_start = 0;
+	s_au_open = s_cur_vcl = s_eof = s_release = 0;
+	s_au_rap = s_au_rasl = 0;
+	g_stream_bytes = 0;
+	g_stream_au = 0;
+	s_fill(1u << 20);
+	g_t_clock0 = now_s() - pctl_pause_seconds() - ss;
+	g_pace_ms0 = -1;
+	g_sync_ms0 = -1;
+	if (g_seek_clamped)
+		osd_show(2.0, "已到片尾 %ld:%02ld", (long)ss / 60, (long)ss % 60);
+	else
+		osd_show(2.0, "跳到 %ld:%02ld", (long)ss / 60, (long)ss % 60);
+	return 0;
+}
+
+/* 目标位置收口：<0 归零；知道片长（DUR）或探到过片尾（g_end_hi）就钳住。
+ * 跳到 EOF 之外 ffmpeg 立刻 EOF、一帧不出，主循环只会当"播完了"退出，
+ * 屏幕上就剩黑屏/命令行——所以宁可在片尾前 1s 停下并说一句。
+ */
+static double seek_clamp(double t)
+{
+	double lim = -1.0;
+
+	g_seek_clamped = 0;
+	if (t < 0)
+		t = 0;
+	if (g_dur_total > 0)
+		lim = g_dur_total;
+	if (g_end_hi > 0 && (lim < 0 || g_end_hi < lim))
+		lim = g_end_hi;
+	if (lim > 0 && t > lim - 1.0) {
+		t = lim - 1.0;
+		if (t < 0)
+			t = 0;
+		g_seek_clamped = 1;
+	}
+	return t;
+}
+
+/* 绝对跳（-c "seekto 120"、以及 seek 0 回片头）。返回 1 = 已接管 */
+static int player_seek_abs(double t)
+{
+	if (!g_spawn_mode)
+		return 0;
+	g_seek_base = g_seek_to >= 0 ? g_seek_to : (double)pl_pos_ms() / 1000.0;
+	g_seek_to = seek_clamp(t);
+	g_seek_last = g_seek_to;
+	g_seek_pending = 1;
+	kill(getpid(), SIGUSR1);	/* 打断阻塞的 read/poll */
+	return 1;
+}
+
+/* 遥控器 ▶/◀ 进来：spawn 模式就地跳，返回 1 表示已接管 */
+static int player_seek(int rel)
+{
+	double base, t;
+
+	if (!g_spawn_mode)
+		return 0;
+	/* 上一次 seek 还没落定时 pl_pos_ms() 还在旧位置：连按 ▶▶ 会从旧位置
+	 * 起算（3400 → -600 → +1200 跳到 4688 而不是 4086）。有未完成的
+	 * seek 就以它为目标基准。
+	 */
+	base = g_seek_to >= 0 ? g_seek_to : (double)pl_pos_ms() / 1000.0;
+	t = base + rel;
+	g_seek_base = base;
+	g_seek_to = seek_clamp(t);
+	g_seek_last = g_seek_to;
+	g_seek_pending = 1;
+	kill(getpid(), SIGUSR1);	/* 打断阻塞的 read/poll */
+	return 1;
+}
+
 /* ---------- 上屏路径上报（给"上层"看） ----------
  * 脚本/自检/遥控不该去 grep 日志猜：到底是 DRM 直挂 plane，还是 GLES 导入
  * 纹理再色彩处理；HDR 是播放器 CPU 转还是 shader 转。只有播放器知道真相
@@ -2978,7 +3266,39 @@ int main(int argc, char **argv)
 
 	/* 会话在 SPS 解析之后才开（vdec_open 需要真实分辨率去 S_FMT），
 	 * 这里只管把码流接上。 */
-	if (!strcmp(path, "-")) {
+	{
+		const char *sp = getenv("SPAWN");
+
+		if (sp && *sp) {
+			snprintf(g_spawn_tpl, sizeof g_spawn_tpl, "%s", sp);
+			g_spawn_mode = 1;
+			g_ss0 = getenv("SS") ? atof(getenv("SS")) : 0.0;
+			/* play.sh 会导出 DUR（片源总长）；裸跑没有就是未知，
+			 * 那就只靠"越界被弹回"来探片尾。
+			 */
+			if (getenv("DUR"))
+				g_dur_total = atof(getenv("DUR"));
+			if (g_dur_total > 0) {
+				printf("SEEK: 片长 %.1fs，seek 会钳在片尾前\n",
+				       g_dur_total);
+			} else {
+				/* 没有 DUR：后台 ffprobe 量一次，量到了
+				 * 后面所有 seek 都能钳住。
+				 */
+				pthread_t th;
+
+				if (pthread_create(&th, NULL, dur_probe_thread,
+						   NULL) == 0)
+					pthread_detach(th);
+			}
+			atexit(spawn_kill);
+		}
+	}
+	if (g_spawn_mode) {
+		sf = spawn_start(g_ss0);	/* 播自己 fork 的 ffmpeg */
+		if (sf < 0)
+			die("spawn ffmpeg");
+	} else if (!strcmp(path, "-")) {
 		sf = STDIN_FILENO;	/* 管道直供：ffmpeg -f hevc - | player - */
 	} else {
 		sf = open(path, O_RDONLY);
@@ -3100,12 +3420,14 @@ int main(int argc, char **argv)
 		t_play0 = now_s();
 		printf("PACE: render_has_pace=%d fps=%.2f lead=%.1f\n",
 		       render_has_pace(rend), g_play_fps, g_play_lead);
-		g_t_clock0 = t_play0;
+		g_t_clock0 = t_play0 - g_ss0;	/* spawn 起播在 SS 秒：位置别从 0 数 */
 
 		/* 控制面起来：/tmp/play.sock（play.sh 用 `player -c ...` 说话）
 		 * + evdev 遥控。盒上不再有 mpvctl / rcinputd 两个常驻件。
 		 */
 		pctl_set_sources(pl_pos_ms, pl_au);
+		pctl_set_seek(player_seek);
+		pctl_set_seek_abs(player_seek_abs);
 		pctl_start();
 		atexit(pctl_stop);
 
@@ -3202,11 +3524,30 @@ int main(int argc, char **argv)
 		 * 清码流、跳帧、归位计数器全在事务里，失败要么回到干净空态，
 		 * 要么整体放弃（返回 3 让上层整链重启）。
 		 */
-		if (g_reinit) {
+		/* g_seek_to 也要算进来：事务期间落进来的 seek 会把 g_reinit
+		 * 清掉（BODY 里只升档位不排队），只剩 g_seek_to 这一份证据；
+		 * 只看 g_reinit 会让那次 seek 悄悄消失（-c 还回 ok）。
+		 */
+		if (g_reinit || g_seek_to >= 0) {
 			int rr;
 
 			printf("REINIT: 开始重建事务（DRM/GL 保留）\n");
-			rr = tx_run(1);
+			/* 就地 seek：先在事务外把新流的字节备好（spawn_reseek 里
+			 * 已经把扫描状态归零），事务用 flush=0 —— flush=1 会把刚
+			 * 起好的新管道读空，等于把新位置的 GOS 头丢掉。
+			 */
+			if (g_seek_to >= 0) {
+				double ss = g_seek_to;
+
+				g_seek_to = -1;
+				if (spawn_reseek(ss) < 0) {
+					printf("SEEK: 重开供流失败，退出让上层重启\n");
+					fflush(stdout);
+					return 3;
+				}
+				rr = tx_run(0);
+			} else
+				rr = tx_run(1);
 			if (rr == -2) {
 				printf("REINIT: 事务放弃（L4），退出让上层重启\n");
 				fflush(stdout);
@@ -3254,6 +3595,29 @@ int main(int argc, char **argv)
 					       eos_seen, poll_timeouts, el, got);
 				break;
 			}
+		}
+
+		/* seek 落到片尾之外：新流一起头就 EOF，一帧都没出。这时
+		 * 按"放完了"退出等于用户一按 ▶▶ 就黑屏剩命令行。改成跳回
+		 * 原来的位置，并把目标记作片尾上界，后面谁再往前跳都钳在
+		 * 它前面（下不为例）。
+		 */
+		if (stream_done && got == 0 && g_seek_pending && g_seek_base >= 0) {
+			double back = g_seek_base;
+
+			g_end_hi = g_seek_last > 0 ? g_seek_last : g_end_hi;
+			g_seek_pending = 0;
+			g_seek_base = -1.0;
+			stream_done = 0;
+			drained = 0;
+			eos_seen = 0;
+			tx_request(LVL_L2, VEV_SEEK);
+			g_seek_to = back;
+			printf("SEEK: 目标 %.1fs 超出片尾（一帧没出），退回 %.1fs\n",
+			       g_seek_last, back);
+			fflush(stdout);
+			osd_show(2.0, "已到片尾");
+			continue;
 		}
 
 		/* drain 必须放在循环最开头做：下面的 poll 超时分支有
@@ -3515,6 +3879,8 @@ no_stall:;
 			t_frame0 = t_rx;
 			if (g_mark_first) {
 				g_mark_first = 0;
+				g_seek_pending = 0;	/* seek 落定：首帧已出 */
+				g_seek_base = -1.0;
 				g_err_rec = 0;	/* 真的出帧了，自愈计数归零 */
 				printf("REINIT: first frame\n");
 			}
