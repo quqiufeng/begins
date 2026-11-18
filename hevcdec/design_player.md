@@ -789,19 +789,25 @@ LUT 上传成 `RGBA32F` 纹理（`GLLUT8=1` 可退成 RGBA8 省带宽）。
 采样 Y、C（GR88 两通道）、LUT
 → YUV 有限范围(16/219,128/224) → RGB（BT.709 矩阵）
 → BT.2020 → BT.709 3x3 色域压缩
-→ clamp → 按 uSat 向亮度混合（降饱和）
+→ clamp → 抖动（降饱和不在这里：sat 已进 LUT 的色度增益）
 → hash 抖动 ±0.5/255 消除渐变色带
 ```
 
-`uSat` 即 `TM_SAT`（默认 0.85）。
+色度增益来自 LUT 的 G 通道：`gain = 1 + sat*(nout/n-1)`（`hc_build`，与软映射
+`hc_chroma709` 同一规则，`sat` 默认 0.90 / `TM_SAT` 可覆盖）。**不在片元里 mix 到
+亮度**——那样暗饱和色被压暗、亮饱和色给缺失通道灌能量，且与软映射出图不一致。
+片元的 `uSat` 恒为 1.0，只保留成恒等 mix 的兼容壳。
 
 ### 3.4 两遍渲染（默认开）
 
 `g.twopass = !GL1PASS`。`twopass_frame()`：
 
-- **pass1**：按"屏幕装得下且不超过 1080p 量级"的尺寸（`GL1MAX` 可覆盖上限）
-  渲染到 FBO 纹理 `tex_rgb`(RGBA8)。4K 全尺寸做色调映射是 8.3M 片元（~54 ms），
-  缩到 1080p 只有 2M（~37 ms），肉眼看不出差别。
+- **pass1**：按"**源尺寸**、封顶 `GL1MAX`（默认 1920x1080）"渲染到 FBO 纹理
+  `tex_rgb`(RGBA8)。注意是源尺寸而不是屏幕尺寸 —— 720p 源在 1080p 屏上，
+  pass1 就是 1280x720，之后 pass2/DPU 才放大；所以 `DPUSCALE` 省不到 pass1
+  的钱（§4.1.4 结论五有实测）。4K 源全尺寸做色调映射是 8.3M 片元（~54 ms），
+  被 `GL1MAX` 压到 1080p 只有 2M（~37 ms）；1080p 源再往下压到 720p 是
+  6.8 ms/帧、5.8 fps 上限，画质 PSNR 37.7 dB（能看出软），默认不压。
 - **pass2**：`FS_COPY` 把这纹理按等比+黑边画到 GBM surface（`VS2` 不翻 UV，
   因为 pass1 的 VS 已经翻过一次，再套会上下颠倒）。
 - 单遍路径（`GL1PASS=1`）直接在 surface 上用一句 `glViewport` 摆等比黑边。
@@ -847,6 +853,9 @@ LUT 上传成 `RGBA32F` 纹理（`GLLUT8=1` 可退成 RGBA8 省带宽）。
 `SetPlane`(154)，等比黑边 `dx/dy`(148-152) 都是完整的），缺的是接入时要解决的
 三件事：从未被 include、`S.cur` 盲轮转不等扫描输出(129)、以及 `pick_primary_plane()`
 抢的就是正常路径那张透明 primary —— 和 `eglSwapBuffers` 争同一个 crtc。逐条见 §4.1.1。
+**2026-11-19 补**：两条最省事的落地路径已在盒子上量过了（§4.1.5）。
+结论是 `glscale` 这套 dirty 的三缓冲/SetPlane 躲不掉——把渲染目标缩小再走
+`eglSwapBuffers`（形态 A）会被驱动直接挡住（legacy `SetCrtc` 收小 fb → ENOSPC）。
 
 ---
 
@@ -951,6 +960,149 @@ primary plane 的属性表里有没有 `IN_FENCE_FD`、缩放上下限多少 —
 | 色彩 | 与 §3.4 两遍路径同帧对比 | 逐像素一致（同一套 LUT，只该换几何） |
 | CMA | `cma-watch.sh` 播放 5 分钟 | 不单调上涨 |
 
+#### 4.1.5 实测：这块 meson 的平面能力（2026-11-19，x96 盒上）
+
+§4.1.2 的 A/B 判据一直写着"上盒子跑一次 `drmprops` 看一眼"，现在跑完了。
+三个探针都在仓库里，盒子上一跑就能复现：
+
+| 探针 | 干什么 |
+|---|---|
+| `drmplane2.c` → `drmplane2-aarch64` | 列每个 plane 的格式表和全部属性（名+当前值） |
+| `scaletest.c` → `scaletest-aarch64` | 直接 `drmModeSetPlane` 试各种 src→dst |
+| `crtctest.c` → `crtctest-aarch64` | 只做一件事：legacy `SetCrtc` 挂一张比 mode 小的 fb |
+
+编译（三个都链盒子上的 libdrm，和 glout 同一条命令行）：
+`aarch64-linux-gnu-gcc -O2 -Wall -idirafter /usr/include -idirafter /usr/include/libdrm -o X-aarch64 X.c crosslib/libdrm.so.2`
+（`drmplane.c` 是裸 ioctl 版，留作"不链 libdrm"的参照，实际用 `drmplane2`）
+
+**结论一：`IN_FENCE_FD` 有，atomic 有。** 两张平面（primary 40：`AR24 AB24 XR24
+XB24 RG24 RG16`；overlay 43：`YUYV NV12 NV21 …`）的属性表里都有 `IN_FENCE_FD`，
+`drmSetClientCap(DRM_CLIENT_CAP_ATOMIC)` 也成功。§4.1.1 第 1 条那个
+"留 `glFinish` 还是填 `IN_FENCE_FD`"的二选一，**能力上可以选后者**。
+但 `OUT_FENCE_PTR` 不在这两张平面上，它在 CRTC 上——§4.1.1 第 2 条
+（轮转等扫描输出）要从那里取。
+
+**结论二：屏是 1920x1080，不是 2560x1440。** §4.1 那张"源 → 2560x1440"的表
+按现在这台盒子的 EDID 得整体重算：720p 源占屏 25%（1/4 成立），1080p 源占屏
+**100%**（不是 56%）。也就是说在这台盒子上，"DPU 放大"只对 720p 及以下的源
+有收益，1080p 源天然就是 1:1，没有可省的片元。
+
+**结论三：legacy `SetCrtc` 不接受比 mode 小的 fb。**
+`drmModeSetCrtc(crtc, fb=1280x720, …, mode=1920x1080)` → **ENOSPC**。
+这就是GL 目标缩到 720p 后播放器报 `GLOUT: SetCrtc 失败: No space left on
+device` 的原因，和 CMA 无关（`CmaFree` 还有 1GB）。`drmModePageFlip` 走同一条
+plane 校验，所以"小 surface + eglSwapBuffers"（§4.1.2 形态 A）在这块驱动上
+**直接不成立**。
+
+**结论四：`SetPlane` 能缩放，但 dst 必须是整屏。**
+
+| # | src | dst | 结果 |
+|---|---|---|---|
+| 1 | 1280x720 | 1280x720（1:1） | EINVAL |
+| 2 | 1280x720 | 1920x1080（放大 1.5x） | **成功** |
+| 3 | 1280x720 | 1680x960 @(0,0) | EINVAL |
+| 4 | 640x360 | 1920x1080（放大 3x） | **成功** |
+| 5 | 1920x1080 | 1920x1080 | **成功** |
+| 6 | 1920x1080 | 960x540（缩小） | ERANGE |
+
+三条定死了设计：
+1. **放大可用**，1.5x/3x 都行——720p 源省下的 75% 片元是真能省。
+2. **不能缩小**（ERANGE），比屏大的源只能 GPU 缩。
+3. **dst 只能是整屏**，给子矩形就 EINVAL——所以 letterbox 不能靠 plane 矩形，
+   必须把黑边画进渲染 target 里（DPU 再把整张一起放大，比例不变）。
+   §4.1.2 表里"B 能 letterbox"这一格要改：靠 `dest_w/h` 做不到。
+
+**结论五：接上去之后到底快多少（X96Max 实机，1920x1080@60 屏）。**
+
+上屏换成 atomic 之后（`ATOMIC=1`，`IN_FENCE_FD` 可用 → 不 `glFinish`），
+`t720.265`（1280x720）在 24fps 片源下：`submit=300 shown=300 drop=0 abort=0`，
+commit 失败 0 次。GPU 每帧（`PERF=1`，含 `glFinish`）：
+
+| 配置 | 渲染 target | `glFinish`/帧 | 吞吐（`NOPACE=1` 量渲染侧上限） |
+|---|---|---|---|
+| `DPUSCALE=0` | 1920x1080 | 9.0 ms | 24.1 fps（片源节拍顶住） |
+| `DPUSCALE=3` | 1280x720 | 8.5 ms | 24.4 fps |
+
+**只有 0.5 ms，不是早先测的 6.2 ms。** 差别在 pass1：`twopass_frame()` 现在是
+「源尺寸封顶 `GL1MAX`」，720p 源的 pass1 本来就是 1280x720 —— 以前那 6.2 ms 里
+大部分是 pass1 从 1080p 降到 720p 省下来的，而现在的代码一开始就没渲到 1080p。
+DPU 能省的只剩 pass2 那次放大（1080p→720p 的拷贝），0.5 ms 是它的真价。
+**所以 DPUSCALE 的收益不是"省 40% 片元"，是省扫描输出带宽 + 让 atomic/fence
+这条路成立**；指望它救帧率会失望。
+
+**DPU 放大真正值钱的地方是 `GL1MAX`（pass1 尺寸）**，1080p 源实测：
+
+| `GL1MAX` | pass1 | `glFinish`/帧 | 吞吐上限 | 画质（对全尺寸参考） |
+|---|---|---|---|---|
+| 1080 | 1920x800（1:1） | 13.9 ms | 48.9 fps | 参考 |
+| 720 | 1280x534 | 7.1 ms | 54.7 fps | PSNR 37.7 dB，水平差分 -43% |
+| 540 | 960x400 | 6.5 ms | 55.8 fps | PSNR 37.5 dB，水平差分 -58% |
+
+读法：`GL1MAX=720` 拿 6.8 ms 换 5.8 fps 上限，代价是 37.7 dB 的软（文字/细纹理
+一眼能看出）。24fps 片源本来就装得下（13.9 ms vs 41.7 ms 预算），**默认值应留在
+`GL1MAX=1080`**，`GL1MAX` 只作 50/60fps 1080p 的逃生舱。另测 `PERF=1`（逐帧
+`glFinish`）只吃掉 1 fps 上限（48.9 vs 49.8），对 24fps 播放无感，不用为它改默认。
+
+**结论六：dst 给子矩形，atomic 也照样 EINVAL（`DSTFIT` 实验）。**
+想法是"target 用源比例、dst 用等比内容框、黑边交给屏"，`1920x800` 的 2.35:1 源
+在 16:9 屏上 dst 给 `1920x800+0+140`。结果：**192 帧、192 次
+`atomic commit 失败: Invalid argument`**，`shown=192 drop=0` 全靠 legacy
+兜底上屏才没黑屏。所以结论四（dst 必须整屏）在 atomic 下同样成立，
+黑边只能画进 target。反过来说：**target 必须与屏幕同比例**，否则 DPU 把整张
+拉成全屏 —— 2.35:1 的片子就是纵向 1.35 倍变形。
+
+`glout.c` 因此按下面两条定默认（`ATOMIC=1` 时 `DPUSCALE` 默认 4）：
+1. 只有 atomic 起来了才缩 target（legacy `SetCrtc` 小 fb → ENOSPC）；
+2. 源比例与屏幕差 > 0.5% 就直接用整屏 target（GL 自己画黑边），不硬放。
+
+比例一律按**显示宽高比**算，不是容器宽高比：`spscolor.c` 顺手把 VUI 的
+`aspect_ratio_info` 解析出来（idc 1..16 查表 + `Ext_SAR` 取显式分子分母），
+存进 `ColorMetadata.sar_num/sar_den`；`render_gl.c` 每帧 `glout_set_par()`
+刷给 `glout.c`，两处黑边计算（`twopass_frame` 的 pass2 和单 pass 路径）都
+走 `src_ar(w,h) = w*par/h`。`glout_init` 里的比例守卫仍然只决定 target 尺寸，
+非方形像素的源按"像素比例 ≠ 屏比例"退回整屏 target —— 这是保守但正确的一侧
+（不变形，只是不省片元），有需要再让 target 跟着显示宽高比走。
+实测分两段，第二段才是真链路：
+
+1. **GL 侧**（盒子上测试卡 720x576，`GLDUM` 出 PPM 量内容框）：`PAR=1:1` 内容框
+   1261 宽，`PAR=16:15` 变成 1345 宽，比值 1.0667 = 16/15，说明黑边按 SAR 撑开了。
+   注意 `PAR=` 只存在于 `GLOUT_NO_MAIN` 那支测试卡 main 里，播放器进程**不认**
+   这个环境变量，所以它只能证明 `glout.c` 的几何，不能证明 SAR 从码流接进来了。
+2. **整链**（2026-11-19，真 ES + `PLAY=1 RENDER=gl GLDUM`）：拿 `ffmpeg -vf
+   setsar=16/15` 把 720p 测试流转成 `/tmp/sar1615.265`，
+   `SPSDBG=1` 打印 `sar=16:15`（VUI 解析通了），上屏后量 PPM 内容框：
+
+   | 片源 | 内容行 | 高 | 结论 |
+   |---|---|---|---|
+   | 1280x720（无 VUI SAR，1:1） | 0..1079 | 1080 | 满屏 |
+   | 1280x720 + SAR 16:15 | 34..1045 | 1012 | 上下各 34px 黑边 |
+
+   1012 = 1920 / (1280·16 / 720·15) = 1012.5，与理论一致：SAR 走的是等比
+   letterbox，不是水平拉伸。顺带记一句流程坑：**不开 `PLAY=1` 就不建 Renderer**，
+   没有 `RENDER:` 也没有 `GLDUM`，那是纯解码跑分；`RENDER=drm` 后端不支持 `GLDUM`。
+
+**旋转**不在 HEVC 码流里（只有容器/显示矩阵才有），裸 ES 播放不涉及，不做。
+
+**下一步**：
+1. ~~上屏换 atomic~~（已做：`FB_ID`+`IN_FENCE_FD`+`CRTC_W/H=整屏`+`SRC_W/H=target`，
+   翻页事件照旧，`out_fence=有`）。
+2. ~~打通后量真实播放帧率回填 §4.1.4~~（已回填上表：720p/1080p 都是 `drop=0`）。
+3. 真 HDR 片源（PQ+BT.2020，非测试彩条）跑一遍，确认 `DSTFIT` 之外没有别的
+   几何问题（~~aspect 守卫不看 SAR~~ 已做：VUI SAR 已接入显示宽高比，
+   见上；旋转不在 ES 里，不做）。HDR 这边 2026-11-19 只走到**半程**：
+   拿 1080p 测试流重编成 `yuv420p10le` + `bt2020nc/smpte2084/bt2020` +
+   `master-display L(10000000,1)` + `max-cll=1000,400`（`/tmp/hdr1080.265`），
+   播放链路自己是对的 —— `SPSDBG` 打 `色域=BT.2020(9) tf=16 bd=10`、
+   `RENDER: mode=gles tonemap=shader`、`COLOR: 峰值=1000 nits(SEI144 maxCLL)
+   母版=1000/0.0001`、`GLOUT: TM on tf=PQ curve=1 peak=1000(sei) target=200
+   sat=0.90 knee=0.70`，抓帧内容行 0..1079 满屏（10 bit + HDR 不引入几何偏移），
+   逐通道过曝（≥250）从 `TM=0` 的 78.5% 降到 28.0%。
+   **但片源本体还是 SDR 彩条重打的 PQ 标签**，看不出"灰蒙/过曝"到底修到什么程度，
+   要判画质仍得找一条真 HDR 母版（且 10 bit 4K 母版会撞上 `design_recover` 那条
+   硬解复位，先从 1080p 母版验）。
+
+---
+
 ### 4.2 方案 A 的缺点
 
 1. **完全没有色彩管理**。这是硬伤：DPU 这条路径只能把 YUV 原码值直送显示器，
@@ -984,11 +1136,16 @@ primary plane 的属性表里有没有 `IN_FENCE_FD`、缩放上下限多少 —
 2. **吃 GPU、吃带宽、发热**。pass1 4K 全尺寸 54 ms，缩到 1080p 才 37 ms ——
    性能是靠**牺牲清晰度**换的，4K 片源实际是按 1080p 做色调映射再放大。
    两遍渲染多一次 FBO 往返，G31 一直在线，功耗和温度都比纯 DPU 路径高（未量化）。
-3. **降饱和 + hash 抖动都是近似**。输出仍是 8 bit，`uSat=0.85` 是人工折中
-   （保亮度还是保饱和度只能选一边），抖动只是拿噪声换掉色带的视觉近似，
-   不是真 10 bit 管线。
-4. **色调映射参数靠手调**。`TM_SRC_PEAK` 默认常量 1000，不解析片源的
-   MaxCLL/MaxFALL 静态元数据；不同片源要人工改环境变量，否则不是削太狠就是过曝。
+3. **降饱和 + hash 抖动都是近似**。输出仍是 8 bit，`sat=0.90` 是人工折中
+   （色度增益插值，亮度守恒，色度幅度只能粗放地按 LUT 的 nout/n 缩），
+   抖动只是拿噪声换掉色带的视觉近似，不是真 10 bit 管线。
+4. **色调映射参数只做到半自动**。峰值不再写死：`build_lut()` 先看 `TM_SRC_PEAK`
+   （人工覆盖，日志峰值来源打 `env`），否则 `csig_peak()` 按 `maxCLL` →
+   母版 `maxLuminance` → 0 的顺序取值（打 `sei`），全都没有才 1000 兜底并靠
+   `tm_peak_sync()` 在首帧 SEI 到达后补建 LUT。色域只有 2020/709 两档
+   （`hc_sat_from_primaries` → 0.90 / 1.0）。仍然**只吃静态元数据**：
+   maxFALL 没参与计算，HDR10+ / Dolby Vision 的逐帧 metadata 完全不认，
+   `target=200`、`knee=0.7` 还是人工折中，不同片源想调仍得改环境变量。
 5. **依赖重、现场难改**。EGL + GLESv2 + gbm + drm 四个板端 `.so`（`crosslib/`），
    着色器、LUT、纹理缓存任何一环坏掉都表现为"黑屏/花屏"，没有中间态；
    必须复用方案 A 已经拿到的 DRM master fd，GL 自己 `open` 拿不到 master。
@@ -1174,7 +1331,14 @@ ffmpeg -hide_banner -loglevel warning -re -ss "$START" -i "$URL" \
  | DSTGEO="$GEO+0+0" NOWRITE=1 PLAY=1 RENDER=gl /tmp/v4l2hevc-aarch64 -
 ```
 
-- `NOWRITE=1` 必须：否则写 `/tmp/out.yuv`，4K 从 24 fps 掉到 10 fps。
+- `NOWRITE=1` 现在可省：凡 `PLAY=1` 且没显式给 `OUTYUV`，播放器**默认不落盘**，
+  `PHASE write` 恒 0。历史上默认是写 `/tmp/out.yuv`（1080p 3.1 MB/帧），
+  实测 `hdr1080.265` 漏设时 e2e 18.2 fps、`PHASE write=8.76s`，设了才 23.6 fps
+  贴住 24 fps 源速——这是当时唯一的"丢帧"来源，不是 decode 慢也不是 GL 慢
+  （draw 恒 7.2 ms）。4K（3840x1600，80 帧实测）同样：不落盘 e2e 23.53 fps，
+  显式 `OUTYUV` 落盘 e2e 9.16 fps、`PHASE write=6.42s`；一直写下去 1.9 G 的
+  tmpfs 二十几秒就满。改默认的连带影响：纯解码（不带 `PLAY`）照旧落
+  `/tmp/out.yuv`，边播边存要显式 `OUTYUV=`（会打 `OUT:` 行确认）。
 - 音频单独一条 `mpv --no-video --ao=alsa --audio-device=alsa/hw:0,0 --cache-secs=20`。
   为什么不用 `ffmpeg -f alsa`：这块板子缓冲太浅（实测 8 s 内 15 次 xrun）。完整决策与代价见 **§1.12**。
 - `DSTGEO` 只对方案 A 生效；方案 B 按 connector `modes[0]` 自行等比铺屏（两者都是 2560x1440）。

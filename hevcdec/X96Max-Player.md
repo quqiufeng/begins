@@ -237,6 +237,10 @@ PLAYING ──seek──→ SEEKING ──拿到 IRAP──→ PLAYING
 不是"提成 uniform 就完事"——见下条。
 
 **② `uSat` 其实已经是 uniform —— 我先前说错了。**
+
+> 后续修正（本条已过时）：sat 现在**不再**由片元 mix 施加，而是进 LUT 的色度增益
+> （`tp_hc()` 传 `tp.sat`，`glout.c`），`uSat` 恒上传 1.0。A/B 实测：col_R 65→65、
+> col_B 20→19、col_Y 回到 255,255,0，与软映射逐通道差 ≤1；`TM=0` 出图逐字节不变。
 `glout.c:950` / `:1079` 已 `glUniform1f(..., "uSat", tp.sat)`。
 真正的 bug 是 `tp.sat` 默认 **0.90**（`:208`），对 SDR 也生效。
 所以 A 步的正确改动是：`sat` 默认 1.0，仅当检测到 HDR 时才降到 0.9，

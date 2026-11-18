@@ -59,7 +59,7 @@ ffmpeg -v error -i <片源>.mkv -map 0:v:0 -c copy \
 |---|---|
 | `PLAY` | **必填**，否则不走渲染路径，只解码落盘 |
 | `RENDER` | `auto` / `drm`（直出 plane）/ `gl`（GLES3 出图） |
-| `NOWRITE` | **播放时务必置位**：裸 YUV 落 `/tmp/out.yuv`，1080p 约 150 MB/s，1.9 G 的 tmpfs 十几秒就满 |
+| `NOWRITE` | 播放时不必再设了：**`PLAY=1` 且没给 `OUTYUV` 时默认不落盘**。要边播边存就显式 `OUTYUV=xx.yuv`（会打一行 `OUT:` 确认）；纯解码不带 `PLAY` 仍默认落 `/tmp/out.yuv` |
 | `FPS` / `LEAD` | 配速与领先量，默认 24 / 6；`NOPACE` 关节拍 |
 | `TMDITHER=0` | 关有序抖动（A/B 比效果用） |
 
@@ -231,6 +231,37 @@ SOURCE_CHANGE 回调、退出路径）一律不许自己拼 `stop_stream + close
    status=unknown）和 HDMI-A-1，前者排前面且带 720x576i 模式。只看
    `count_modes` 会选中 CVBS → 输出 720x576@50、HDMI 全黑、vout 队列堵死。
 
+9. **「解码流畅」不等于「在放」：DRM master 只有一个。**
+   盒子上 `desktop.service`（SDL2 KMSDRM 文件浏览器）在跑时它拿着 card0 的
+   master，SSH 里起的播放器 `drmSetMaster()` 拿到 EBUSY，之后
+   `atomic commit` / `SetCrtc` 一律 EACCES、`eglSwapBuffers` 返回
+   0x3003（EGL_BAD_ALLOC）——**每帧都失败，但解码循环照跑，日志里的
+   fps 看着还挺好**。以前只数「成功上屏帧数」当分母，于是屏幕上冻着上一帧、
+   统计却是 100% 上屏。现在三处一起改：
+   - `glout_init()` 显式 `drmSetMaster()`，失败立刻喊「拿不到 DRM master」；
+   - 提交数与上屏数分开记：`PERF 上屏 N 帧 / 提交 M 帧（丢弃 X）`，
+     `shown=0` 时补一句「一帧都没上屏，屏幕不会变」；
+   - 每帧重复的失败日志限流（同错前 3 次 + 每 60 次一次），
+     否则 80 行一样的字把真正的第一个错埋掉；
+   - 时间戳改在「提交前」打，不再只在上屏成功时打 —— 否则 `shown=0`
+     连 `elapsed` 都是 `0.00s`，看着像没提交过，实际每秒都在提交。
+   验证方法：`cat /sys/kernel/debug/dri/0/clients`，看 `master` 列是谁；
+   要么先 `systemctl stop desktop.service`，要么从本机 console 起播。
+
+   两个后端在这里的行为**不一样**，别以为换后端能绕过：
+   - `RENDER=gl`：`glout_init()` 抢 master 失败只警告，之后每帧提交都失败 →
+     屏幕冻住，但**进程不退出**，得看 `shown` 才知道；
+   - `RENDER=drm`：`vout_open()` 自己 `open("/dev/dri/card0")` 而**不抢 master**，
+     直接 `SetCrtc` → `EACCES`，初始化阶段就退（`FAIL render_open`）。
+     所以 drm 后端的失败是「响的」，gl 后端的失败是「哑的」。
+   `vout.c` 现在把 `EACCES/EPERM` 单独认出来并指路，不再只丢一句
+   `SETCRTC: Permission denied` 让人去查权限/属组。
+
+10. **`draw avg=0.02ms` 不是「GPU 很快」，是「没量到」**：native fence 可用时
+   `glout` 不再 `glFinish()`，绘制结束时刻由 KMS 等 fence，所以
+   `draw_ms_sum` 只剩提交指令的时间。判 GPU 负载要看
+   `PERF 上屏 … / 提交 …` 的通过率，不要看 draw avg。
+
 ## 验证结论（2026-11-16，X96Max / meson-vdec）
 
 与 ffmpeg 软解逐帧 md5 比对，整帧全量比对：
@@ -265,3 +296,22 @@ HB t=20 au=477 got=474      ← 23.9 fps（片源 23.976）
 
 掉帧 0，`out_nfree=8/8` 常驻，`plane[40] allocated by = v4l2hevc-aarch6`（comm 只取前 15 字节）。
 HDR 源在该后端走 CPU 色调映射（日志 `tonemap=cpu`），4K 输入仍能满帧。
+
+### 真上屏（不是"解码在跑"）实测 — 2026-11-19
+
+上表的 fps 只证明解码，不证明屏幕在变。加了 `PERF 上屏 N/提交 M` 之后重测，
+两个后端同一张表，重点看 `shown` 与 `drop`：
+
+```
+# desktop.service 占着 DRM master（SSH 里起播时的典型状态）
+PLAY: submit=80 shown=0 drop=80 ... elapsed=3.22s -> 0.0 fps   ← 屏幕冻在上一次的画面
+GLOUT: 拿不到 DRM master (Device or resource busy)
+
+# systemctl stop desktop.service 之后，同一个二进制同一段流
+PLAY: submit=80 shown=80 drop=0  ... elapsed=3.22s -> 24.8 fps   ← 4K 3840x1600，节拍 24
+PLAY: submit=300 shown=300 drop=0 ... -> 24.4 fps                 ← 1080p HDR(BT.2020/PQ)
+```
+
+结论：上屏侧一帧不丢（drop=0），瓶颈仍是节拍与解码，不是 GPU/DPU；
+但**验证上屏必须看 `shown`**，否则 master 被占时会被 23fps 的数字骗过去。
+两行对照：同样 `submit=80 / elapsed=3.22s`，差别只在 `shown` 与 `drop`。
