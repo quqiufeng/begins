@@ -1093,6 +1093,15 @@ int glout_init(unsigned sw, unsigned sh)
 	 */
 	g.up = getenv("DPUSCALE") ? (unsigned)atoi(getenv("DPUSCALE"))
 				  : (g.atomic ? 4 : 0);
+	/* 死结 1 的后果：没有 atomic 就只有 legacy SetCrtc/PageFlip，而这两条
+	 * 对小 fb 一律 ENOSPC —— 显式要了 DPUSCALE 却忘了 ATOMIC=1，实测就是
+	 * 全程黑屏（submit 300 / shown 0，日志只有一行 SetCrtc 失败）。
+	 * 与其让人对着黑屏猜，这里直接否掉并说清原因。 */
+	if (g.up && !g.atomic) {
+		printf("GLOUT: DPUSCALE=%u 需要 ATOMIC=1（legacy 不收小 fb，"
+		       "会全程黑屏）；本次按 0 处理\n", g.up);
+		g.up = 0;
+	}
 	g.vw = sw ? sw : g.dw;
 	g.vh = sh ? sh : g.dh;
 	if (g.vw > g.dw) g.vw = g.dw;
