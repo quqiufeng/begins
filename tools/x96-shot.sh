@@ -87,7 +87,7 @@ case "$MODE" in
   desk)
     [ -n "$REMOTE_ONLY" ] && { grab_desk "$(basename "${REMOTE_ONLY%.png}")" || rc=1; exit $rc; }
     dst="${OUT:-$HOME/x96-desktop-$stamp.png}"
-    base="x96-$(basename "${dst%.png}")-$stamp"
+    base="$(basename "${dst%.png}")"  # 名字已经带时间戳，别再拼一遍
     grab_desk "$base" || exit 1
     timeout 30 scp -q -o BatchMode=yes "$HOST:/tmp/$base.png" "$dst" && echo "→ $dst" || rc=1
     ;;
@@ -99,7 +99,7 @@ case "$MODE" in
   all)
     d1="${OUT:-$HOME/x96-desktop-$stamp.png}"; d2="${OUT:+${OUT%.png}-console.png}"
     d2="${d2:-$HOME/x96-console-$stamp.png}"
-    base="x96-desk-$stamp"
+    base="x96-desktop-$stamp"
     if grab_desk "$base"; then
       timeout 30 scp -q -o BatchMode=yes "$HOST:/tmp/$base.png" "$d1" && echo "→ $d1" || rc=1
     else rc=1; fi
