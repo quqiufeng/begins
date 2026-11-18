@@ -2,7 +2,8 @@
 # 冻结现场抓取器 v2
 # 判定只用「au 是否推进」：HB 行 10s 一条，连续两条 au 相同 = 20s 无新帧。
 # （v1 用 poll timeout 计数，会误报：drain/reinit 后 poll_timeouts 不清零。）
-# 应用侧 STALLSEC 自愈阈值保守，这里 20s 才动手，并记录 rec 是否已自愈。
+# 应用侧 STALLSEC 已收到 1.5s（带 au-got>0 守卫），这里 20s 只在应用自己也没
+# 反应过来时才动手，并记录 rec 是否已自愈。
 OUT=/tmp/freeze
 mkdir -p $OUT
 LOG=/tmp/tvplay.log

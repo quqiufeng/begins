@@ -233,8 +233,11 @@ meson-vdec 的硬约束：**同一个 V4L2 会话里不能换码流**，seek/分
    - `SIGUSR1` → seek（`sa_flags = 0`，**不能带 SA_RESTART**，否则信号被延到下一帧数据，
      seek 白等几秒；`xioctl()` 里 `g_reinit` 时直接返回 `EINTR` 让主循环处理）；
    - `POLLERR` → 驱动 abort，自愈上限 `ERRREC`（默认 4），出帧后 `g_err_rec` 归零；
-   - STALL 检测：`STALLSEC`（默认 12s）无新帧；门控态（等 RAP / 跳 RASL）的超时
-     归状态机自己管（§1.14 的超时表），不走这一路；
+   - STALL 检测：`STALLSEC`（默认 1.5s）无新帧**且驱动手里压着 AU**（`au-got > 0`）；
+     门控态（等 RAP / 跳 RASL）的超时归状态机自己管（§1.14 的超时表），不走这一路；
+     只有 AU 压着却没吐帧才是驱动挂死——供流打嗝（`au-got == 0`）只打 `STARVE:`
+     一行、不重建。`PLAY` 态的 poll 周期也从 2000ms 收到 200ms，否则看门狗
+     （挂在 `pr==0` 分支）的检测分辨率就是 2s，阈值再小也没用；
    - `FORCEREINIT=N` 在第 N 帧主动走一遍自愈，用于确定性验证。
 
 **暂停识别**：`tvplay` 的"暂停"是 `pkill -STOP` 整条链。进程被冻住期间
@@ -482,7 +485,7 @@ $ aoutctl toggle
 | `IRAPWAIT` | 60 s | `WAIT` 的绝对上限 | 软重建（计入 `ERRREC`） |
 | `RAPRASLMAX` | 8 AU | `RASL` | 回 `WAIT`；累计 3 次判死 |
 | `RAPRASLSEC` | 1.5 s | `RASL` | 同上 |
-| `STALLSEC` | 12 s | 仅 `PLAY` | 硬复位重建（原语义） |
+| `STALLSEC` | 1.5 s | 仅 `PLAY` 且 `au-got > 0` | 硬复位重建（原语义） |
 
 两个必须一起改的地方，否则互相打架：
 

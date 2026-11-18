@@ -140,7 +140,9 @@ static int env_i(const char *k, int d)
  *   IRAPWAIT   60.0s   WAIT 的绝对上限，超过判死 → 重建（计入 ERRREC）
  *   RAPRASLMAX    8    RASL 段最多丢几个 AU（x265 的 leading picture 会有 3~4 个）
  *   RAPRASLSEC  1.5s   RASL 段的时长上限
- *   STALLSEC   12.0s   仅 PLAY 态：无新帧判死（门控态本来就不出帧，不适用）
+ *   STALLSEC   1.5s   仅 PLAY 态：无新帧判死（门控态本来就不出帧，不适用）
+ *                     —— 12.0s 的老值让每次驱动 hang 白冻 12 秒画面；
+ *                     实测 2h soak 里正常段 quiet 恒 0，1.5s（=36 帧）留够余量
  */
 static int g_verbose;		/* VERBOSE：状态机/事件级日志 */
 enum { RAP_PLAY, RAP_WAIT, RAP_RASL };
@@ -3167,14 +3169,25 @@ int main(int argc, char **argv)
 		 * 只能靠外部 rchar 采样反推，前端时间全是黑的。
 		 */
 		{
-			static double t_hb;
+			static double t_hb, q_peak;
 
+			/* qmax：HB 窗口内「距上一帧」的最大值。STALLSEC 只该比正常
+			 * 播放的真实最大间隔大一个量级，光看 quiet 采样点恒 0.0
+			 * 不知道余量够不够——这行就是给下次定阈值用的证据。
+			 */
+			{
+				double qc = t_last_rx > 0 ? now_s() - t_last_rx : 0.0;
+
+				if (qc > q_peak)
+					q_peak = qc;
+			}
 			if (now_s() - t_hb >= 10.0) {
 				t_hb = now_s();
-				printf("HB t=%.0f au=%d got=%d out_nfree=%d/%d quiet=%.1f rec=%d\n",
+				printf("HB t=%.0f au=%d got=%d out_nfree=%d/%d quiet=%.1f qmax=%.2f rec=%d\n",
 				       t_hb - t0, au_idx, got, out_nfree, n_out,
-				       t_hb - t_last_rx, g_err_rec);
+				       t_hb - t_last_rx, q_peak, g_err_rec);
 				fflush(stdout);
+				q_peak = 0;
 			}
 		}
 
@@ -3359,7 +3372,14 @@ int main(int argc, char **argv)
 		{
 			double tp = now_s();
 
-			pr = poll(&pf, 1, drained ? 50 : (out_nfree ? 2000 : 100));
+			/* PLAY 态把 poll 周期从 2000 收到 200：STALL 看门狗挂在
+			 * pr==0 分支上，2s 的 poll 周期意味着阈值再小也只能 2s
+			 * 才查一次（实测 hang 时 out_nfree=5/8 正是这条 2s 路径）。
+			 * 正常播放帧间隔 41ms，poll 由事件唤醒，缩短周期不增加
+			 * 唤醒次数——纯白拿的检测分辨率。
+			 */
+			pr = poll(&pf, 1, drained ? 50 :
+				  (out_nfree ? (g_rap_st == RAP_PLAY ? 200 : 2000) : 100));
 			t_poll_acc += now_s() - tp;
 		}
 		if (pr < 0) {
@@ -3403,13 +3423,28 @@ int main(int argc, char **argv)
 			 * 就会被 STALLSEC 判死，反复重建。
 			 */
 			if (!drained && g_rap_st == RAP_PLAY) {
-				double limit = env_d("STALLSEC", 12.0), base = t_last_rx;
+				double limit = env_d("STALLSEC", 1.5), base = t_last_rx;
 				{
 				double quiet2 = now_s() - base;
+				/* 「没帧」有两种，必须分开：喂进去没吐出来 = 驱动
+				 * 挂了（该重建）；压根没喂进去 = 供流打嗝（网络
+				 * NAS 抽一下很常见，重建只会闪黑 + 丢 buffer）。
+				 * au_idx-got 就是驱动手里压着的 AU 数，两个实测
+				 * stall 分别是 6 和 8，都不是 0。
+				 */
+				long inflight = (long)au_idx - got;
 
+				if (limit > 0 && base > 0 && quiet2 > limit && inflight <= 0) {
+					/* 供流饿着：只报不重建，等 feed 自己回来 */
+					if (quiet2 > 5.0 && quiet2 < 6.0)
+						printf("STARVE: %.1fs 无新帧但驱动手里没有 AU"
+						       "（au=%d got=%d）→ 等供流，不重建\n",
+						       quiet2, au_idx, got);
+					goto no_stall;
+				}
 				if (limit > 0 && base > 0 && quiet2 > limit) {
-					printf("STALL: %.1fs 无新帧 au=%d out_nfree=%d/%d got=%d → 重建会话\n",
-					       quiet2, au_idx, out_nfree, n_out, got);
+					printf("STALL: %.1fs 无新帧 au=%d out_nfree=%d/%d got=%d inflight=%ld → 重建会话\n",
+					       quiet2, au_idx, out_nfree, n_out, got, inflight);
 					fflush(stdout);
 					if (++g_err_rec <= (getenv("ERRREC") ? atoi(getenv("ERRREC")) : 4)) {
 						tx_request(LVL_L3, VEV_STALL);
@@ -3419,6 +3454,7 @@ int main(int argc, char **argv)
 					}
 				}
 				}
+no_stall:;
 			}
 			continue;
 		}
