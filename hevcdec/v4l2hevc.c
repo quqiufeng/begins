@@ -335,9 +335,85 @@ static double t_hist[4]; static int n_hist[4]; static size_t b_hist[4];
 static double t_slp_acc; static int n_slp; static double t_frame0;	/* 播放器自己配速睡觉的时间 */
 static double t_loop;	/* 上一轮主循环的时刻，用来识别"进程被冻住过" */
 
+/* 编解码格式。驱动侧 meson-vdec 两种都支持（vdec_platform.c 的 sm1/g12
+ * 表里都有 V4L2_PIX_FMT_H264 + g12a_h264.bin），用户态原先只认 HEVC：
+ * S_FMT 写死 HEVC、NAL 头按 2 字节解、宽高只从 HEVC SPS 里拿。
+ * g_h264=1 时这三处换实现，其余（会话事务/渲染/音频/控制口）一行不动。
+ * 由 CODEC=h264 指定，没指定就按码流首个 NAL 自动识别。
+ */
+static int g_h264;
+
 static int nal_type(const unsigned char *p)
 {
-	return (p[0] >> 1) & 0x3f;
+	if (g_h264)
+		return p[0] & 0x1f;	/* H.264：1 字节头，type 在低 5 位 */
+	return (p[0] >> 1) & 0x3f;	/* HEVC：2 字节头 */
+}
+
+static int nal_hdrlen(void)
+{
+	return g_h264 ? 1 : 2;
+}
+
+/* HEVC：VCL 是 0..31。H.264：VCL 是 1..5（非 IDR 片=1、分区 A/B/C=2..4、
+ * IDR=5），6=SEI、7=SPS、8=PPS、9=AUD。 */
+static int nal_vcl(int t)
+{
+	return g_h264 ? (t >= 1 && t <= 5) : (t <= 31);
+}
+
+/* 出现在 AU 之前、本身属于下一个 AU 的 NAL（HEVC 的 VPS/SPS/PPS/AUD/
+ * SEI，H.264 的 SEI/SPS/PPS/AUD）。见到它就说明上一个 AU 已经收口。 */
+static int nal_iru(int t)
+{
+	if (g_h264)
+		return t == 6 || t == 7 || t == 8 || t == 9;
+	return t == 32 || t == 33 || t == 34 || t == 35 || t == 39 || t == 41;
+}
+
+/* H.264 的 AU 边界藏在 slice 头里：first_mb_in_slice==0 表示新图像开始
+ * （ue(v) 的首比特为 1）。容器解出来的裸流通常不带 AUD，不判这一位就会
+ * 把整段 GOP 当一个 AU 喂给驱动——驱动只按第一个 slice 建参考帧，
+ * 后面全解错。多 slice 的图像靠这一位才不会被切断。
+ */
+static int h264_new_pic(const unsigned char *nal, size_t n)
+{
+	size_t i;
+
+	for (i = 1; i < n && i < 16; i++) {	/* 跳过 NAL 头 */
+		unsigned char c = nal[i];
+
+		if (c == 0 || c == 3)	/* 前导零 / 防竞争 03 都不参与 */
+			continue;
+		return (c & 0x80) != 0;
+	}
+	return 0;
+}
+
+/* 首个 NAL 判格式：HEVC 的 VPS/SPS/PPS/SEI 是 0x40/0x42/0x44/0x4e，
+ * H.264 的 SPS/PPS/SEI/AUD 是 0x67/0x68/0x06/0x09。两者不会撞。
+ * 返回 1=H.264，0=HEVC，-1=看不出来。
+ */
+static int codec_detect(const unsigned char *buf, size_t n)
+{
+	size_t i;
+
+	for (i = 0; i + 4 < n; i++) {
+		int hevc_t, h264_t;
+
+		if (!(buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 1))
+			continue;
+		hevc_t = (buf[i+3] >> 1) & 0x3f;
+		h264_t = buf[i+3] & 0x1f;
+		if (hevc_t == 32 || hevc_t == 33 || hevc_t == 34 || hevc_t == 39)
+			return 0;
+		if (!(buf[i+3] & 0x80) &&
+		    (h264_t == 5 || h264_t == 6 || h264_t == 7 ||
+		     h264_t == 8 || h264_t == 9 || h264_t == 1))
+			return 1;
+		return -1;
+	}
+	return -1;
 }
 
 /* Split Annex-B stream into access units. */
@@ -1302,21 +1378,27 @@ static int stream_next_au(const unsigned char **out, size_t *outlen)
 			 * 所以必须逐个解析：只记第一个会丢掉母版亮度（SEI 137）。
 			 * 范围也必须正好是这个 NAL（到下一个起始码为止）——之前给的是
 			 * "到 AU 结束"，把后面的 VCL 也当 SEI 扫，读出一堆假 payload。 */
-			if (s_sei_pl) {
-				csig_sei(s_buf + s_sei_pl, sc - s_sei_pl);
-				s_sei_pl = 0;
+			/* SEI/SPS 只有 HEVC 那套解析器（HDR10+ 的 137/144、
+			 * VUI 的 88/96 位 PTL）。H.264 的 SEI/SPS 语法完全不同，
+			 * 硬套只会扫出假 payload，干脆不解析：H.264 片源按
+			 * bt709/SDR 出图，颜色走驱动给的值。 */
+			if (!g_h264) {
+				if (s_sei_pl) {
+					csig_sei(s_buf + s_sei_pl, sc - s_sei_pl);
+					s_sei_pl = 0;
+				}
+				if (t == 39)
+					s_sei_pl = pl;
+				if (s_sps_pl) {	/* 同理：VUI 也要逐段解析 */
+					sps_color_apply(s_buf + s_sps_pl,
+							sc - s_sps_pl);
+					s_sps_pl = 0;
+				}
+				if (t == 33)
+					s_sps_pl = pl;
 			}
-			if (t == 39)
-				s_sei_pl = pl;
-			if (s_sps_pl) {	/* 同理：VUI 也要逐段解析 */
-				sps_color_apply(s_buf + s_sps_pl, sc - s_sps_pl);
-				s_sps_pl = 0;
-			}
-			if (t == 33)
-				s_sps_pl = pl;
-			vcl = (t <= 31);
-			iru = (t == 32 || t == 33 || t == 34 || t == 35 ||
-			       t == 39 || t == 41);
+			vcl = nal_vcl(t);
+			iru = nal_iru(t);
 			/* 注意顺序：SEI 属于"将要开始的 AU"，不能在这里记。
 			 * 之前就在这里赋值，AU 收口时拿到的是下一个 AU 的 SEI 偏移，
 			 * sc - s_au_sei 变成巨大的 size_t，csig_sei() 就把整段压缩数据
@@ -1328,7 +1410,10 @@ static int stream_next_au(const unsigned char **out, size_t *outlen)
 				s_au_rap = 0;
 				s_au_rasl = 0;
 				s_au_sei = 0;
-			} else if ((vcl && s_cur_vcl) || (iru && s_cur_vcl)) {
+			} else if ((vcl && s_cur_vcl &&
+				    (!g_h264 || h264_new_pic(&s_buf[pl],
+							     s_len - pl))) ||
+				   (iru && s_cur_vcl)) {
 				size_t len = sc - s_au_start;
 
 				if (!len) {	/* 空 AU，跳过 */
@@ -1361,10 +1446,21 @@ static int stream_next_au(const unsigned char **out, size_t *outlen)
 			}
 			if (vcl) {
 				s_cur_vcl = 1;
-				if (t >= 16 && t <= 21)
-					s_au_rap = t;
-				if (t == 8 || t == 9)	/* RASL：CRA 之后、不可解码 */
-					s_au_rasl = 1;
+				if (g_h264) {
+					/* H.264 的随机接入点只有 IDR（type 5），
+					 * 空 DPB 上直接可解，等价于 HEVC 的
+					 * BLA/IDR。归一成 16，下游闸门
+					 * （rap_accept/rap_recoverable）不用改。
+					 * 非 IDR 片一律 0：I 片也可能是 open
+					 * GOP 里的，不能当起点。 */
+					if (t == 5)
+						s_au_rap = 16;
+				} else {
+					if (t >= 16 && t <= 21)
+						s_au_rap = t;
+					if (t == 8 || t == 9)
+						s_au_rasl = 1;	/* RASL：CRA 之后、不可解码 */
+				}
 			}
 			s_pos = pl + 1;
 		}
@@ -1412,6 +1508,13 @@ static int sps_size(unsigned *ow, unsigned *oh)
 {
 	static unsigned char buf[8192];
 	size_t i = 0;
+
+	/* H.264 的 SPS 语法和 HEVC 完全不同（没有 profile_tier_level、
+	 * 没有 conformance window 的 ue(v) 序列），复用这套解析器只会读出
+	 * 垃圾宽高。H.264 的宽高由上游 ffprobe 给（play.sh 传 argv[2]/[3]），
+	 * 拿不到就按常见 1080p 开，驱动靠码流里的 SPS 自己纠正。 */
+	if (g_h264)
+		return 0;
 
 	while (i + 6 < stream_size) {
 		size_t pl;
@@ -2233,7 +2336,8 @@ static int out_fmt_setup(unsigned w, unsigned h)
 	size_t max = getenv("MAXAU") ? atol(getenv("MAXAU")) : (6u << 20);
 
 	f.type = OUT_T;
-	f.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_HEVC;
+	f.fmt.pix_mp.pixelformat = g_h264 ? V4L2_PIX_FMT_H264
+					 : V4L2_PIX_FMT_HEVC;
 	f.fmt.pix_mp.num_planes = 1;
 	f.fmt.pix_mp.width = w;
 	f.fmt.pix_mp.height = h;
@@ -2870,9 +2974,27 @@ int main(int argc, char **argv)
 		printf("input: %s (%.2f GB)\n", path, st.st_size / 1073741824.0);
 	else
 		printf("input: stdin (pipe)\n");
+	/* 编码格式：CODEC=h264 明着给；不给就看首个 NAL 自己认
+	 * （play.sh 会明给，裸流手动跑时靠这一步）。
+	 */
+	{
+		const char *c = getenv("CODEC");
+
+		if (c && (!strcmp(c, "h264") || !strcmp(c, "avc") ||
+			  !strcmp(c, "H264") || !strcmp(c, "H.264")))
+			g_h264 = 1;
+	}
 	/* 只预读一小段：足够 SPS 即可，不整片读入 */
 	s_fill(getenv("PREFILL") ? atol(getenv("PREFILL")) : (1u << 20));
 	if (!s_len) die("stream 空");
+	if (!g_h264) {
+		int d = codec_detect(s_buf, s_len);
+
+		if (d == 1) {
+			g_h264 = 1;
+			printf("CODEC: 自动识别为 H.264（没有 CODEC=h264）\n");
+		}
+	}
 
 	{
 		unsigned sw = 0, sh = 0;
@@ -2884,7 +3006,19 @@ int main(int argc, char **argv)
 		f = sps_size(&sw, &sh);
 		stream = NULL;
 		stream_size = 0;
-		if (argc > 3) {
+		if (g_h264) {
+			/* H.264 不走 HEVC SPS 解析：宽高只认命令行/ffprobe。
+			 * 没给就按 1080p 开——S_FMT 的宽高只决定上下文尺寸，
+			 * 真实分辨率由码流里的 SPS 在一次 SOURCE_CHANGE 里纠正。
+			 */
+			if (argc > 3)
+				printf("H264: %ux%u（ffprobe 给定）\n", g_w, g_h);
+			else {
+				g_w = 1920;
+				g_h = 1080;
+				printf("H264: 未给宽高，按 %ux%u 打开\n", g_w, g_h);
+			}
+		} else if (argc > 3) {
 			printf("SPS: %ux%u (被命令行覆盖为 %ux%u)\n", sw, sh, g_w, g_h);
 		} else if (f) {
 			printf("SPS: %ux%u\n", sw, sh);

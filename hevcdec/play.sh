@@ -283,6 +283,7 @@ cleanup_old() {
 		pkill -9 -x "$(printf '%.15s' "$_p")" 2>/dev/null
 	done
 	pkill -9 -f 'ffmpeg .*-f hevc' 2>/dev/null
+	pkill -9 -f 'ffmpeg .*-f h264' 2>/dev/null
 	# 上次异常退出会把 fifo 留在原地，ffmpeg 见到就 "File already exists" 收工
 	rm -f "$AFIFO"
 	# 老链路把声音交给游离的 mpv/mpvctl：不清掉就是两路抢同一个 PCM
@@ -309,8 +310,31 @@ do_play() {
 
 	case "$SRC" in
 	*.265|*.h265|*.hevc|*.bin) NAKED=1 ;;
+	*.h264|*.264|*.avc)        NAKED=1 ;;
 	*) NAKED=0 ;;
 	esac
+
+	# 编码：驱动侧两种都能硬解（meson-vdec 的 sm1/g12 表里 HEVC 和 H.264
+	# 都在，固件 g12a_h264.bin 也在盒子上），但**裸流格式必须对得上**：
+	# `-f hevc` 喂 H.264 会让 ffmpeg 直接 "Could not write header"，管道
+	# 空着就是黑屏 + FAIL stream 空。所以先问 ffprobe 一句，再定 -f。
+	# H.264 的宽高解析不了 HEVC 那套 SPS，得由这里传给播放器。
+	VC=""; VW=""; VH=""
+	if [ "$NAKED" = 0 ] && command -v ffprobe >/dev/null 2>&1; then
+		_pv=$(ffprobe -v error -select_streams v:0 \
+			-show_entries stream=codec_name,width,height \
+			-of csv=p=0 "$SRC" 2>/dev/null | head -n 1)
+		VC=${_pv%%,*}
+		_wh=${_pv#*,}
+		VW=${_wh%%,*}; VH=${_wh##*,}
+		case "$VC" in h264|hevc) ;; *) VC="" ;; esac
+		case "$VW$VH" in ''|*[!0-9]*) VW=""; VH="" ;; esac
+	fi
+	[ -z "$VC" ] && case "$SRC" in *.h264|*.264|*.avc) VC=h264 ;; esac
+	[ -z "$VC" ] && VC=hevc
+	VF=hevc; VWH=""
+	[ "$VC" = h264 ] && { VF=h264; [ -n "$VW" ] && VWH="$VW $VH"; }
+	say "编码：$VC（ffmpeg -f $VF）${VWH:+ ${VW}x$VH}"
 	# NAS 上读片：网络抖一下不该整条链卡死（默认 rw_timeout 是无限等）。
 	# -reconnect* 只对 http 输入有意义，本地文件加上也无害。
 	HTTP_OPT=""
@@ -337,8 +361,9 @@ do_play() {
 		printf '片源：%s\n' "$_safe"
 		[ "$SRC_REMOTE" = 1 ] && printf '来源：NAS %s（认证取 %s）\n' "$NAS_URL" "${ENVF:-环境变量}"
 		printf '播放器：%s\n' "$BIN"
-		printf '命令：ffmpeg -re %s-i "%s" -map 0:v:0 -c:v copy -f hevc - | %s -\n' \
-			"${SS:+-ss $SS }" "$_safe" "$BIN"
+		printf '编码：%s\n' "$VC"
+		printf '命令：ffmpeg -re %s-i "%s" -map 0:v:0 -c:v copy -f %s - | %s - %s\n' \
+			"${SS:+-ss $SS }" "$_safe" "$VF" "$BIN" "$VWH"
 		return 0
 	fi
 
@@ -388,6 +413,9 @@ do_play() {
 	# AUDIO_FIFO 直接 export：写成 `${X:+AUDIO_FIFO=...}` 那个赋值不会生效，
 	# 展开出来的是一个「命令名」，报 AUDIO_FIFO=/tmp/play.afifo: not found。
 	export SRC SS DUR DA NAKED BIN LOG RENDER SCALE AFIFO_USE SOCK AUDIO HTTP_OPT
+	export VC VF VWH CODEC=""
+	[ "$VC" = h264 ] && CODEC=h264
+	export CODEC
 	if [ -n "$AFIFO_USE" ]; then export AUDIO_FIFO="$AFIFO_USE"; else unset AUDIO_FIFO; fi
 	export AUDIO_BUF AUDIO_PERIOD
 	[ -n "$FPS" ] && export FPS
@@ -401,9 +429,9 @@ if [ "$NAKED" = 1 ]; then
 else
 	ffmpeg -hide_banner -loglevel warning -nostdin -y -re \
 		${SS:+-ss "$SS"} $DA $HTTP_OPT \
-		-i "$SRC" -map 0:v:0 -c:v copy -f hevc - $AF 2>>"$LOG"
+		-i "$SRC" -map 0:v:0 -c:v copy -f "$VF" - $AF 2>>"$LOG"
 fi | PLAY=1 NOWRITE=1 RENDER="$RENDER" SCALE="$SCALE" PLAY_SOCK="$SOCK" \
-	"$BIN" - >>"$LOG" 2>&1'
+	"$BIN" - $VWH >>"$LOG" 2>&1'
 
 	# </dev/null：不然 ssh 远端起播时子进程握着 stdin，ssh 永远等不到 EOF
 	# 外层 sh 也要重定向：否则它握着调用者的 stdout，ssh 远端起播会一直等 EOF
