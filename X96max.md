@@ -2800,6 +2800,116 @@ apt-get update                    # rc=0，无 E:/W:
 - trim 的 `src-clean` 仍然必须保留：它是原样解压的全量树（1.8G，未裁剪；裁剪只在 `.config` 层），解压要重来一遍 160M 包 + 时间
   （删了用 `kernel/gen-trim.sh` 重生成，耗时远大于解压）。
 
+## 22. tty1 壁纸终端（console-wall，2026-11-18）
+
+需求：开机不进桌面时，HDMI 上的命令行也要能用 —— **高清壁纸打底 + 半透明终端**，
+不是黑底白字，也不要花屏。做法不是改 framebuffer 驱动，而是「先把图画进 `/dev/fb0`，
+再用半透明 fbterm 盖在上面」。
+
+### 22.1 两个落点
+
+| 件 | 位置 | 说明 |
+|---|---|---|
+| 脚本（装机源） | 仓库根 `console-wall.sh` → 盒子 `/usr/local/bin/console-wall.sh`（755） | 画背景 + exec fbterm |
+| 服务 | `/etc/systemd/system/console-wall.service` | 绑 `/dev/tty1`，`WantedBy=multi-user.target` |
+| 壁纸库 | `/root/backgrounds/`，`/root/backgrounds/.pinned` 写第一行=固定那张 | 不给参数时按此顺序挑图 |
+
+service 关键字段（出错基本都在这几条）：
+
+```ini
+[Unit]
+Conflicts=desktop.service getty@tty1.service
+Before=getty@tty1.service
+[Service]
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=tty
+TTYReset=yes
+TTYVHangup=yes
+Environment=HOME=/root
+Environment=TERM=fbterm
+ExecStart=/usr/local/bin/console-wall.sh
+```
+
+`Conflicts=desktop.service` 是硬约束：桌面一起来，壁纸终端就让位，两个不能同时占 tty1。
+
+### 22.2 分辨率：取 `modes`，不要取 `virtual_size`
+
+`/sys/class/graphics/fb0/virtual_size` 在这台机器上报 **2560,2160**（虚拟高，是双缓冲/对齐后的值），
+按它画图会垂直拉伸 1.5 倍且底部被裁掉。脚本先读真实模式：
+
+```bash
+MODE=$(head -1 /sys/class/graphics/fb0/modes)   # 期望 2560x1440p-0
+[[ "$MODE" =~ ([0-9]+)x([0-9]+) ]] && W=${BASH_REMATCH[1]} H=${BASH_REMATCH[2]}
+```
+
+读不到才退回 `virtual_size`，最后兜底 2560x1440。
+
+### 22.3 背景处理链路
+
+```bash
+ffmpeg -i "$IMG" -vf "scale=W:H:force_original_aspect_ratio=increase,crop=W:H,\
+                      lutrgb=r=val*0.42:g=val*0.42:b=val*0.42,gblur=sigma=2" \
+       -pix_fmt bgra -f rawvideo /run/console-wall.raw
+dd if=/run/console-wall.raw of=/dev/fb0 bs=$((W*4)) conv=notrunc status=none
+```
+
+- `scale…increase + crop`：铺满不留边，宁可切掉一点。
+- `val*0.42`：压暗到 42%，否则浅色壁纸上的文字压不住。
+- `gblur=sigma=2`：轻微模糊，去掉噪点，让文字边缘干净。
+- `-pix_fmt bgra`：framebuffer 是 BGRA（`fb0` 的 `32bpp`），顺序错就是偏色/花屏。
+- 没有图时的兜底：`tr '\0' '\30'` 铺 `0x30` 深灰，**不能留空**（残留内容看起来像花屏）。
+
+### 22.4 字号 ↔ 屏幕网格（2560x1440 实测）
+
+字号决定行×列，选错了要么字太小要么行距挤：
+
+| `-s` | 行 × 列 | 单格（宽×高） | 说明 |
+|---|---|---|---|
+| 16 | ≈62 × 213 | 12 × 23 | 推算值，未实测 |
+| **20（默认）** | **49 × 170** | **15 × 29** | **实测**，`stty size` 读数，日常够用 |
+| 24 | ≈41 × 142 | 21 × 35 | 推算值，未实测 |
+
+改字号（默认值就在脚本第 48 行，也认环境变量）：
+
+```bash
+# 盒子执行
+sed -i 's/CONSOLE_WALL_FONTSIZE:-20/CONSOLE_WALL_FONTSIZE:-24/' /usr/local/bin/console-wall.sh
+systemctl restart console-wall
+# 或临时试
+CONSOLE_WALL_FONTSIZE=24 /usr/local/bin/console-wall.sh /root/backgrounds/xxx.jpg
+```
+
+字体默认 `Noto Sans Mono CJK SC`（`CONSOLE_WALL_FONT` 可换）。必须留 CJK 等宽字体，
+否则中文不占两列，ASCII 混排会错位。
+
+### 22.5 坑：不要手写 `--font-width/--font-height` 硬指定格子
+
+2026-11-18 踩过：为了「更大更清楚」把 fbterm 起成 `--font-height=24 --font-width=12`，
+结果行与行叠压、字符挤成一团糊在屏幕上半部 —— 手写格子与字体实际行高不匹配就是这个症状。
+
+结论：**只用 `-s 字号`，让 fbterm 自己算格子**。真要指格子，宽:高 必须 ≈ **0.53**
+（如 16×30、15×29），否则重演叠行。
+
+排查顺序：`stty size </dev/pts/0` 看网格是否合理 → `pgrep -a fbterm` 看参数有没有多出来的
+`--font-*` → 截一张 fb0 的图看渲染。截图：
+
+```bash
+ssh x96 'dd if=/dev/fb0 bs=10240 count=1440 status=none' > /tmp/fb.raw
+ffmpeg -f rawvideo -pix_fmt bgra -s 2560x1440 -i /tmp/fb.raw -vf crop=1600:260:0:0 /tmp/fb.png
+```
+
+### 22.6 发布（无编译，纯脚本）
+
+```bash
+cd /home/quqiufeng/kernel
+scp console-wall.sh x96:/tmp/console-wall.sh
+ssh x96 'install -m755 /tmp/console-wall.sh /usr/local/bin/console-wall.sh && systemctl restart console-wall'
+ssh x96 'systemctl is-active console-wall; stty size </dev/pts/0'
+```
+
+验收：service `active`、`stty size` 给出 `49 170`、截图里中英混排对齐不叠行。
+
 ---
 
-*文档版本: 2.0 · 更新: 2026-11-15 · 设备: X96 Max / S905X2*
+*文档版本: 2.1 · 更新: 2026-11-18 · 设备: X96 Max / S905X2*
