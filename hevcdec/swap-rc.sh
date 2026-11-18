@@ -37,7 +37,7 @@ cat /tmp/tvplay-rc.log
 echo "== 重新起播 @${POS}s =="
 enc() { printf '%s' "$1" | base64 -w0; }
 sh "$NODE" play "$(enc "${PLAYER:-hevc}")" "$KEYB64" "$(enc "$POS")" \
-   "$(enc "${TRACK:-1}")" "$(enc "${AUDIO:-1}")" "$(enc "${FPS:-0}")" "$(enc "${GEO:-2560x1440}")"
+   "$(enc "${TRACK:-1}")" "$(enc "${AUDIO:-1}")" "$(enc "${FPS:-0}")" "$(enc "${GEO:-$(sh "$NODE" disp 2>/dev/null | cut -d@ -f1)}")"
 sleep 8
 
 echo "== 换装后谁攥着 event0（只应有 rcinputd）=="

@@ -5,10 +5,11 @@
 #   HEVC ≤30fps  → hevcdec 硬解 + EGL/GLES3 上屏（4K 不转码）
 #   其他          → mpv（沿用旧配置）
 #
-# 输出分辨率一律按显示器来（BenQ PD2500Q，2560x1440@60）：
-#   盒子 cmdline 锁 video=HDMI-A-1:2560x1440@60e + drm.edid_firmware=...benq-pd2500q.bin，
-#   所以 connector 的 modes[0] 就是 2560x1440，GL 输出 / DRM 平面都按这块屏铺。
-#   片源比屏大或比屏小都等比缩放 + 居中黑边（不改片源、不转码）。
+# 输出分辨率一律按显示器来，但**不写死**（当前这台是 BenQ PD2500Q 2560x1440@60）：
+#   盒子 cmdline 已不再锁 video=/drm.edid_firmware=，模式由显示器真 EDID 决定；
+#   需求值现场探测（fb0 applied 模式 → connector → EDID DTD），换屏/换线自动跟随。
+#   GL 输出 / DRM 平面都按探测结果铺，片源比屏大或比屏小都等比缩放 + 居中黑边
+#   （不改片源、不转码）。
 #
 # 用法:
 #   tvplay.sh -i                # 重建索引
@@ -32,10 +33,15 @@ X96="${X96_IP:-192.168.1.121}"
 IDX="$HOME/.cache/tvplay.index"
 VID='\.(mkv|mp4|m2ts|ts|avi|rmvb|mov|wmv|flv)$'
 
-HW_BIN=/tmp/v4l2hevc-gl-aarch64
+# 落点 /root（ext4）：/tmp 是 tmpfs，122MB 级重启就没了，改一次 cmdline 就得重推一次；
+# 盒端 play.sh / deploy.sh / x96-rc.service 早就统一在 /root，这里跟上。
+HW_BIN=/root/v4l2hevc-aarch64
+# 交叉产物名随 Makefile：CROSS=1 出 hevcdec/v4l2hevc-aarch64（drm+gl 同一二进制，RENDER= 选后端），
+# 老名字 v4l2hevc-gl-aarch64 只是副本；两个名字都认，否则 "make 无需做任何事" 却 scp 找不到文件。
 HW_LOCAL="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/hevcdec/v4l2hevc-gl-aarch64"
+[ -x "$HW_LOCAL" ] || HW_LOCAL="${HW_LOCAL%/*}/v4l2hevc-aarch64"
 NODE=/tmp/tvplay-node.sh          # 盒子上的常驻助手（probe/play/stop/state/disp）
-# 显示器（BenQ PD2500Q）默认输出模式；盒子取不到当前模式时用它兜底
+# 兜底模式：仅当盒子探测不出当前显示模式时才用（正常走 node disp 现场探测）
 DISP_W=2560; DISP_H=1440; DISP_HZ=60
 
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no
@@ -50,7 +56,10 @@ node() { "${SSH[@]}" "$NODE $*" 2>/dev/null; }
 node_push() {
   cat > /tmp/tvplay-node-src.sh <<'EOS'
 #!/bin/sh
-# tvplay-node-v17  协议版本串：加/改子命令时同步改 ensure_node 里的匹配串
+# tvplay-node-v19  协议版本串：加/改子命令时同步改 ensure_node 里的匹配串
+# v19: 播放器落点 /root（老 /tmp 副本仍兼容）；进程匹配从 v4l2hevc-gl-aarch64 放宽到 [v]4l2hevc
+#      （二进制改名成 v4l2hevc-aarch64 后老模式一个都匹配不上；中括号避免 pkill 打到自己的 sh）
+# v18: disp 改成现场探测（fb0 applied 模式 → connector → EDID DTD），GEO 不再写死 2560x1440
 # tvplay 盒端助手：所有参数 base64 进来，避免 ssh 嵌套引号
 # v5: 供流(ffmpeg)与解码(hevcdec)拆成两个进程，中间走命名管道 VFIFO，
 #     哑写者常驻占住写端 → seek 只换 ffmpeg，解码器读不到 EOF、DRM 不释放，
@@ -58,10 +67,68 @@ node_push() {
 set -u
 LOG=/tmp/tvplay.log
 STATE=/tmp/tvplay.state
-HW=/tmp/v4l2hevc-gl-aarch64
+# 播放器路径：/root 优先（重启不丢），老 /tmp 副本兜底（升级过渡期）
+for _h in /root/v4l2hevc-aarch64 /tmp/v4l2hevc-gl-aarch64 /tmp/v4l2hevc-aarch64; do
+  [ -x "$_h" ] && { HW=$_h; break; }
+done
+: "${HW:=/root/v4l2hevc-aarch64}"
 VFIFO=/tmp/tvplay.vfifo
 dec() { printf '%s' "$1" | base64 -d; }
 now() { date +%s; }
+
+# ── 显示几何 / 刷新率：一律现场探测，不写死，也不依赖 cmdline ──
+# 2026-11-18 拆掉 cmdline 的 video=HDMI-A-1:2560x1440@60e + drm.edid_firmware= 之后，
+# 模式由显示器真 EDID 决定。两个坑：
+#   ① /sys/class/drm/*/modes、/edid 都是虚拟文件，size=0，不能拿 -s 判存在；
+#   ② meson dw-hdmi 的 connector status 会停在 "disconnected"（屏明明在出图），
+#      所以不能像旧版那样"只认 status=connected"。
+# 探测顺序：fb0 的 applied 模式 → connector mode/modes[0] → 任意有模式表的 connector。
+edid_hz() {  # $1=edid 路径 → 首选 DTD 的刷新率 = pixclk/(htotal*vtotal)，pixclk 单位 10kHz
+  local f=$1 e pc ha hbl va vbl ht vt
+  e=$(od -An -tu1 -j54 -N18 "$f" 2>/dev/null) || return 1
+  [ -n "$e" ] || return 1
+  set -- $e
+  [ $# -ge 18 ] || return 1
+  pc=$(( $1 + $2 * 256 ))
+  [ "$pc" -gt 0 ] || return 1
+  ha=$((  $3 + (($5 & 0xf0) << 4) ));  hbl=$(( $4 + (($5 & 0x0f) << 8) ))
+  va=$((  $6 + (($8 & 0xf0) << 4) ));  vbl=$(( $7 + (($8 & 0x0f) << 8) ))
+  ht=$((  ha + hbl ));                 vt=$((  va + vbl ))
+  [ "$ht" -gt 0 ] && [ "$vt" -gt 0 ] || return 1
+  echo $(( (pc * 10000 + ht * vt / 2) / (ht * vt) ))
+}
+drm_geo() {  # 当前生效的输出几何 WxH；取不到返回 1
+  local d m
+  # ① fb0 的 U:WxHp 是内核真正 applied 的模式，最权威
+  m=$(sed -n 's/^[A-Za-z]*:\([0-9][0-9]*x[0-9][0-9]*\)[pi].*/\1/p' \
+        /sys/class/graphics/fb0/modes 2>/dev/null | head -1)
+  [ -n "$m" ] && { printf '%s\n' "$m"; return 0; }
+  # ② enabled 或 status=connected 的 connector
+  for d in /sys/class/drm/card*-*; do
+    m=$(head -1 "$d/modes" 2>/dev/null)
+    [ -n "$m" ] || continue
+    { [ "$(cat "$d/status" 2>/dev/null)"  = connected ] ||
+      [ "$(cat "$d/enabled" 2>/dev/null)" = enabled   ]; } || continue
+    [ -n "$(cat "$d/mode" 2>/dev/null)" ] && m=$(cat "$d/mode")
+    printf '%s\n' "$m"; return 0
+  done
+  # ③ status 不可信时的最后兜底：任何有模式表的 connector
+  for d in /sys/class/drm/card*-*; do
+    m=$(head -1 "$d/modes" 2>/dev/null)
+    [ -n "$m" ] && { printf '%s\n' "$m"; return 0; }
+  done
+  return 1
+}
+drm_hz() {  # 当前刷新率：cmdline 的 video= 优先（若哪天又写回去），否则 EDID DTD，最后 60
+  local d h
+  h=$(sed -n 's/.*video=[A-Za-z0-9_-]*:[0-9]*x[0-9]*@\([0-9][0-9]*\).*/\1/p' /proc/cmdline 2>/dev/null | head -1)
+  [ -n "$h" ] && { printf '%s\n' "$h"; return 0; }
+  for d in /sys/class/drm/card*-*; do
+    h=$(edid_hz "$d/edid") && { printf '%s\n' "$h"; return 0; }
+  done
+  printf '60\n'
+}
+disp_now() { printf '%s@%s\n' "$(drm_geo || echo '?')" "$(drm_hz)"; }
 # 解码器真身 pid：pgrep -f 会误配到"命令行里带这个名字"的 shell（ssh/bash -c、
 # 甚至本脚本自己的等待循环），USR1 打到错进程上就是"按快进毫无反应 19 秒后整链重开"。
 # 所以一律按 /proc/PID/exe 校验，并优先用 play 落进 state 的 DECPID。
@@ -69,18 +136,18 @@ decpid() {
   local p e
   # 首选 stdin 就是这个管道的那个：一场播放里只该有一个，旧链路的残留解码器
   # 也在跑同一个程序名，但它读的是别的管道/普通管道，认错就会打到死进程上。
-  for p in $(pgrep -f 'v4l2hevc-gl-aarch64' 2>/dev/null); do
+  for p in $(pgrep -f '[v]4l2hevc' 2>/dev/null); do
     [ "$(readlink "/proc/$p/fd/0" 2>/dev/null)" = "$VFIFO" ] && { printf '%s\n' "$p"; return 0; }
   done
-  for p in $(pgrep -f 'v4l2hevc-gl-aarch64' 2>/dev/null); do
+  for p in $(pgrep -f '[v]4l2hevc' 2>/dev/null); do
     e=$(readlink "/proc/$p/exe" 2>/dev/null)
-    case "$e" in */v4l2hevc-gl-aarch64*) printf '%s\n' "$p"; return 0;; esac
+    case "$e" in */v4l2hevc*) printf '%s\n' "$p"; return 0;; esac
   done
   return 1
 }
 decpid_ok() {  # $1=pid：还活着且确实是解码器
   [ -n "${1:-}" ] && [ -r "/proc/$1/cmdline" ] || return 1
-  case "$(readlink "/proc/$1/exe" 2>/dev/null)" in */v4l2hevc-gl-aarch64*) return 0;; esac
+  case "$(readlink "/proc/$1/exe" 2>/dev/null)" in */v4l2hevc*) return 0;; esac
   return 1
 }
 
@@ -133,10 +200,11 @@ feed)
 play)
   PLAYER=$(dec "$2"); URL=$(dec "$3"); START=$(dec "$4")
   TRACK=$(dec "$5");  AUDIO=$(dec "$6"); FPS=$(dec "$7")
-  GEO=$(dec "${8:-}"); [ -n "$GEO" ] || GEO=2560x1440   # 显示器输出几何 WxH
+  # 显示器输出几何 WxH：调用方没给就现场探测（不写死 2560x1440）
+  GEO=$(dec "${8:-}"); [ -n "$GEO" ] || GEO=$(drm_geo) || GEO=1920x1080
 
   # 清场
-  pkill -9 -f 'v4l2hevc-gl-aarch64' 2>/dev/null
+  pkill -9 -f '[v]4l2hevc' 2>/dev/null
   pkill -9 -f 'ffmpeg .*-f hevc'    2>/dev/null
   pkill -9 -f 'mpv .*--no-video'    2>/dev/null
   pkill -9 -f 'sleep 999999999'     2>/dev/null   # 上次的管道哑写者
@@ -215,7 +283,7 @@ play)
 
 stop)
   pkill -9 -f 'rcinputd-aarch64'    2>/dev/null
-  pkill -9 -f 'v4l2hevc-gl-aarch64' 2>/dev/null
+  pkill -9 -f '[v]4l2hevc' 2>/dev/null
   pkill -9 -f 'ffmpeg .*-f hevc'    2>/dev/null
   pkill -9 -f 'mpv .*--no-video'    2>/dev/null
   pkill -9 -f 'sleep 999999999'     2>/dev/null   # 管道哑写者
@@ -230,7 +298,7 @@ state)
   . "$STATE" 2>/dev/null || exit 1
   PA=${PAUSE_AT:-0}; [ "$PA" -gt 0 ] 2>/dev/null || PA=0
   if [ "$PA" -gt 0 ]; then el=$(( PA - START + OFF )); else el=$(( $(now) - START + OFF )); fi
-  n=$(pgrep -f 'v4l2hevc-gl-aarch64|mpv' 2>/dev/null | wc -l)
+  n=$(pgrep -f '[v]4l2hevc|mpv' 2>/dev/null | wc -l)
   printf '%s %s %s %s %s\n' "$el" "${PLAYER:-?}" "${n:-0}" "${KEYB64:-}" \
     "$([ "$PA" -gt 0 ] && echo 1 || echo 0)"
   ;;
@@ -273,13 +341,13 @@ key)
   restart() {  # $1=起点秒：seek 只能重启管线（码流是 ffmpeg -re 现推的）
     rmdir /tmp/tvplay.seek.lock 2>/dev/null
     pkill -9 -f 'rcinputd-aarch64'    2>/dev/null
-    pkill -9 -f 'v4l2hevc-gl-aarch64' 2>/dev/null
+    pkill -9 -f '[v]4l2hevc' 2>/dev/null
     pkill -9 -f 'ffmpeg .*-f hevc'    2>/dev/null
     pkill -9 -f 'mpv .*--no-video'    2>/dev/null
     sleep 0.3
     exec "$0" play "$(b64 "$PLAYER")" "$(b64 "$URL")" "$(b64 "$1")" \
       "$(b64 "${TRACK:-1}")" "$(b64 "${AUDIO:-1}")" "$(b64 "${FPS:-0}")" \
-      "$(b64 "${GEO:-2560x1440}")"
+      "$(b64 "${GEO:-$(drm_geo || echo 1920x1080)}")"
   }
   softseek() {  # $1=目标秒：重建 V4L2 会话，DRM/控制台全程不释放
     _t=$1
@@ -324,7 +392,7 @@ key)
       decpid_ok "$_dpid" || _dpid=$(decpid)
       [ -z "$_dpid" ] && { echo "key: 解码器已退出，整链重开" >> "$LOG"; restart "$_t"; }
       echo "key: 目标解码器 pid=$_dpid" >> "$LOG"
-      pkill -CONT -f 'v4l2hevc-gl-aarch64' 2>/dev/null   # 暂停态下也能响应信号
+      pkill -CONT -f '[v]4l2hevc' 2>/dev/null   # 暂停态下也能响应信号
       _n=$(wc -c < "$LOG" 2>/dev/null || echo 0)
       kill -USR1 "$_dpid" 2>/dev/null
       _i=0; _next=20
@@ -362,7 +430,7 @@ key)
     # 8. 按原状态收尾
     if [ "$PA" -gt 0 ]; then
       save_pa "$(now)"
-      pkill -STOP -f 'v4l2hevc-gl-aarch64' 2>/dev/null
+      pkill -STOP -f '[v]4l2hevc' 2>/dev/null
       pkill -STOP -f 'ffmpeg .*-f hevc'    2>/dev/null
       echo "softseek: 保持暂停 @${_t}s"
     else
@@ -376,13 +444,13 @@ key)
   toggle|pause|resume)
     if [ "$PA" -gt 0 ]; then
       save_pa 0
-      pkill -CONT -f 'v4l2hevc-gl-aarch64' 2>/dev/null
+      pkill -CONT -f '[v]4l2hevc' 2>/dev/null
       pkill -CONT -f 'ffmpeg .*-f hevc'    2>/dev/null
       mpvctl '{"command":["set_property","pause",false]}'
       echo "resume $(cur)"
     else
       save_pa "$(now)"
-      pkill -STOP -f 'v4l2hevc-gl-aarch64' 2>/dev/null
+      pkill -STOP -f '[v]4l2hevc' 2>/dev/null
       pkill -STOP -f 'ffmpeg .*-f hevc'    2>/dev/null
       mpvctl '{"command":["set_property","pause",true]}'
       echo "pause $(cur)"
@@ -425,21 +493,14 @@ key)
   ;;
 
 disp)
-  # 当前显示模式 WxH@Hz：/sys/class/drm/*/mode 常为空，退化取 modes 首行；
-  # 刷新率从 cmdline 的 video=HDMI-A-1:WxH@Hz[e] 里取
-  for d in /sys/class/drm/card*-HDMI*; do
-    [ -r "$d/status" ] || continue
-    [ "$(cat "$d/status" 2>/dev/null)" = connected ] || continue
-    D=$(cat "$d/mode" 2>/dev/null)
-    [ -n "$D" ] || D=$(head -1 "$d/modes" 2>/dev/null)
-    break
-  done
-  H=$(sed -n 's/.*video=HDMI[^:]*:[0-9]*x[0-9]*@\([0-9]*\).*/\1/p' /proc/cmdline 2>/dev/null | head -1)
-  printf '%s@%s\n' "${D:-?}" "${H:-60}"
+  # 当前显示模式 WxH@Hz：现场探测（见 drm_geo/drm_hz）。
+  # 不再"只认 status=connected"，也不再从 cmdline 的 video= 里抠刷新率——
+  # 那条 video= 已从 uEnv.txt 移除，旧写法会固定吐 "?@60"。
+  disp_now
   ;;
 
 alive)
-  pgrep -f 'v4l2hevc-gl-aarch64|mpv' 2>/dev/null | wc -l
+  pgrep -f '[v]4l2hevc|mpv' 2>/dev/null | wc -l
   ;;
 
 log)
@@ -452,7 +513,7 @@ EOS
 }
 
 # 版本不符也重推：助手常驻 /tmp，只判 -x 会让旧协议一直生效（踩过：disp 子命令拿不到模式）
-ensure_node() { "${SSH[@]}" "test -x $NODE && grep -q tvplay-node-v17 $NODE" 2>/dev/null || \
+ensure_node() { "${SSH[@]}" "test -x $NODE && grep -q tvplay-node-v19 $NODE" 2>/dev/null || \
   node_push || { echo "✘ 无法部署盒端助手" >&2; return 1; }; }
 
 # ─────────────────────────── 索引 ───────────────────────────
@@ -505,7 +566,9 @@ deploy_hw() {
     ( cd "$(dirname "$HW_LOCAL")" && make gl CROSS=1 ) || return 1
   fi
   "${SCP[@]}" "$HW_LOCAL" root@"$X96":"$HW_BIN" && \
-  "${SSH[@]}" "chmod +x $HW_BIN" && echo "已部署 $HW_BIN"
+  "${SSH[@]}" "chmod +x $HW_BIN; \
+    rm -f /tmp/v4l2hevc-gl-aarch64 /tmp/v4l2hevc-aarch64" && \
+  echo "已部署 $HW_BIN（已清 /tmp 老副本）"
 }
 
 # ─────────────────────────── 播放 ───────────────────────────
@@ -516,12 +579,12 @@ play() { # $1=dav path $2=强制起点(可空)
   ensure_node || return 1
 
   echo "▶ 探显示器…"
-  local dsc dmode dhz
+  local dsc dmode dhz dfb=0
   dsc=$(node disp 2>/dev/null); dhz="${dsc##*@}"; dmode="${dsc%@*}"
   case "$dmode" in
-    [0-9]*x[0-9]*) ;;                                    # 正常拿到 2560x1440
-    *) dmode="${DISP_W}x${DISP_H}"; dhz="$DISP_HZ"
-       echo "  ⚠ 取不到盒子显示模式，按显示器默认 ${dmode}@${dhz} 播" >&2;;
+    [0-9]*x[0-9]*) ;;                                     # 盒子现场探测成功（屏自己报的）
+    *) dmode="${DISP_W}x${DISP_H}"; dhz="$DISP_HZ"; dfb=1
+       echo "  ⚠ 取不到盒子显示模式，按兜底 ${dmode}@${dhz} 播" >&2;;
   esac
   local DW="${dmode%x*}" DH="${dmode#*x}"
 
@@ -547,7 +610,7 @@ play() { # $1=dav path $2=强制起点(可空)
 
   echo "  片源: $codec ${w}x${h} ${fps}fps$([ "${dur:-0}" -gt 0 ] && awk -v d="$dur" 'BEGIN{printf "  %.0f分钟", d/60}')"
   echo "  播放器: $([ "$player" = hw ] && echo 'hevcdec 硬解 (GLES3)' || echo 'mpv')"
-  echo "  输出: ${DW}x${DH}@${dhz}（显示器 $([ "$dmode" = "${DISP_W}x${DISP_H}" ] && echo 原生 || echo 非预期⚠)）$(
+  echo "  输出: ${DW}x${DH}@${dhz}（显示器 $([ "$dfb" = 1 ] && echo '兜底值⚠' || echo 现场探测)）$(
     awk -v sw="$w" -v sh="$h" -v dw="$DW" -v dh="$DH" 'BEGIN{
       if (sw<=0 || sh<=0) exit;
       if (SCALE_MODE=="crop") { printf "  缩放: 裁切铺满 %dx%d", dw, dh; exit }

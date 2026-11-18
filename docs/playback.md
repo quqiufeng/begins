@@ -50,7 +50,7 @@ C 只在「想省盒子功耗」或「要长期归档小体积」时才用，写
 |---|---|
 | 主机（仅旧推流路径用） | `192.168.1.10`（= `ip route get 192.168.1.121` 的 src，脚本自动取） |
 | 盒子（显示端） | `192.168.1.121`，root，`7.2.12-x96-trim`，mpv v0.40.0 |
-| 显示器 | BenQ PD2500Q，`card0-HDMI-A-1`，**2560×1440@60**（cmdline 锁 `video=HDMI-A-1:2560x1440@60e` + 固件 EDID） |
+| 显示器 | BenQ PD2500Q，`card0-HDMI-A-1`，**2560×1440@60**（走真 EDID；cmdline 的 `video=`/`drm.edid_firmware=` 已于 2026-11-18 移除） |
 | 片源 | 极空间 NAS WebDAV，索引根 `$WEBDAV_MOVIES` |
 | 推流 | `tcp://0.0.0.0:5000?listen=1`（mpegts） |
 | 凭据 | `~/.env`：`WEBDAV_URL/USER/PASS/MOVIES/SEARCH`、`X96_IP`、可选 `CAST_PORT/CAST_HOST` |
@@ -145,9 +145,11 @@ ssh root@192.168.1.121 \
 | 事实 | 值 / 位置 |
 |---|---|
 | 显示器 | BenQ PD2500Q，原生 **2560×1440@60**（`card0-HDMI-A-1`，`modes` 首行就是 2560x1440） |
-| 模式怎么锁的 | 盒子 cmdline：`video=HDMI-A-1:2560x1440@60e drm.edid_firmware=HDMI-A-1:edid/benq-pd2500q.bin`，`force=on` 跳过真 EDID，靠固件 EDID 才能列出 2560×1440 |
-| GL 路径取几何 | `glout.c: kms_pick()` 取 connector 的 `modes[0]` → 就是 cmdline 锁的那条 → 全屏 2560×1440 |
-| DRM 平面路径兜底 | `tvplay.sh` 传 `DSTGEO=2560x1440+0+0`（GL 路径忽略它，两者结果一致） |
+| 模式由谁定 | **显示器真 EDID**（2026-11-18 已从 uEnv.txt 移除 `video=HDMI-A-1:2560x1440@60e` 与 `drm.edid_firmware=`）；内核按 CEA/DTD 首选模式起屏，换屏/换线自动跟随 |
+| GL 路径取几何 | `glout.c: kms_pick()` 取 connector 的 `modes[0]` → 当前是 2560×1440（屏自己报的首选模式） |
+| 壳怎么知道几何 | 盒端 `disp` 现场探测：`/sys/class/graphics/fb0/modes`（内核 applied 模式，最权威）→ connector `mode`/`modes[0]` → 任意有模式表的 connector；刷新率取 EDID 首选 DTD 的 `pixclk/(htotal*vtotal)`（`drm_hz`），cmdline `video=` 若回来了优先用它 |
+| 两个已知坑 | ① `drm/*/modes`、`/edid` 是虚拟文件，`size=0`，不能用 `-s` 判存在；② meson dw-hdmi 的 connector `status` 会停在 `disconnected`（屏明明在出图），所以探测**不能只认** `status=connected` |
+| DRM 平面路径兜底 | `tvplay.sh` 传 `DSTGEO=<探测值>+0+0`（GL 路径忽略它，两者结果一致）；探测失败才退 2560x1440/1920x1080 一类兜底值并打印告警 |
 | 谁来缩放 | GL：GPU（Mali-G31 shader，单 pass）；DRM：显示控制器硬件 overlay 缩放 |
 
 等比 letterbox（`SCALE` 默认 fit，居中黑边）在 2560×1440 上的落点：
@@ -162,9 +164,10 @@ ssh root@192.168.1.121 \
 - 要铺满/裁边就用 `SCALE=crop`（按屏比例内缩采样区，等价于放大后裁边）。
 - 节拍：屏 60Hz，GL 路径**没有 vblank 节拍器**，23.976 源靠 `ffmpeg -re` 按时间轴供帧
   （实测 23.8fps、drops=0）；屏刷新率只决定 swap 时机，不决定帧率。
-- `tvplay.sh` 起播会先探屏并打印 `输出: 2560x1440@60（显示器 原生）` + 一行
+- `tvplay.sh` 起播会先探屏并打印 `输出: 2560x1440@60（显示器 现场探测）` + 一行
   `缩放: 3840x1600 → 2560x1067 + 上下黑边各 186`，起播后回读盒端日志里的
-  `GLOUT: 屏幕 2560x1440@60` 作为**实际选中模式**的验收；模式不是 2560x1440 会显式告警。
+  `GLOUT: 屏幕 2560x1440@60` 作为**实际选中模式**的验收。探测失败才打 `兜底值⚠` 并用
+  `DISP_W/DISP_H/DISP_HZ`（脚本顶部），不再默默假设某块屏。
 
 实测（2026-11-16，X96Max / Mali-G31 / 3840×1600 10bit 源 → 2560×1440 输出）：
 
@@ -312,9 +315,9 @@ ffmpeg -hide_banner -i "http://user:pass@nas/路径" \
 
 1. **`vd-lavc-dr=yes` 绝对不要开**：破坏零拷贝直出，`drop` 从 210 涨到 702（21/s）。
 2. **`hwdec=v4l2m2m-copy` 在 60Hz 必掉帧**：每帧上传吃带宽，`drop` 每秒 +3.7；要么零拷贝要么软解。
-3. **60Hz 屏上没有 24Hz 模式，只能靠配速消除抖动**：内核 cmdline `video=HDMI-A-1:2560x1440@60e` +
-   debugfs `force=on` → 跳过真 EDID，模式表来自固件 EDID（`edid/benq-pd2500q.bin`），
-   2560×1440 之外只有 1080p 一类，没有 23.976/24Hz。mpv 路径用 display-resample + 插帧；
+3. **60Hz 屏上没有 24Hz 模式，只能靠配速消除抖动**：（旧）内核 cmdline `video=HDMI-A-1:2560x1440@60e`
+   + debugfs `force=on` 跳过真 EDID；（2026-11-18 起）走真 EDID，模式表更全，
+   但 23.976/24Hz 依旧要显示器自己支持，BenQ 这条 HDMI 口仍只给 50/60。mpv 路径用 display-resample + 插帧；
    `hevcdec` GL 路径没有节拍器，靠 `ffmpeg -re` 按时间轴供帧（实测 drops=0，看着不晃）。
 4. **字幕**：内封 ASS 特效字幕 `osd_render` 要 11.4ms/帧，纯文本约 5ms。需要省 CPU 时指定
    `--sid=<纯文本轨> --sub-auto=no`。

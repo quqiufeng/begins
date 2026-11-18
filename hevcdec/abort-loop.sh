@@ -13,7 +13,9 @@ N=${1:-9}
 SECS=${2:-4}
 E=/tmp/tvplay-node.sh
 VID=${VID:-/root/4k24.mkv}
-GEO=${GEO:-2560x1440}
+# 输出几何现场探测（sh $E disp → WxH@Hz），别写死 2560x1440
+GEO=${GEO:-$(sh "$E" disp 2>/dev/null | cut -d@ -f1)}
+case "$GEO" in [0-9]*x[0-9]*) ;; *) GEO=1920x1080 ;; esac
 
 enc() { printf '%s' "$1" | base64 -w0; }
 free_kb() { awk '/^CmaFree:/{print $2}' /proc/meminfo; }

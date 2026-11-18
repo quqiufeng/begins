@@ -12,6 +12,53 @@ dec() { printf '%s' "$1" | base64 -d; }
 enc() { printf '%s' "$1" | base64 -w0; }
 now() { date +%s; }
 
+# ── 显示几何 / 刷新率：现场探测，不写死、不依赖 cmdline（与 tvplay.sh 内嵌 v17 同步）──
+# /sys/class/drm/*/modes、/edid 是虚拟文件（size=0，别用 -s 判存在）；
+# meson dw-hdmi 的 connector status 会停在 disconnected（屏在出图），不能只认 connected。
+edid_hz() {  # $1=edid 路径 → 首选 DTD: pixclk/(htotal*vtotal)，pixclk 单位 10kHz
+	local f=$1 e pc ha hbl va vbl ht vt
+	e=$(od -An -tu1 -j54 -N18 "$f" 2>/dev/null) || return 1
+	[ -n "$e" ] || return 1
+	set -- $e
+	[ $# -ge 18 ] || return 1
+	pc=$(( $1 + $2 * 256 ))
+	[ "$pc" -gt 0 ] || return 1
+	ha=$((  $3 + (($5 & 0xf0) << 4) ));  hbl=$(( $4 + (($5 & 0x0f) << 8) ))
+	va=$((  $6 + (($8 & 0xf0) << 4) ));  vbl=$(( $7 + (($8 & 0x0f) << 8) ))
+	ht=$((  ha + hbl ));                 vt=$((  va + vbl ))
+	[ "$ht" -gt 0 ] && [ "$vt" -gt 0 ] || return 1
+	echo $(( (pc * 10000 + ht * vt / 2) / (ht * vt) ))
+}
+drm_geo() {  # 当前生效输出几何 WxH；取不到返回 1
+	local d m
+	m=$(sed -n 's/^[A-Za-z]*:\([0-9][0-9]*x[0-9][0-9]*\)[pi].*/\1/p' \
+	      /sys/class/graphics/fb0/modes 2>/dev/null | head -1)
+	[ -n "$m" ] && { printf '%s\n' "$m"; return 0; }
+	for d in /sys/class/drm/card*-*; do
+		m=$(head -1 "$d/modes" 2>/dev/null)
+		[ -n "$m" ] || continue
+		{ [ "$(cat "$d/status" 2>/dev/null)"  = connected ] ||
+		  [ "$(cat "$d/enabled" 2>/dev/null)" = enabled   ]; } || continue
+		[ -n "$(cat "$d/mode" 2>/dev/null)" ] && m=$(cat "$d/mode")
+		printf '%s\n' "$m"; return 0
+	done
+	for d in /sys/class/drm/card*-*; do
+		m=$(head -1 "$d/modes" 2>/dev/null)
+		[ -n "$m" ] && { printf '%s\n' "$m"; return 0; }
+	done
+	return 1
+}
+drm_hz() {  # 刷新率：cmdline video= → EDID DTD → 60
+	local d h
+	h=$(sed -n 's/.*video=[A-Za-z0-9_-]*:[0-9]*x[0-9]*@\([0-9][0-9]*\).*/\1/p' /proc/cmdline 2>/dev/null | head -1)
+	[ -n "$h" ] && { printf '%s\n' "$h"; return 0; }
+	for d in /sys/class/drm/card*-*; do
+		h=$(edid_hz "$d/edid") && { printf '%s\n' "$h"; return 0; }
+	done
+	printf '60\n'
+}
+disp_now() { printf '%s@%s\n' "$(drm_geo || echo '?')" "$(drm_hz)"; }
+
 # 播放位置（秒）。暂停期间冻结：PAUSE_AT>0 时用 PAUSE_AT 当"现在"。
 pos() {
 	. "$STATE" 2>/dev/null || return 1
@@ -33,7 +80,8 @@ probe)
 play)
   PLAYER=$(dec "$2"); URL=$(dec "$3"); START=$(dec "$4")
   TRACK=$(dec "$5");  AUDIO=$(dec "$6"); FPS=$(dec "$7")
-  GEO=$(dec "${8:-}")   # 显示器输出几何 WxH
+  # 显示器输出几何 WxH：调用方没给就现场探测（不写死 2560x1440）
+  GEO=$(dec "${8:-}"); [ -n "$GEO" ] || GEO=$(drm_geo) || GEO=1920x1080
   RENDER=$(dec "${9:-}")  # 上屏后端 drm|gl|auto（缺省 gl）
 
   # 校验：宁可回落默认，也不要把解码失败的垃圾写进 state ——
@@ -41,7 +89,7 @@ play)
   case "$AUDIO" in 0|1) ;; *) AUDIO=1 ;; esac
   case "$FPS"   in ''|*[!0-9]*) FPS=0 ;; esac
   case "$TRACK" in ''|*[!0-9]*) TRACK=1 ;; esac
-  case "$GEO"   in [0-9]*x[0-9]*) ;; *) GEO=2560x1440 ;; esac
+  case "$GEO"   in [0-9]*x[0-9]*) ;; *) GEO=$(drm_geo) || GEO=1920x1080 ;; esac
   case "$RENDER" in drm|gl|auto) ;; *) RENDER=gl ;; esac
 
   # 清场
@@ -131,7 +179,7 @@ key)
 		# state 文件被写坏）。TRACK/AUDIO/GEO 还需能容忍旧 state 的空值。
 		sh "$0" play "$(enc "${PLAYER}")" "$KEYB64" "$(enc "$1")" \
 			"$(enc "${TRACK:-1}")" "$(enc "${AUDIO:-1}")" \
-			"$(enc "${FPS:-0}")" "$(enc "${GEO:-2560x1440}")" \
+			"$(enc "${FPS:-0}")" "$(enc "${GEO:-$(drm_geo || echo 1920x1080)}")" \
 			"$(enc "${RENDER:-gl}")"
   }
 
@@ -248,17 +296,8 @@ state)
   ;;
 
 disp)
-  # 当前显示模式 WxH@Hz：/sys/class/drm/*/mode 常为空，退化取 modes 首行；
-  # 刷新率从 cmdline 的 video=HDMI-A-1:WxH@Hz[e] 里取
-  for d in /sys/class/drm/card*-HDMI*; do
-    [ -r "$d/status" ] || continue
-    [ "$(cat "$d/status" 2>/dev/null)" = connected ] || continue
-    D=$(cat "$d/mode" 2>/dev/null)
-    [ -n "$D" ] || D=$(head -1 "$d/modes" 2>/dev/null)
-    break
-  done
-  H=$(sed -n 's/.*video=HDMI[^:]*:[0-9]*x[0-9]*@\([0-9]*\).*/\1/p' /proc/cmdline 2>/dev/null | head -1)
-  printf '%s@%s\n' "${D:-?}" "${H:-60}"
+  # 当前显示模式 WxH@Hz：现场探测（drm_geo/drm_hz），不依赖 cmdline 的 video=
+  disp_now
   ;;
 
 alive)
