@@ -10,6 +10,7 @@
 --   DESKTOP_READER_SCRIPT="luajit /opt/reader/main.lua %s"   （%s = 文件路径）
 
 local dav = require("core.dav")
+local fbcon = require("util.fbcon")
 
 local M = {}
 M.__index = M
@@ -118,6 +119,9 @@ function M:run(label, cmd, opts)
 	opts = opts or {}
 	self.chrome:toast("启动 " .. label .. " …（退出后自动回桌面）", 4)
 	if screen.ren then screen.sdl.present(screen.ren) end
+	-- 让出 master 的空档（suspend 到子进程上屏之间）里，fbcon 会立刻把
+	-- 命令行推上主 plane：读文件开头说的「闪回命令行」。先解绑再放手。
+	fbcon.hold()
 	screen:suspend()
 
 	local rcfile = cfg.launch_log .. ".rc"
@@ -185,6 +189,9 @@ function M:run(label, cmd, opts)
 	end
 
 	local ok, rerr = screen:resume()
+	-- resume 成功时桌面已拿回 master，rebind 不会真扫出命令行；
+	-- resume 失败也必须 rebind，否则命令行一直黑着。
+	fbcon.release()
 	local stopped = self.stopped
 
 	self.pid, self.stopped = nil, nil

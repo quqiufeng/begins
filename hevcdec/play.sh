@@ -200,6 +200,9 @@ vtcon_bind() {
 }
 
 fbcon_hold() {
+	# 桌面（打开阅读器/播放器的那个进程）已经接管 fbcon 时，不要再插手：
+	# 它会在 resume 之后自己 rebind，我们抢先 rebind 就又闪一次。
+	[ -e /tmp/desktop-fbcon.owner ] && return 0
 	_b=$(vtcon_bind) || return 0
 	[ "$(cat "$_b" 2>/dev/null)" = 0 ] && return 0
 	[ -w "$_b" ] || { say "提示：$_b 不可写，seek 间隙可能闪回命令行"; return 0; }
@@ -217,6 +220,10 @@ fbcon_watch_stop() {
 
 fbcon_release() {
 	fbcon_watch_stop
+	# 桌面替我们挡着（它打开阅读器/播放器时 hold 的）：由它在 resume 之后 rebind。
+	# 这里抢先 rebind 会正好落在 master 空档里，命令行闪一下、HDMI 重锁存、
+	# 电视弹黄条 —— 也就是老版看门狗 8s 阈值抖出来的那个现象。
+	[ -e /tmp/desktop-fbcon.owner ] && { say "fbcon 由桌面接管（不在退出时 rebind）"; return 0; }
 	_b=$(vtcon_bind) || return 0
 	[ "$(cat "$_b" 2>/dev/null)" = 1 ] && return 0
 	echo 1 > "$_b" 2>/dev/null && say "fbcon 已重新绑定（命令行恢复）"
@@ -236,6 +243,8 @@ fbcon_release() {
 # 老看门狗每秒核对一次，发现 owner 不是自己就安静退出 —— 绝不在
 # 新会话已经上屏之后再手贱 rebind 一次。
 fbcon_watch() {
+	# 桌面接管期间不起看门狗：它自己会在 resume 之后就 rebind
+	[ -e /tmp/desktop-fbcon.owner ] && return 0
 	_b=$(vtcon_bind) || return 0
 	[ -w "$_b" ] || return 0
 	_wd=/tmp/play.fbcon.wd
