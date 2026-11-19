@@ -1,12 +1,15 @@
 #!/bin/bash
 # 默认播放参数: 23.976fps 内容在 60Hz 屏上用 display-resample+插帧消除 3:2 抖动
-# (盒子 EDID 读不到, 无 24Hz 模式; v4l2m2m-copy 在 60Hz 上传会掉帧, 故用零拷贝/软解)
-# 播放参数已固化在盒子 /root/.config/mpv/mpv.conf（display-resample + 插帧 + 零拷贝 hwdec）
+# (盒子 EDID 读不到, 无 24Hz 模式; mpv 0.40 该构建无 v4l2m2m 零拷贝, 只有 -copy 上传会掉帧,
+#  故 mpv 这条只能软解。HEVC 片要硬解走 tvplay.sh 的 play.sh 链路)
+# 播放参数已固化在盒子 /root/.config/mpv/mpv.conf（video-sync=audio + 不插帧 + 1440p 输出/1080p 渲染面）
 # MPV_EXTRA 仅用于临时覆盖，例如 MPV_EXTRA="--no-config" 可完全绕开该配置做对照测试
 MPV_EXTRA="${MPV_EXTRA:-}"
 # tvcast.sh — 4K/HDR 片源"主机转码 + 盒子播放"
-#   盒子(X96, panfrost G31) 硬解 4K HEVC10 实际只能 ~12fps（mpv 该构建无 v4l2m2m 零拷贝，
-#   只能 -copy，每帧 9MB CPU->GPU 上传），因此 4K HDR 交给主机 RTX3080:
+#   盒子(X96, panfrost G31) 经 **mpv** 放 4K HEVC10 只有 ~12fps（该构建无 v4l2m2m 零拷贝，
+#   只能 -copy，每帧 9MB CPU->GPU 上传）。注意这不代表盒子解不动 4K：play.sh 走 V4L2 M2M
+#   真硬解实测 23.76fps，4K 本机可放。要走主机转码是为了 HDR->SDR tonemap + 省事，不是硬解能力不足。
+#   因此 4K HDR 交给主机 RTX3080:
 #   cuda 硬解 + zscale tonemap(HDR->SDR) + 缩 1080p + nvenc，TCP 推给盒子直显。
 #   实测: 转码 1.56x 实时, 盒子 drop=0, A-V=0.000
 # 用法: tvcast.sh <关键词> | -p <dav路径> [起始秒] | -s 停止 | -t 进度 | -d 部署盒子配置

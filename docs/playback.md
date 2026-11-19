@@ -4,20 +4,30 @@
 
 ## 纠正旧结论：卡的是缩放，不是解码（2026-11-16 实测）
 
-旧文档写的是「盒子硬解 4K HEVC10 只有 ~12fps，因为 mpv 无 `v4l2m2m` 零拷贝」——
-**这条错了**。盒子 mpv v0.40.0 的零拷贝解码完全可用，`hevc_v4l2m2m` 实测：
+旧文档写的是「盒子硬解 4K HEVC10 只有 ~12fps，因为 mpv 无 `v4l2m2m` 零拷贝」。
+**「硬解只有 ~12fps」是错的，但「mpv 没有 `v4l2m2m`」是对的**——这两件事必须分开看，
+混在一起就是后面所有误判的源头（2026-11-19 复验）：
+
+| 情形 | 判定 | 依据 |
+|---|---|---|
+| ffmpeg / 自写播放器走 `hevc_v4l2m2m` | **真零拷贝硬解，可用** | `ffmpeg -c:v hevc_v4l2m2m` 4K HEVC10：1200 帧 / 13.9s = **86fps**（3.5x 实时）；软解同片 17fps |
+| `play.sh`（meson_vdec → NV12M dmabuf → GLES3） | **真零拷贝硬解，可用** | 2152 AU / 90.5s = **23.76fps**，drop=0；同段软解 6.06fps |
+| mpv `--hwdec=v4l2m2m` | **该值在此构建里不存在** | 实测 `mpv --hwdec=v4l2m2m` → `Unsupported hwdec: v4l2m2m`。本机 mpv 0.40 只编了 `v4l2m2m-copy` |
+
+即：**盒子有真硬解，只是 mpv 这条链路用不上**。下表 mpv 的 `--hwdec=v4l2m2m` 行是历史误记
+（参数被 mpv 拒收，量到的是软解速度），保留仅作对照，勿据此下结论：
 
 | 测法 | 结果 |
 |---|---|
-| `ffmpeg -c:v hevc_v4l2m2m` 纯解码 4K HEVC 10bit | 1200 帧 / 13.9s = **86fps**（3.5x 实时） |
-| `ffmpeg` 软解同片 | 1200 帧 / 69.4s = 17fps |
 | `mpv --vo=null --hwdec=v4l2m2m-copy` | 21fps |
-| `mpv --vo=gpu --gpu-context=drm --hwdec=v4l2m2m`（零拷贝上屏） | 240 帧 / 30.9s = **7.8fps** |
-| `mpv --vo=drm --drmprime-video-plane=overlay`（DRM 直通） | 240 帧 / 34.5s = 7fps |
-| `mpv --vo=drm --hwdec=v4l2m2m-copy` | 240 帧 / 58.9s = 4fps |
+| ~~`mpv --vo=gpu --gpu-context=drm --hwdec=v4l2m2m`~~（值无效，实为软解） | ~~7.8fps~~ 作废 |
+| `mpv --vo=drm --drmprime-video-plane=overlay`（DRM 直通，atomic EINVAL） | 7fps |
+| `mpv --vo=drm --hwdec=v4l2m2m-copy` | 4fps |
 | `mpv --vo=gpu-next` | >40s 未跑完（<6fps） |
 
-解码有余量 3 倍，卡的是**后段**缩放。mpv 的 `vo=gpu` 在 Mali-G31 上只有 4–8fps，
+解码有余量 3 倍，卡的是**后段**缩放。注意：下面 mpv 的数字全部是**软解**跑出来的
+（含上面作废那行），它们证明的是「mpv 这条路走不通」，而不是「盒子解不动 4K」。
+mpv 的 `vo=gpu` 在 Mali-G31 上只有 4–8fps，
 原因不在「没有缩放硬件」这个笼统结论上，而是具体三条：
 
 - 电视 EDID 实测只声明 1920×1080 / 1280×720（`X96-TV`，128 字节、无 CEA 扩展块）→ 4K 必须下采样
@@ -203,7 +213,7 @@ t=558.66 fps=23.976024 drop=4 mistimed=843 vo_drop=? vcache=61.27 disp_fps=60.00
 | `mistimed` | 缓慢增长 | 暴涨 = 输出模式与源不匹配 |
 | `disp_fps` | 60 | 60 就是 23.976 源 → 3:2 pulldown 的来源 |
 | `sync` | `display-resample` | 变 `audio` = 配置没生效（掉回旧参数） |
-| `hw` | `v4l2m2m`（零拷贝硬解，4K 都有 86fps 余量） | `no` = 软解，白烧 CPU；`v4l2m2m-copy` 必掉帧 |
+| `hw` | `no`（本机 mpv 0.40 没有 `v4l2m2m` 这个值，**仅指 mpv 这条链路**，见 §2.1 结论 2） | 出现 `v4l2m2m` = 换了 mpv 构建；出现 `v4l2m2m-copy` = 必掉帧。要 4K 真硬解走 `hevcdec`/`play.sh`（§1.2），实测 23.76fps |
 
 ## 2. 盒子配置文件（唯二两份，部署到 `/root/.config/mpv/`）
 
@@ -211,26 +221,60 @@ t=558.66 fps=23.976024 drop=4 mistimed=843 vo_drop=? vcache=61.27 disp_fps=60.00
 自愈（配置被删 / 盒子重刷后自动补回）。**盒子 mpv 启动只用 `--config-dir=/root/.config/mpv`，
 不再传 `--no-config` 或一串散参数**；临时对照测试才用 `MPV_EXTRA`。
 
-> 注意：主路 `tvplay.sh` 目前是**自带散参数**启动（`--hwdec=no` 软解），没读这份 `mpv.conf`。
-> 1080p 软解跑得动，但白烧 CPU；要省电就把 `tvplay.sh` 里的 `--hwdec=no` 换成 `--hwdec=v4l2m2m`
-> 或干脆改成 `--config-dir=/root/.config/mpv`（零拷贝解码实测 86fps，余量充足）。
+> 注意：`tvplay.sh` 的 mpv 分支（H.264 等非 HEVC 片源）**自带散参数**启动（`--hwdec=no` 软解），
+> 没读这份 `mpv.conf`。1080p 软解跑得动，但白烧 CPU。
+>
+> **不要**把它改成 `--hwdec=v4l2m2m`——本机 mpv 0.40 该值是**无效值**，不报错直接静默回退软解，
+> 改了等于没改（这是旧文档留下的错误建议，已实测证伪，见 §2.1 结论 2）。
+> 要省电只有一条路：HEVC 片走 `hevcdec`/`play.sh` 的 V4L2 M2M 真硬解链路（§1.2）。
 
-### 2.1 `/root/.config/mpv/mpv.conf`（825B，与 `~/bin/box-mpv.conf` 同内容）
+### 2.1 `/root/.config/mpv/mpv.conf`（2005B，11-17 全面实测重写）
+
+> 三份同内容、md5 一致：盒子 `/root/.config/mpv/mpv.conf`、主机 `~/bin/box-mpv.conf`、仓库 `box-mpv.conf`。
+> 旧版（825B，`hwdec=v4l2m2m` + `interpolation=yes`）已被实测推翻，仓库副本已同步，避免 `ensure_box` 把旧配置刷回盒子。
+
 
 ```ini
 # X96 盒子播放配置  tvcast 固化版本
-# 起因: 内核 cmdline 锁 video=HDMI-A-1:1920x1080@60e, 且 force=on 跳过 EDID,
-#       模式表只有 CVT 兜底, 无 24Hz。23.976fps 源在 60Hz 上 3:2 pulldown 抖动。
-# 解法: display-resample 对齐 vsync + GPU 插帧补到 60Hz。
-#       hwdec 必须零拷贝 v4l2m2m: v4l2m2m-copy 的 per-frame 上传吃掉带宽, 插帧会掉帧。
-video-sync=display-resample
-interpolation=yes
-tscale=oversample
+# 2026-11-17 全面实测重写。四项关键结论:
+#
+# 1) 输出面板原生 2560x1440, 但 Mali 只渲染 1920x1080, 由 meson 主平面做硬件放大。
+#    这不是"退回 1080p", kernel debugfs 已证实平板在放大:
+#      primary plane: fb=1920x1080  src-pos=1920x1080  crtc-pos=2560x1440+0+0
+#    实测丢帧:
+#      Mali 直接渲 1440p            → 11.2 帧/秒
+#      Mali 渲 1080p + 平面放大 1440p → 0 帧/秒, AV=+0
+#    所以 drm-draw-surface-size=1920x1080 是必须的, 不是妥协。
+#
+# 2) 【仅限 mpv 这条链路】没有真硬解可用。警告: 盒子本身有真零拷贝硬解, 走的是
+#    play.sh -> V4L2 M2M (meson_vdec -> NV12M dmabuf -> GLES3), 实测 4K HEVC10 23.76fps
+#    (drop=0), 同一段码流 ffmpeg 软解只有 6.06fps。本条结论只对 mpv 成立, 不要外推。
+#    本机 mpv 0.40 只编了 v4l2m2m-copy, "v4l2m2m" 是无效值,
+#    mpv 不报错直接静默回退软解。实测 v4l2m2m-copy 虽然 CPU 从 238% 降到 92%,
+#    但 AV 同步持续漂移(5秒冲到 +0.72, 30秒涨到 +1.12, 约 0.016/秒 = 每小时 58 秒),
+#    长片必然音画不同步, 故弃用。软解 CPU 偏高但 AV 恒定 +0。
+#    vo=drm + drmprime 视频平面的直出通路在这台盒子上是断的:
+#      退 1440p 时 atomic commit EINVAL, hwdec-current 始终 = no。
+#
+# 3) interpolation=yes 在本机一律负收益, 已关。实测开插帧丢帧 13.2/秒(1080p输出)。
+#
+# 4) 23.976fps 也实测过(本地转码样本 24000/1001, 1439帧):
+#    不插帧 丢 0 / 抖 0; 开插帧 丢 5.6/秒 + 抖 8.4/秒。故与 29.97 一致, 一律不插帧。
+#    注意: interpolation=no 时 mpv 报 mistimed=(unavailable), 应以 frame-drop-count=0 为准。
+
+video-sync=audio
+interpolation=no
+
+# 1440p 输出 + 1080p 渲染面(见上文结论 1, 两条必须成对出现)
+drm-mode=2560x1440
+drm-draw-surface-size=1920x1080
+
+hwdec=no
+
 scale=bilinear
 dscale=bilinear
 cscale=bilinear
-hwdec=v4l2m2m
-# vd-lavc-dr=yes 会破坏零拷贝直出(实测 drop 21/s), 保持默认 no
+# vd-lavc-dr=yes 会破坏直出通路(实测 drop 21/s), 保持 no
 vd-lavc-dr=no
 
 vo=gpu
