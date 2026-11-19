@@ -640,6 +640,8 @@ static struct {
 	PFNEGLDUPNATIVEFENCEFDANDROIDPROC p_eglDupFenceFd;
 	unsigned long n_fence_ok, n_fence_none, n_fence_fail;
 	int nowait;		/* ATOMIC_WAIT=0：提交完立刻返回，不等 flip */
+	double src_fps;		/* 片源帧率：用来把屏幕刷新率对到片源，避免 24p@60Hz 抖 */
+	int glfin;		/* GLFIN=1：不用 EGL native fence，逐帧 glFinish */
 	unsigned long n_commit_ebusy;
 } g;
 
@@ -660,6 +662,15 @@ static void gpu_done(double t0)
 }
 
 /* ---------- KMS：找 connector/crtc/mode ---------- */
+/* 模式的真实刷新率：vrefresh 常被凑整（59.94 写成 60），算出来的才准 */
+static double mode_fps(const drmModeModeInfo *m)
+{
+	if (m->htotal && m->vtotal && m->clock)
+		return (double)m->clock * 1000.0 /
+		       ((double)m->htotal * (double)m->vtotal);
+	return m->vrefresh ? (double)m->vrefresh : 60.0;
+}
+
 static int kms_pick(void)
 {
 	drmModeRes *res = drmModeGetResources(g.dfd);
@@ -688,6 +699,46 @@ static int kms_pick(void)
 				g.dw = g.mode.hdisplay;
 				g.dh = g.mode.vdisplay;
 				break;
+			}
+		}
+	}
+	/* ---------- 刷新率对片源：24p 不该在 60Hz 上做 3:2 ----------
+	 * 23.976/24 的片子在 60Hz 上每帧要占 2 或 3 个 vblank，一快一慢地
+	 * 重复，pan 镜头和字幕滚动看上去就是「抖」。CEA 的 24/25/30/50 模式
+	 * 这块板都认，直接切到同刷新率，一帧一个 vblank。
+	 * 只在「同分辨率、找到了跟片源差 <0.6Hz 的模式」时才切，切不动就
+	 * 老老实实留在首选模式（REFRESH_MATCH=0 也能关）。
+	 */
+	if (g.src_fps >= 23.0 && (!getenv("REFRESH_MATCH") ||
+				  atoi(getenv("REFRESH_MATCH")))) {
+		static const double cand[] = { 23.976, 24, 25, 29.97, 30, 50,
+					       59.94, 60 };
+		double want = cand[0], bd = 1e9, bestd = 1e9;
+		int bj = -1, j;
+
+		for (j = 0; j < (int)(sizeof(cand) / sizeof(cand[0])); j++) {
+			double d = fabs(cand[j] - g.src_fps);
+
+			if (d < bd) { bd = d; want = cand[j]; }
+		}
+		if (fabs(mode_fps(&g.mode) - want) > 0.6) {
+			for (j = 0; j < conn->count_modes; j++) {
+				drmModeModeInfo *m = &conn->modes[j];
+				double mf = mode_fps(m), d;
+
+				if (m->hdisplay != g.dw || m->vdisplay != g.dh)
+					continue;
+				d = fabs(mf - want);
+				if (d < bestd) { bestd = d; bj = j; }
+			}
+			if (bj >= 0 && bestd <= 0.6) {
+				unsigned or = g.mode.vrefresh;
+
+				g.mode = conn->modes[bj];
+				printf("GLOUT: 刷新率对片源 %.3ffps：%ux%u@%u → "
+				       "%ux%u@%.2f（一帧一 vblank）\n",
+				       g.src_fps, g.dw, g.dh, or, g.dw, g.dh,
+				       mode_fps(&g.mode));
 			}
 		}
 	}
@@ -1021,6 +1072,15 @@ void glout_set_par(unsigned num, unsigned den)
 	}
 }
 
+/* 片源帧率：必须在 glout_init 之前调用。刷新率匹配靠它——24p 的片子在
+ * 60Hz 上只能靠 3:2 重复凑，pan 镜头一眼就看得出「抖」。能拿到跟片源同
+ * 刷新率的模式（CEA 的 24/25/30/50 都在）就切过去，1:1 上屏。
+ */
+void glout_set_fps(double fps)
+{
+	g.src_fps = fps;
+}
+
 /* 源在屏幕上的显示宽高比 */
 static double src_ar(unsigned w, unsigned h)
 {
@@ -1042,6 +1102,9 @@ int glout_init(unsigned sw, unsigned sh)
 
 	if (g.inited) return 0;
 	if (g.par <= 0.0) g.par = 1.0;
+	g.glfin = getenv("GLFIN") && atoi(getenv("GLFIN"));
+	if (g.src_fps <= 1.0)
+		g.src_fps = getenv("FPS") ? atof(getenv("FPS")) : 0.0;
 	g.sw = sw;
 	g.sh = sh;
 	if (g.fd_in > 0) {
@@ -2010,8 +2073,8 @@ swap:
 		int ff = -1;
 		double tf;
 
-		if (g.nfence) ff = make_fence();
-		else glFinish();	/* 没有 in-fence，只能自己等 GPU 画完 */
+		if (g.nfence && !g.glfin) ff = make_fence();
+		else glFinish();	/* 没有 in-fence（或 GLFIN=1），自己等 GPU 画完 */
 		tf = now_s();
 		if (present_atomic(fbr, ff) == 0)
 			g.presented++;

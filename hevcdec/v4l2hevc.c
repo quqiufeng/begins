@@ -2206,7 +2206,7 @@ static void tm_apply(int idx, unsigned w, unsigned h)
  */
 static struct renderer *rend;
 static int g_drop_owners;	/* 会话重建中：owner 已作废，别再往旧 fd 上 QBUF */
-static double g_play_fps = 24.0;	/* 播放配速；0 = 不限速（测吞吐） */
+double g_play_fps = 24.0;	/* 播放配速；0 = 不限速（测吞吐） */
 /* 声画偏斜探针（SYNC=1）：重建/seek 之后画面必须跳过一整个 GOP 才能重新
  * 起解，这段时间音频照走（ffmpeg -re 按墙钟灌 PCM），两边差多少必须能量
  * 出来——"跳段"（两边一起丢）和"错位"（只丢画面）是两种完全不同的病，

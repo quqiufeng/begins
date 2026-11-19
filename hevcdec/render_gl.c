@@ -25,6 +25,10 @@
 void glout_set_drm_fd(int fd);
 int  glout_init(unsigned sw, unsigned sh);
 void glout_set_par(unsigned num, unsigned den);
+void glout_set_fps(double fps);
+/* v4l2hevc.c 里的播放配速（=片源帧率）。弱符号：gl-selftest 单独链接时
+ * 没有它，取地址判断即可，不影响自测。 */
+extern double g_play_fps __attribute__((weak));
 int  glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 		 unsigned ypitch, unsigned cpitch);
 int  glout_repaint(void);
@@ -73,6 +77,9 @@ static int gl_init(struct renderer *r, unsigned sw, unsigned sh)
 		return -1;
 	}
 	glout_set_drm_fd(p->dfd);
+	/* 刷新率匹配：片源 24p 就把屏切到 24Hz，别在 60Hz 上做 3:2 */
+	glout_set_fps(&g_play_fps && g_play_fps > 1.0 ? g_play_fps :
+		      (getenv("FPS") ? atof(getenv("FPS")) : 24.0));
 	/* 非方形像素的源（720x576 SAR 16:15 那类）靠它算对黑边；VUI 还没到就
 	 * 先按 1:1，gl_submit 每帧会再刷一次。 */
 	glout_set_par(g_cm.sar_num > 0 ? (unsigned)g_cm.sar_num : 1u,
