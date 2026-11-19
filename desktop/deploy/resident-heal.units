@@ -1,0 +1,14 @@
+[Unit]
+Description=resident 常驻兜底（桌面 + 遥控派发，不在就拉起）
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/resident-heal.sh desktop keybd
+
+[Unit]
+Description=每 10s 检查 desktop / keybd 是否还活着
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=10s
+AccuracySec=2s
+[Install]
+WantedBy=timers.target
