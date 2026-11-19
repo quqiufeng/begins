@@ -43,6 +43,11 @@ typedef drmModeCrtcPtr (*getcrtc_fn)(int, uint32_t);
 typedef drmModeFBPtr (*getfb_fn)(int, uint32_t);
 typedef int (*atomic_fn)(int, drmModeAtomicReqPtr, uint32_t, void *);
 typedef int (*master_fn)(int);
+typedef drmModeFB2Ptr (*getfb2_fn)(int, uint32_t);
+typedef int (*addfb2m_fn)(int, uint32_t, uint32_t, uint32_t, const uint32_t *,
+                          const uint32_t *, const uint32_t *, const uint64_t *,
+                          uint32_t *, uint32_t);
+typedef int (*rmfb_fn)(int, uint32_t);
 
 static setcrtc_fn real_setcrtc;
 static pageflip_fn real_pageflip;
@@ -50,6 +55,9 @@ static getcrtc_fn real_getcrtc;
 static getfb_fn real_getfb;
 static atomic_fn real_atomic;
 static master_fn real_setmaster, real_dropmaster;
+static getfb2_fn real_getfb2;
+static addfb2m_fn real_addfb2m;
+static rmfb_fn real_rmfb;
 
 static int mode_kind;		/* 0=off 1=log 2=fix */
 static FILE *logfp;
@@ -99,6 +107,9 @@ static void init_once(void)
 	real_getcrtc = (getcrtc_fn)dlsym(h, "drmModeGetCrtc");
 	real_getfb = (getfb_fn)dlsym(h, "drmModeGetFB");
 	real_atomic = (atomic_fn)dlsym(h, "drmModeAtomicCommit");
+	real_getfb2 = (getfb2_fn)dlsym(h, "drmModeGetFB2");
+	real_addfb2m = (addfb2m_fn)dlsym(h, "drmModeAddFB2WithModifiers");
+	real_rmfb = (rmfb_fn)dlsym(h, "drmModeRmFB");
 	real_setmaster = (master_fn)dlsym(h, "drmSetMaster");
 	real_dropmaster = (master_fn)dlsym(h, "drmDropMaster");
 }
@@ -135,6 +146,50 @@ static const char *caller(void)
 
 	if (!dladdr(__builtin_return_address(0), &di) || !di.dli_fname) return "?";
 	return di.dli_fname;
+}
+
+
+/* ---- AR24 → XR24 别名 ----
+ * 现场（4K、mainline meson）: SDL 2.32 的 kmsdrm 建 GBM surface 用 ARGB8888，
+ * 而 meson 主 plane 只吃 XRGB8888 —— drmModePageFlip(fb=AR24) 一律 -EINVAL，
+ * SDL 每帧打 "Could not queue pageflip: -22"，fbcon 一直占着主 plane，桌面
+ * 黑屏。同一块 bo 用 XR24 建别名 fb 立刻能翻（已用 drmtest 实测：XR24 同尺寸
+ * 翻页 0，AR24 同尺寸 -22）。XR24 忽略 alpha，画面不变，内存不多占。
+ * 别名 fb 与源 fb 同源 bo；drmModeRmFB 源 fb 时一起回收，否则 bo 永远被钉住。 */
+#define AR24 0x34325241u
+#define XR24 0x34325258u
+#define MAXALIAS 32
+static struct { uint32_t src, dst; } aliases[MAXALIAS];
+static int nalias;
+
+static uint32_t alias_fb(int fd, uint32_t src)
+{
+	drmModeFB2Ptr f;
+	uint32_t hs[4], ps[4], os[4], dst = 0;
+	uint64_t ms[4];
+	int i, r;
+
+	for (i = 0; i < nalias; i++)
+		if (aliases[i].src == src) return aliases[i].dst;
+	if (nalias >= MAXALIAS || !real_getfb2 || !real_addfb2m) return 0;
+	f = real_getfb2(fd, src);
+	if (!f) return 0;
+	if (f->pixel_format != AR24) { drmModeFreeFB2(f); return 0; }
+	for (i = 0; i < 4; i++) {
+		hs[i] = f->handles[i];
+		ps[i] = f->pitches[i];
+		os[i] = f->offsets[i];
+		ms[i] = (f->flags & DRM_MODE_FB_MODIFIERS) ? f->modifier : 0;
+	}
+	r = real_addfb2m(fd, f->width, f->height, XR24, hs, ps, os, ms, &dst,
+			 (f->flags & DRM_MODE_FB_MODIFIERS) ? DRM_MODE_FB_MODIFIERS : 0);
+	say("    [alias] AR24 fb=%u → XR24 fb=%u ret=%d", src, dst, r);
+	drmModeFreeFB2(f);
+	if (r) return 0;
+	aliases[nalias].src = src;
+	aliases[nalias].dst = dst;
+	nalias++;
+	return dst;
 }
 
 /* 同一个模式 = 时钟/有效区/总时序/刷率都一样。只比 hdisplay 不够：
@@ -263,6 +318,7 @@ done:
 		int i;
 
 		ret = -1;
+		bufferId = alias_fb(fd, bufferId) ?: bufferId;
 		for (i = 0; i < 12; i++) {
 			ret = real_pageflip(fd, crtcId, bufferId, 0, NULL);
 			if (!ret) break;
@@ -309,12 +365,38 @@ int drmModePageFlip(int fd, uint32_t crtc, uint32_t fb, uint32_t flags, void *ud
 	init_once();
 	if (!real_pageflip) return -1;
 	ret = real_pageflip(fd, crtc, fb, flags, ud);
+	if (ret == -EINVAL) {
+		uint32_t a = alias_fb(fd, fb);
+
+		if (a) {
+			int r2 = real_pageflip(fd, crtc, a, flags, ud);
+
+			if (!r2) ret = 0;
+		}
+	}
 	if (mode_kind && !depth) {	/* 每帧一次，全记会把日志刷爆：只留计数 */
 		static int bad;
 
 		__flip_n++;
 		if (ret && bad++ < 5) say("    [flip] 失败 flags=0x%x → %d", flags, ret);
 	}
+	return ret;
+}
+
+int drmModeRmFB(int fd, uint32_t fb)
+{
+	int i, ret;
+
+	boot();
+	init_once();
+	if (!real_rmfb) return -1;
+	for (i = 0; i < nalias; i++) {
+		if (aliases[i].src != fb) continue;
+		real_rmfb(fd, aliases[i].dst);
+		aliases[i] = aliases[--nalias];
+		break;
+	}
+	ret = real_rmfb(fd, fb);
 	return ret;
 }
 
