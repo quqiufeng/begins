@@ -23,6 +23,26 @@
 #include <signal.h>
 #include <time.h>
 #include <linux/videodev2.h>
+
+/* dma_heap：自己分配采集缓冲用（CAPDMABUF=1）。设备上的 uapi 头比较新，
+ * 交叉工具链里可能没有，所以缺了就按 uapi 原样补一份。 */
+#if defined(__has_include)
+# if __has_include(<linux/dma-heap.h>)
+#  include <linux/dma-heap.h>
+#  define HAVE_DMA_HEAP_HDR 1
+# endif
+#endif
+#ifndef HAVE_DMA_HEAP_HDR
+struct dma_heap_allocation_data {
+	unsigned long long len;
+	unsigned int fd;
+	unsigned int fd_flags;
+	unsigned long long heap_flags;
+};
+# define DMA_HEAP_IOC_MAGIC		'H'
+# define DMA_HEAP_IOCTL_ALLOC		_IOWR(DMA_HEAP_IOC_MAGIC, 0x0, \
+					      struct dma_heap_allocation_data)
+#endif
 #ifdef USE_DRM
 #include <stdint.h>
 #include <drm/drm.h>
@@ -35,6 +55,7 @@
 #include "aout.h"	/* 内嵌音频输出（-DAOUT_EMBED 编进来，不再单独一个二进制） */
 #include "osd.h"	/* 音量/暂停提示条：pctl 写，gl 后端合成到画面 */
 #include "pctl.h"	/* 内置控制口 /tmp/play.sock + evdev 遥控（替代 mpvctl/rcinputd） */
+#include "vout_mode.h"	/* `-M`：只问屏不播，几何查询和播放器共用同一份策略 */
 
 /* 内容信号（SEI 里的 maxCLL / mastering display）。这个 TU 出强定义，
  * glout.c 只引用——它的 LUT 也要跟着真实峰值走，不再是写死 1000。 */
@@ -270,6 +291,8 @@ static struct capbuf capbuf[NBUF_CAP_MAX];
 /* 这一块交给 Renderer 了、还没收到完成反馈：期间绝不能再 QBUF */
 static int cap_busy[NBUF_CAP_MAX];
 static unsigned cap_count;
+static unsigned cap_memory = V4L2_MEMORY_MMAP;
+static unsigned cap_psize[2];	/* DMABUF 模式下每 plane 的字节数 */
 
 static struct { void *mem; size_t len; } outbuf[NBUF_OUT];
 static int out_free[NBUF_OUT], out_nfree, n_out;
@@ -710,7 +733,7 @@ static void cap_release(void)
 			}
 	cap_count = 0;
 	rb.type = CAP_T;
-	rb.memory = V4L2_MEMORY_MMAP;
+	rb.memory = cap_memory;
 	rb.count = 0;
 	xioctl(fd, VIDIOC_REQBUFS, &rb);
 }
@@ -732,6 +755,58 @@ static void close_cap_dmabufs(void)
 			}
 }
 
+/* ---- 采集缓冲的来源 ------------------------------------------------
+ * MMAP  = 驱动自己在 vb2 里分配，我们只 mmap 出来用。
+ * DMABUF= 我们自己从 /dev/dma_heap/reserved 分配，每个 plane 一个 fd，
+ *         既塞进 CAPTURE 队列，也自己 mmap 出来读写。
+ *
+ * 实测（X96 / meson-vdec，1080p HEVC，/tmp/d3.c）：同一段 CPU 逐字节
+ * LUT 写，驱动 MMAP 缓冲只有 6.1 MB/s，dma_heap 缓冲 130~155 MB/s，
+ * 差 25 倍。差别在内存位置——vb2 的缓冲落在 VPU 那侧的 carveout，
+ * CPU 访问要过 uncached + IOMMU。TM 这种要逐像素过 CPU 的路径全靠它；
+ * 纯零拷贝上屏用不着（EXPBUF 导出的 fd 直接给 DRM 就够）。
+ */
+
+/* sizeimage 一律用驱动 G_FMT 之后填的值：自算的 w*h 比它少一截对齐
+ * 余量（1080p 少 24576 字节），拿去 QBUF 直接 EINVAL。 */
+static int cap_heap_planes(void)
+{
+	struct v4l2_format f = {0};
+
+	f.type = CAP_T;
+	if (xioctl(fd, VIDIOC_G_FMT, &f) < 0) {
+		printf("G_FMT CAP 失败: %s\n", strerror(errno));
+		return -errno;
+	}
+	cap_psize[0] = f.fmt.pix_mp.plane_fmt[0].sizeimage;
+	cap_psize[1] = f.fmt.pix_mp.plane_fmt[1].sizeimage;
+	if (!cap_psize[0] || !cap_psize[1]) {
+		printf("G_FMT CAP sizeimage 没填(%u/%u)，没法按 dmabuf 分配\n",
+		       cap_psize[0], cap_psize[1]);
+		return -EINVAL;
+	}
+	printf("dmabuf cap plane: Y=%u C=%u\n", cap_psize[0], cap_psize[1]);
+	return 0;
+}
+
+static int dma_heap_alloc(size_t len)
+{
+	struct dma_heap_allocation_data da = {0};
+	int h;
+
+	h = open("/dev/dma_heap/reserved", O_RDWR | O_CLOEXEC);
+	if (h < 0)
+		return -1;
+	da.len = len;
+	da.fd_flags = O_RDWR | O_CLOEXEC;
+	if (ioctl(h, DMA_HEAP_IOCTL_ALLOC, &da) < 0) {
+		close(h);
+		return -1;
+	}
+	close(h);
+	return (int)da.fd;
+}
+
 static int cap_setup(void)
 {
 	struct v4l2_requestbuffers rb = {0};
@@ -747,66 +822,118 @@ static int cap_setup(void)
 	} else {
 		want = NBUF_CAP();
 	}
+	cap_memory = getenv("CAPDMABUF") ? V4L2_MEMORY_DMABUF
+					 : V4L2_MEMORY_MMAP;
 	rb.type = CAP_T;
-	rb.memory = V4L2_MEMORY_MMAP;
+	rb.memory = cap_memory;
 	rb.count = want;
 	if (xioctl(fd, VIDIOC_REQBUFS, &rb) < 0) {
 		printf("REQBUFS cap 失败: %s\n", strerror(errno));
 		return -errno;
 	}
-	cap_count = rb.count > want ? want : rb.count;
-	printf("cap buffers=%u\n", cap_count);
+	/* DMABUF 模式必须按驱动返回的数量**全部** QBUF：meson vdec 会把
+	 * count 抬到 16，只喂一部分时它不报错、STREAMON 也返回 0，但永远
+	 * 不出帧（实测 8/16 一帧都没有、16/16 立刻正常）。MMAP 模式沿用
+	 * 旧策略，多要的留着不用。 */
+	if (cap_memory == V4L2_MEMORY_DMABUF)
+		cap_count = rb.count > NBUF_CAP_MAX ? NBUF_CAP_MAX : rb.count;
+	else
+		cap_count = rb.count > want ? want : rb.count;
+	printf("cap buffers=%u (%s)\n", cap_count,
+	       cap_memory == V4L2_MEMORY_DMABUF ? "dmabuf" : "mmap");
+
+	for (i = 0; i < NBUF_CAP_MAX; i++)	/* fail 路径靠 -1 判断关不关 */
+		for (p = 0; p < 2; p++)
+			capbuf[i].dmabuf[p] = -1;
+
+	if (cap_memory == V4L2_MEMORY_DMABUF) {
+		r = cap_heap_planes();
+		if (r)
+			goto fail;
+	}
 
 	for (i = 0; i < cap_count; i++) {
 		struct v4l2_buffer b = {0};
 		struct v4l2_plane pl[2] = {{0}};
 
 		b.type = CAP_T;
-		b.memory = V4L2_MEMORY_MMAP;
+		b.memory = cap_memory;
 		b.index = i;
 		b.length = 2;
 		b.m.planes = pl;
-		if (xioctl(fd, VIDIOC_QUERYBUF, &b) < 0) {
-			printf("QUERYBUF cap[%u] 失败: %s\n", i, strerror(errno));
-			r = -errno;
-			goto fail;
-		}
-		for (p = 0; p < 2; p++) {
-			capbuf[i].len[p] = pl[p].length;
-			capbuf[i].dmabuf[p] = -1;
-			if (getenv("NOMAP")) {		/* 零拷贝：不 mmap，只导出 */
-				capbuf[i].mem[p] = NULL;
-				continue;
-			}
-			capbuf[i].mem[p] = mmap(NULL, pl[p].length,
-						PROT_READ | PROT_WRITE, MAP_SHARED,
-						fd, pl[p].m.mem_offset);
-			if (capbuf[i].mem[p] == MAP_FAILED) {
-				capbuf[i].mem[p] = NULL;
-				printf("mmap cap[%u] 失败: %s\n", i, strerror(errno));
-				r = -errno;
-				goto fail;
-			}
-		}
-		if (getenv("EXPBUF") || getenv("PLAY")) {
-			for (p = 0; p < 2; p++) {
-				struct v4l2_exportbuffer eb = {0};
 
-				eb.type = CAP_T;
-				eb.index = i;
-				eb.plane = p;
-				eb.flags = O_CLOEXEC;
-				if (xioctl(fd, VIDIOC_EXPBUF, &eb) < 0) {
-					printf("EXPBUF cap[%u/%d] 失败: %s\n",
+		if (cap_memory == V4L2_MEMORY_DMABUF) {
+			for (p = 0; p < 2; p++) {
+				int hfd = dma_heap_alloc(cap_psize[p]);
+
+				if (hfd < 0) {
+					printf("dma_heap cap[%u/%d] 失败: %s\n",
 					       i, p, strerror(errno));
 					r = -errno;
 					goto fail;
 				}
-				capbuf[i].dmabuf[p] = eb.fd;
+				capbuf[i].dmabuf[p] = hfd;
+				capbuf[i].len[p] = cap_psize[p];
+				pl[p].m.fd = hfd;
+				pl[p].length = cap_psize[p];
+				capbuf[i].mem[p] = mmap(NULL, cap_psize[p],
+							PROT_READ | PROT_WRITE,
+							MAP_SHARED, hfd, 0);
+				if (capbuf[i].mem[p] == MAP_FAILED) {
+					capbuf[i].mem[p] = NULL;
+					printf("mmap cap[%u/%d] 失败: %s\n",
+					       i, p, strerror(errno));
+					r = -errno;
+					goto fail;
+				}
 			}
-			if (i == 0)
-				printf("dmabuf: buf0 Y=%d C=%d\n",
-				       capbuf[0].dmabuf[0], capbuf[0].dmabuf[1]);
+		} else {
+			if (xioctl(fd, VIDIOC_QUERYBUF, &b) < 0) {
+				printf("QUERYBUF cap[%u] 失败: %s\n", i,
+				       strerror(errno));
+				r = -errno;
+				goto fail;
+			}
+			for (p = 0; p < 2; p++) {
+				capbuf[i].len[p] = pl[p].length;
+				if (getenv("NOMAP")) {	/* 零拷贝：只导出 */
+					capbuf[i].mem[p] = NULL;
+					continue;
+				}
+				capbuf[i].mem[p] = mmap(NULL, pl[p].length,
+							PROT_READ | PROT_WRITE,
+							MAP_SHARED, fd,
+							pl[p].m.mem_offset);
+				if (capbuf[i].mem[p] == MAP_FAILED) {
+					capbuf[i].mem[p] = NULL;
+					printf("mmap cap[%u] 失败: %s\n", i,
+					       strerror(errno));
+					r = -errno;
+					goto fail;
+				}
+			}
+			if (getenv("EXPBUF") || getenv("PLAY")) {
+				for (p = 0; p < 2; p++) {
+					struct v4l2_exportbuffer eb = {0};
+
+					eb.type = CAP_T;
+					eb.index = i;
+					eb.plane = p;
+					eb.flags = O_CLOEXEC;
+					if (xioctl(fd, VIDIOC_EXPBUF,
+						   &eb) < 0) {
+						printf("EXPBUF cap[%u/%d] 失败: %s\n",
+						       i, p, strerror(errno));
+						r = -errno;
+						goto fail;
+					}
+					capbuf[i].dmabuf[p] = eb.fd;
+				}
+				if (i == 0)
+					printf("dmabuf: buf0 Y=%d C=%d\n",
+					       capbuf[0].dmabuf[0],
+					       capbuf[0].dmabuf[1]);
+			}
 		}
 		if (xioctl(fd, VIDIOC_QBUF, &b) < 0) {
 			printf("QBUF cap[%u] 失败: %s\n", i, strerror(errno));
@@ -2812,14 +2939,30 @@ static void cap_recycle(int idx)
 
 	if (idx < 0 || idx >= NBUF_CAP_MAX)
 		return;
+	/* 只回收"还在飞"的 buffer：同一个 idx 被回调两次（同步后端就地回调 +
+	 * 轮末兜底 pump、或 drop 与 shown 双报）时，第二次 QBUF 会把已经还给
+	 * vdec 的 buffer 再塞一遍 —— meson vdec 对此回 EIO，接着整条流水线
+	 * 以 "FAIL QBUF out" 退出，表现就是放到十几帧后画面钉住、解码器消失。 */
+	if (!cap_busy[idx])
+		return;
 	cap_busy[idx] = 0;
 	if (g_drop_owners || fd < 0)
 		return;
 	b.type = CAP_T;
-	b.memory = V4L2_MEMORY_MMAP;
+	b.memory = cap_memory;
 	b.index = idx;
 	b.length = 2;
 	b.m.planes = pl;
+	if (cap_memory == V4L2_MEMORY_DMABUF) {
+		/* DMABUF 的 QBUF 每次都要重报 fd 与长度：不带的话驱动回
+		 * EINVAL，而这里的 EINVAL 是被当成"重复回收"忽略掉的，
+		 * 于是 buffer 永远回不了队 —— 表现是放十几帧后 STALL
+		 * （inflight 只增不减）→ 重建会话。 */
+		pl[0].m.fd = capbuf[idx].dmabuf[0];
+		pl[0].length = capbuf[idx].len[0];
+		pl[1].m.fd = capbuf[idx].dmabuf[1];
+		pl[1].length = capbuf[idx].len[1];
+	}
 	if (ioctl(fd, VIDIOC_QBUF, &b) < 0 && errno != EINVAL)
 		perror("QBUF recycle(renderer)");
 }
@@ -3458,6 +3601,19 @@ int main(int argc, char **argv)
 	if (argc > 1 && !strcmp(argv[1], "-K")) {
 		pctl_keymap_dump();
 		return 0;
+	}
+	/* `player -M [req]`：只问屏不播——打印协商后的输出几何 WxH[@R]（stdout），
+	 * 理由走 stderr。play.sh/桌面壳的 disp 用的就是它：壳不再自己照 sysfs 猜
+	 * 一套几何，几何只有这一个来源，DSTGEO 和实际铺的模式才不会错位。
+	 * 不碰 /dev/video0，也不抢 DRM master，播放中调用同样安全。
+	 */
+	if (argc > 1 && (!strcmp(argv[1], "-M") || !strcmp(argv[1], "--vout-mode"))) {
+		char geo[48];
+		int r = vout_mode_query(getenv("DRMDEV"), argc > 2 ? argv[2] : NULL,
+					geo, sizeof geo);
+
+		if (r == 0) printf("%s\n", geo);
+		return r == 0 ? 0 : 1;
 	}
 
 	const char *path = argc > 1 ? argv[1] : "/tmp/test.265";
@@ -4128,7 +4284,7 @@ no_stall:;
 			int rendered = 0;
 
 			b.type = CAP_T;
-			b.memory = V4L2_MEMORY_MMAP;
+			b.memory = cap_memory;
 			b.length = 2;
 			b.m.planes = pl;
 			double t_rx;

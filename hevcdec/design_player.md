@@ -246,6 +246,20 @@ EOS 就是这么来的：**正常播完和 ffmpeg 挂掉走的是同一条路**�
   否则 `amvdec_src_change()` 无法续跑。
 - 两块 plane 都是 `V4L2_MEMORY_MMAP`，各自 `VIDIOC_EXPBUF` 出 dmabuf fd
   （`capbuf[].dmabuf[0/1]`），方案 A/B 都消费这两个 fd，全程零拷贝。
+- `CAPDMABUF=1` 换成自己分配：`/dev/dma_heap/reserved` 每 plane 一个 fd，
+  `REQBUFS(V4L2_MEMORY_DMABUF)` 后把这些 fd 塞进 CAPTURE 队列，同时 mmap
+  出来给 CPU 用；释放时这些 fd 由我们自己关（`capbuf[].dmabuf[]` 两种模式
+  统一存 fd，`close_cap_dmabufs()` 一并处理）。两个坑：
+  1. 驱动会把 `rb.count` 抬到 16，DMABUF 模式必须**按返回的 count 全部 QBUF**，
+     只喂一部分时 STREAMON 仍返回 0，但流永远不出帧；
+  2. 每 plane 的 `length` 必须是 `G_FMT` 回的 `sizeimage`（自算少 24576 字节 → EINVAL），
+     且 `cap_recycle()` 的 QBUF **每次都要重报 `m.fd` + `length`**，否则 EINVAL 被
+     当成"重复回收"吞掉，buffer 永不回队（`STALL inflight` 只增不减 → 重建会话）。
+- 实测（1080p HEVC，x96）：`CAPDMABUF=1` 与 MMAP 端到端**无差别**（纯解码
+  wall 3.47/3.59s vs 3.19/3.57s，GL 播放 21.78 vs 21.60 fps，首帧像素 md5 相同）。
+  `/tmp/d3.c` 微基准里 dma_heap 缓冲的 CPU 逐字节写确实快 25 倍（140 vs 6.1 MB/s），
+  但整条链路瓶颈不在这次 CPU 访存，所以这个开关只是留作对照/备用；
+  顺带教训：盒子的 `/tmp` 是 1.9G tmpfs，塞满会让同一份程序跑出 3 倍慢的假结果。
 - vdec 出的 NV12M 是**紧排**：Y pitch = w，CbCr 交织 pitch = w（不是 w/2）。
 - 订阅 `V4L2_EVENT_SOURCE_CHANGE` 处理真实分辨率变化（`handle_event()` → 重配 capture）。
 - capture plane0 按 64 行对齐（720 → 768），任何按行 dump 的地方必须按 stride 走，
@@ -1358,7 +1372,31 @@ ffmpeg -hide_banner -loglevel warning -re -ss "$START" -i "$URL" \
   `/tmp/out.yuv`，边播边存要显式 `OUTYUV=`（会打 `OUT:` 行确认）。
 - 音频单独一条 `mpv --no-video --ao=alsa --audio-device=alsa/hw:0,0 --cache-secs=20`。
   为什么不用 `ffmpeg -f alsa`：这块板子缓冲太浅（实测 8 s 内 15 次 xrun）。完整决策与代价见 **§1.12**。
-- `DSTGEO` 只对方案 A 生效；方案 B 按 connector `modes[0]` 自行等比铺屏（两者都是 2560x1440）。
+- `DSTGEO` 只对方案 A 生效；方案 B 的几何也来自同一份协商（见 §5.8），不再自行取
+  connector `modes[0]`。
+
+### 5.8 输出几何：只有一个真源（`-M` + `/tmp/vout-geo`）
+
+屏幕分辨率不是常量（换屏/换线就变），所以**几何不许在壳里再猜一套**——两套猜测
+一旦不一致，`DSTGEO`（壳画的框）和播放器实际铺的模式就错位，症状是画面缩到角上
+或凭空多出黑边，事后极难归因。
+
+三条链路，一个出口：
+
+| 谁 | 怎么问 | 拿到什么 |
+|---|---|---|
+| 壳（`tvplay.sh` 的 `disp`/`drm_geo`） | `$HW -M [请求]` | stdout `WxH[@R]`，理由走 stderr |
+| 方案 A（`vout.c`，DRM 平面） | `vout_mode_negotiate` 后 `vout_geo_publish()` | `/tmp/vout-geo` |
+| 方案 B（`glout.c`，GL/GBM） | 同一份 `vout_mode_negotiate` + 落盘 | `/tmp/vout-geo` |
+
+- `VOUT_MODE` 只是**偏好**（`auto` / `WxH` / `WxH@R` / `1080p` 别名 / `max` 支持最大面积），
+  屏幕说了算：屏幕没报的尺寸绝不硬上，做不到就打 `降级 → …` 换 `auto` 并继续播。
+  两个后端都认它（方案 B 以前直接吃 `modes[0]`，于是同一个二进制换个 `RENDER=`
+  就输出不同几何）。
+- `play` 分支起播放器时把已协商的几何钉成 `VOUT_MODE="$GEO"`，并 `VOUT_MODE` 从 `~/.env`
+  经 `node()` 透到盒子上的 `disp` —— 壳和屏对同一个偏好算，不会一个 2160p 一个 576p。
+- `-M` 用 `O_RDONLY` 打开卡，只发 `GET*` ioctl：不抢 master、不动 CRTC，播放中调用
+  也安全（老二进制没有 `-M` 时 `drm_geo` 自动退回 sysfs 探测）。
 
 ### 5.7 排查
 
@@ -1368,6 +1406,8 @@ cat /tmp/tvplay.state
 tail -5 /tmp/tvplay.log; tail -5 /tmp/tvplay-rc.log
 sh /tmp/tvplay-node.sh state
 grep -E 'HB|STALL|POLLERR|REINIT' /tmp/tvplay.log    # 心跳/自愈
+/root/v4l2hevc-aarch64 -M        # 屏究竟会输出什么（几何唯一真源）
+cat /tmp/vout-geo                # 播放器这次实际铺的模式（两后端都写）
 ```
 
 `v4l2hevc` 每 10 s 打一行心跳：
