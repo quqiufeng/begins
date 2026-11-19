@@ -50,13 +50,33 @@ SCP=(scp -o BatchMode=yes -o StrictHostKeyChecking=no
      -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
 
 b64() { printf '%s' "$1" | base64 -w0; }
-node() { "${SSH[@]}" "$NODE $*" 2>/dev/null; }
+# VOUT_MODE 从 ~/.env 来，值只可能是 WxH@R/别名这类安全字符；转义一下再带过去，
+# 否则宿主机改了偏好（比如 2160p），盒子上的 disp 还在按默认答，两边不一致。
+node() {
+  local vm=""
+  case "${VOUT_MODE:-}" in
+    *[!0-9a-zA-Z@x._-]*) VOUT_MODE= ;;
+  esac
+  [ -n "${VOUT_MODE:-}" ] && vm="VOUT_MODE=$VOUT_MODE "
+  # 调参开关必须随命令过 ssh：盒端助手是 heredoc 推过去的脚本，本地 export
+  # 传不过去（RENDER=gl 看着给了、盒子还跑 drm，就是这么来的）。
+  # 只放白名单字符，避免拼进命令串后变成注入。
+  local k v
+  for k in RENDER TM TM_TARGET TM_SAT TM_GAIN TM_SRC_PEAK TM_KNEE TMTIME TMDIAG TMNOOP TMDITHER; do
+    eval "v=\${$k:-}"
+    case "$v" in ''|*[!0-9a-zA-Z._-]*) continue ;; esac
+    vm="$vm$k=$v "
+  done
+  "${SSH[@]}" "$vm$NODE $*" 2>/dev/null
+}
 
 # ─────────────────────────── 远端助手脚本 ───────────────────────────
 node_push() {
   cat > /tmp/tvplay-node-src.sh <<'EOS'
 #!/bin/sh
-# tvplay-node-v19  协议版本串：加/改子命令时同步改 ensure_node 里的匹配串
+# tvplay-node-v20  协议版本串：加/改子命令时同步改 ensure_node 里的匹配串
+# v20: disp/drm_geo 先问播放器 `$HW -M`（probe+negotiate 唯一真源），sysfs 只兜底；
+#      起播放器时 VOUT_MODE 钉成协商结果，壳和屏不再各算一套几何
 # v19: 播放器落点 /root（老 /tmp 副本仍兼容）；进程匹配从 v4l2hevc-gl-aarch64 放宽到 [v]4l2hevc
 #      （二进制改名成 v4l2hevc-aarch64 后老模式一个都匹配不上；中括号避免 pkill 打到自己的 sh）
 # v18: disp 改成现场探测（fb0 applied 模式 → connector → EDID DTD），GEO 不再写死 2560x1440
@@ -97,13 +117,25 @@ edid_hz() {  # $1=edid 路径 → 首选 DTD 的刷新率 = pixclk/(htotal*vtota
   [ "$ht" -gt 0 ] && [ "$vt" -gt 0 ] || return 1
   echo $(( (pc * 10000 + ht * vt / 2) / (ht * vt) ))
 }
+hw_geo() {  # 问播放器自己：`$HW -M` = O_RDONLY 探屏 + 同一份 negotiate 策略
+  local m
+  [ -x "${HW:-}" ] || return 1
+  m=$(VOUT_MODE="${VOUT_MODE:-}" "$HW" -M 2>/dev/null | head -1)
+  case "$m" in [0-9]*x[0-9]*@[0-9]*) printf '%s\n' "$m"; return 0;; esac
+  return 1
+}
 drm_geo() {  # 当前生效的输出几何 WxH；取不到返回 1
   local d m
-  # ① fb0 的 U:WxHp 是内核真正 applied 的模式，最权威
+  # ① 播放器二进制说了算：probe+negotiate 只有一份（vout_mode.c），壳不再
+  #    另写一套 sysfs 猜测。两套逻辑一旦不一致，DSTGEO 就会和播放器实际
+  #    铺的模式错位 —— 画面缩到角上或上下黑边，事后极难归因。
+  #    -M 失败（老二进制/没部署/没显示器）才往下走 sysfs 兜底。
+  m=$(hw_geo) && { printf '%s\n' "${m%@*}"; return 0; }
+  # ② fb0 的 U:WxHp 是内核真正 applied 的模式，最权威
   m=$(sed -n 's/^[A-Za-z]*:\([0-9][0-9]*x[0-9][0-9]*\)[pi].*/\1/p' \
         /sys/class/graphics/fb0/modes 2>/dev/null | head -1)
   [ -n "$m" ] && { printf '%s\n' "$m"; return 0; }
-  # ② enabled 或 status=connected 的 connector
+  # ③ enabled 或 status=connected 的 connector
   for d in /sys/class/drm/card*-*; do
     m=$(head -1 "$d/modes" 2>/dev/null)
     [ -n "$m" ] || continue
@@ -112,7 +144,7 @@ drm_geo() {  # 当前生效的输出几何 WxH；取不到返回 1
     [ -n "$(cat "$d/mode" 2>/dev/null)" ] && m=$(cat "$d/mode")
     printf '%s\n' "$m"; return 0
   done
-  # ③ status 不可信时的最后兜底：任何有模式表的 connector
+  # ④ status 不可信时的最后兜底：任何有模式表的 connector
   for d in /sys/class/drm/card*-*; do
     m=$(head -1 "$d/modes" 2>/dev/null)
     [ -n "$m" ] && { printf '%s\n' "$m"; return 0; }
@@ -128,7 +160,11 @@ drm_hz() {  # 当前刷新率：cmdline 的 video= 优先（若哪天又写回�
   done
   printf '60\n'
 }
-disp_now() { printf '%s@%s\n' "$(drm_geo || echo '?')" "$(drm_hz)"; }
+disp_now() {  # 优先一次调用拿全 "WxH@R"（几何和刷新同源，别一半来自 sysfs）
+  local g
+  g=$(hw_geo) && { printf '%s\n' "$g"; return 0; }
+  printf '%s@%s\n' "$(drm_geo || echo '?')" "$(drm_hz)"
+}
 # 解码器真身 pid：pgrep -f 会误配到"命令行里带这个名字"的 shell（ssh/bash -c、
 # 甚至本脚本自己的等待循环），USR1 打到错进程上就是"按快进毫无反应 19 秒后整链重开"。
 # 所以一律按 /proc/PID/exe 校验，并优先用 play 落进 state 的 DECPID。
@@ -267,7 +303,16 @@ play)
   # 哑写者：O_RDWR 打开管道后 exec 成 sleep —— 同一个进程，fd 9 一直占着写端
   setsid nohup sh -c "exec 9<>'$VFIFO'; exec sleep 999999999" \
     >/dev/null 2>&1 </dev/null &
-  HW="$HW" VFIFO="$VFIFO" GEO="$GEO" LOG="$LOG" setsid nohup sh -c \
+  # VOUT_MODE 钉成已协商出的几何：DSTGEO（壳画的框）和播放器实际切/沿用的模式
+  # 同源，屏幕不支持时 vout_open 会打「降级 → …」并照常播，不会静默换分辨率。
+  # TM/TM_*/RENDER 一并透传：HDR 片源在盒子上 CPU 色调映射极吃 CPU（4K 一行
+  # tonemap 比解码本身贵一个量级），调参/关 TM 对比必须能从壳里直接给。
+  HW="$HW" VFIFO="$VFIFO" GEO="$GEO" LOG="$LOG" \
+    TM="${TM:-}" TM_TARGET="${TM_TARGET:-}" TM_SAT="${TM_SAT:-}" \
+    TM_GAIN="${TM_GAIN:-}" TM_SRC_PEAK="${TM_SRC_PEAK:-}" TM_KNEE="${TM_KNEE:-}" \
+    TMTIME="${TMTIME:-}" TMDIAG="${TMDIAG:-}" \
+    RENDER="${RENDER:-}" \
+    VOUT_MODE="${VOUT_MODE:-$GEO}" setsid nohup sh -c \
     'DSTGEO="$GEO+0+0" NOWRITE=1 PLAY=1 GLPLAY=1 "$HW" - < "$VFIFO" 2>>"$LOG"' \
     >>"$LOG" 2>&1 </dev/null &
   sleep 0.25
@@ -513,7 +558,7 @@ EOS
 }
 
 # 版本不符也重推：助手常驻 /tmp，只判 -x 会让旧协议一直生效（踩过：disp 子命令拿不到模式）
-ensure_node() { "${SSH[@]}" "test -x $NODE && grep -q tvplay-node-v19 $NODE" 2>/dev/null || \
+ensure_node() { "${SSH[@]}" "test -x $NODE && grep -q tvplay-node-v20 $NODE" 2>/dev/null || \
   node_push || { echo "✘ 无法部署盒端助手" >&2; return 1; }; }
 
 # ─────────────────────────── 索引 ───────────────────────────

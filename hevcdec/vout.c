@@ -32,6 +32,7 @@
 #include <drm/drm_fourcc.h>
 
 #include "vout.h"
+#include "vout_mode.h"
 #include "perfstat.h"
 
 #define VOUT_FB_MAX 64
@@ -484,13 +485,11 @@ bad:
 struct vout *vout_open(const char *drmdev)
 {
 	struct vout *v;
-	struct drm_mode_card_res res = {0};
-	static uint32_t crtcs[16], conns[16], encs[16];
-	static struct drm_mode_modeinfo modes[64];
 	const char *dev = drmdev ? drmdev : "/dev/dri/card0";
-	uint32_t enc_id = 0;
 	struct drm_mode_modeinfo mode = {0};
-	struct drm_mode_modeinfo want = {0};	/* 2560x1440@60 目标 */
+	struct vout_display disp;
+	struct vout_mode_choice mc;
+	char one[48];
 	int i;
 
 	v = calloc(1, sizeof(*v));
@@ -509,85 +508,49 @@ struct vout *vout_open(const char *drmdev)
 	v->dfd = open(dev, O_RDWR | O_CLOEXEC);
 	if (v->dfd < 0) { vdie(dev); goto fail; }
 
-	res.crtc_id_ptr = (uint64_t)(uintptr_t)crtcs; res.count_crtcs = 16;
-	res.connector_id_ptr = (uint64_t)(uintptr_t)conns; res.count_connectors = 16;
-	res.encoder_id_ptr = (uint64_t)(uintptr_t)encs; res.count_encoders = 16;
-	if (ioctl(v->dfd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0) { vdie("GETRESOURCES"); goto fail; }
-
-	/* 找一个已连接、有 mode 的 connector；优先它当前绑的 CRTC */
-	for (i = 0; i < (int)res.count_connectors && !v->conn_id; i++) {
-		struct drm_mode_get_connector gc = {0};
-		uint32_t myenc = 0;
-		int j, nmode;
-
-		gc.connector_id = conns[i];
-		gc.modes_ptr = (uint64_t)(uintptr_t)modes;
-		gc.count_modes = 64;
-		gc.encoders_ptr = (uint64_t)(uintptr_t)&myenc;
-		gc.count_encoders = 1;
-		if (ioctl(v->dfd, DRM_IOCTL_MODE_GETCONNECTOR, &gc) < 0) continue;
-		/* 必须只认 connected 的 connector：X96 上 card0 同时挂着
-		 * Composite-1（CVBS，status=unknown）和 HDMI-A-1，前者排在
-		 * 前面且带 720x576i/720x480i 模式。只看 count_modes 会选中
-		 * CVBS → 输出 720x576@50、HDMI 上什么也没有、vout 队列瞬间
-		 * 堵死（"queue full, drop"）。 */
-		if (gc.connection != 1 /* DRM_MODE_CONNECTED */)
-			continue;
-		if (!gc.count_modes) continue;
-		nmode = gc.count_modes > 64 ? 64 : (int)gc.count_modes;
-
-		v->conn_id = conns[i];
-		/* 目标模式写死 2560x1440@60：这台显示器只有这一个模式，屏幕
-		 * 是固定的，选别的分辨率要么黑屏要么走 scaler。先按 (宽,高,刷新)
-		 * 精确找；找不到再退化为"取最大面积（<=4096 宽）"，最后兜底
-		 * modes[0]，别让 EDID 顺序决定结果。
-		 */
-		for (j = 0; j < nmode; j++) {
-			if (modes[j].hdisplay != 2560 || modes[j].vdisplay != 1440)
-				continue;
-			if (!want.hdisplay ||
-			    abs((int)modes[j].vrefresh - 60) <
-			    abs((int)want.vrefresh - 60))
-				want = modes[j];
-		}
-		if (want.hdisplay) {
-			mode = want;
-		} else {
-			for (j = 0; j < nmode; j++) {
-				if (modes[j].hdisplay > 4096) continue;
-				if (modes[j].hdisplay * modes[j].vdisplay >
-				    mode.hdisplay * mode.vdisplay)
-					mode = modes[j];
-			}
-			if (!mode.hdisplay) mode = modes[0];
-			fprintf(stderr, "VOUT: 没有 2560x1440@60，退化为 %ux%u@%u\n",
-				mode.hdisplay, mode.vdisplay, mode.vrefresh);
-		}
-		enc_id = gc.encoder_id ? gc.encoder_id : myenc;
+	/* ---- 显示能力（只读探测，桌面在跑也安全） ----
+	 * 拆成两件事：这里是"屏幕支持什么"（事实），下面 negotiate 是
+	 * "盒子输出什么"（策略）。以前两者写死在同一个循环里，换个显示器
+	 * 就得到不同结果，还没法解释。 */
+	if (vout_display_probe(v->dfd, &disp) < 0) {
+		fprintf(stderr, "VOUT: 没有已连接的显示设备\n");
+		goto fail;
 	}
-	if (!v->conn_id) { fprintf(stderr, "VOUT: 没有已连接的 connector\n"); goto fail; }
-	if (!mode.hdisplay) { fprintf(stderr, "VOUT: 没有可用 mode\n"); goto fail; }
+	v->conn_id = disp.conn_id;
+	v->crtc_id = disp.crtc_id;
+	v->crtc_idx = disp.crtc_idx;
+	if (!v->crtc_id) { fprintf(stderr, "VOUT: 没有 CRTC\n"); goto fail; }
 
+	/* ---- 输出模式：VOUT_MODE 只是偏好，显示设备才是权威 ----
+	 * 不做就降级 auto 并把 why 打出来——静默换分辨率是最难查的一类问题
+	 * （画面在放，只是变糊了，或者上下有黑边）。
+	 *   VOUT_MODE 缺省           跟随屏幕当前模式
+	 *   VOUT_MODE=2560x1440@60   精确要这条
+	 *   VOUT_MODE=1080p / WxH    只给尺寸
+	 *   VOUT_MODE=preferred      EDID 首选（别管现在跑的是什么）
+	 *   VOUT_MODE=max            支持的最大面积（<=4096 宽） */
+	if (vout_mode_negotiate(&disp, getenv("VOUT_MODE"), &mc) < 0) {
+		struct vout_mode_choice alt;
+
+		fprintf(stderr, "VOUT: %s\n", mc.why);
+		if (vout_mode_negotiate(&disp, NULL, &alt) < 0) {
+			fprintf(stderr, "VOUT: %s\n", alt.why);
+			goto fail;
+		}
+		fprintf(stderr, "VOUT: 降级 → %s\n", alt.why);
+		mc = alt;
+	}
+	mode = mc.mode;
+	if (!mode.hdisplay) { fprintf(stderr, "VOUT: 没有可用 mode\n"); goto fail; }
+	/* 目标几何：rect_calc / fit 全靠 v->dw/dh 算目标矩形，这里不落值就是
+	 * 0x0 —— 帧照样提交、SETPLANE 也不报错，只是永远"没上屏"：节拍等不到
+	 * 显示完成，解码线程停止取流，6s 后看守重起供流，屏上一直是黑的。 */
 	v->dw = mode.hdisplay;
 	v->dh = mode.vdisplay;
-	v->refresh = mode.vrefresh ? mode.vrefresh : 60;
-	/* latch 间隔超过 1.5 个刷新周期就是掉槽，阈值随实际刷新率走 */
-	v->h_int.budget = 1500.0 / v->refresh;
-	v->h_int.slot_unit = 1000.0 / v->refresh;	/* 间隔按 vblank 槽记账 */
-	v->h_late.slot_unit = 1000.0 / v->refresh;
-
-	/* encoder → crtc */
-	if (enc_id) {
-		struct drm_mode_get_encoder ge = {0};
-
-		ge.encoder_id = enc_id;
-		if (ioctl(v->dfd, DRM_IOCTL_MODE_GETENCODER, &ge) == 0)
-			v->crtc_id = ge.crtc_id;
-	}
-	if (!v->crtc_id && res.count_crtcs) v->crtc_id = crtcs[0];
-	if (!v->crtc_id) { fprintf(stderr, "VOUT: 没有 CRTC\n"); goto fail; }
-	for (i = 0; i < (int)res.count_crtcs; i++)
-		if (crtcs[i] == v->crtc_id) v->crtc_idx = i;
+	vout_mode_fmt(&mode, one, sizeof(one));
+	printf("VOUT: %s 输出 %s（%s）\n", disp.name, one,
+	       vout_mode_src_name(mc.src));
+	vout_geo_publish(one);
 
 	if (primary_bring_up(v, &mode) < 0) goto fail;
 

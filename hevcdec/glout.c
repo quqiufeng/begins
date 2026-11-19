@@ -27,8 +27,10 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>
+#include <drm/drm_mode.h>
 #include "perfstat.h"
 #include "osd.h"
+#include "vout_mode.h"	/* 输出模式的唯一策略：probe + negotiate（和 DRM 平面路径共用） */
 typedef void (*pfn_image_tex)(GLenum, void *);
 int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 		unsigned ypitch, unsigned cpitch);
@@ -671,6 +673,55 @@ static double mode_fps(const drmModeModeInfo *m)
 	return m->vrefresh ? (double)m->vrefresh : 60.0;
 }
 
+/* vout_mode.c 用的是内核 uapi 的 drm_mode_modeinfo，glout 用 libdrm 的
+ * drmModeModeInfo：后者就是照抄前者（字段顺序/宽度一致），显式转一遍比
+ * memcpy 稳——哪天 libdrm 动了一个字段，memcpy 会静默错位。 */
+static drmModeModeInfo mode_from_modeinfo(const struct drm_mode_modeinfo *m)
+{
+	drmModeModeInfo o;
+
+	memset(&o, 0, sizeof(o));
+	o.clock = m->clock;
+	o.hdisplay = m->hdisplay;
+	o.hsync_start = m->hsync_start;
+	o.hsync_end = m->hsync_end;
+	o.htotal = m->htotal;
+	o.hskew = m->hskew;
+	o.vdisplay = m->vdisplay;
+	o.vsync_start = m->vsync_start;
+	o.vsync_end = m->vsync_end;
+	o.vtotal = m->vtotal;
+	o.vscan = m->vscan;
+	o.vrefresh = m->vrefresh;
+	o.flags = m->flags;
+	o.type = m->type;
+	snprintf(o.name, sizeof(o.name), "%s", m->name);
+	return o;
+}
+
+static struct drm_mode_modeinfo mode_to_modeinfo(const drmModeModeInfo *m)
+{
+	struct drm_mode_modeinfo o;
+
+	memset(&o, 0, sizeof(o));
+	o.clock = m->clock;
+	o.hdisplay = m->hdisplay;
+	o.hsync_start = m->hsync_start;
+	o.hsync_end = m->hsync_end;
+	o.htotal = m->htotal;
+	o.hskew = m->hskew;
+	o.vdisplay = m->vdisplay;
+	o.vsync_start = m->vsync_start;
+	o.vsync_end = m->vsync_end;
+	o.vtotal = m->vtotal;
+	o.vscan = m->vscan;
+	o.vrefresh = m->vrefresh;
+	o.flags = m->flags;
+	o.type = m->type;
+	snprintf(o.name, sizeof(o.name), "%s", m->name);
+	return o;
+}
+
 static int kms_pick(void)
 {
 	drmModeRes *res = drmModeGetResources(g.dfd);
@@ -689,7 +740,25 @@ static int kms_pick(void)
 		if (c) drmModeFreeConnector(c);
 	}
 	if (!conn) { printf("GLOUT: 没有已连接的显示器\n"); return -1; }
-	g.mode = conn->modes[0];	/* 首选模式 */
+	/* 输出模式：VOUT_MODE 只是偏好，屏幕才是权威 —— 和 vout.c 共用
+	 * vout_mode.c 的那一套。以前这里直接拿 modes[0]，于是 VOUT_MODE 对 GL
+	 * 路径完全无效：同一个二进制换个 RENDER 就输出不同几何，壳按 `-M`
+	 * 算出的 DSTGEO 跟着错位（画面缩到角上/多出黑边，事后极难归因）。
+	 * 协商结果必然来自这台屏的 EDID 表，所以拿去 drmModeSetCrtc 是安全的。 */
+	{
+		struct vout_display vd;
+		struct vout_mode_choice mc;
+
+		if (vout_display_probe(g.dfd, &vd) == 0 && vd.conn_id == g.conn_id &&
+		    vout_mode_negotiate(&vd, getenv("VOUT_MODE"), &mc) == 0) {
+			g.mode = mode_from_modeinfo(&mc.mode);
+			/* why 里已经含来龙去脉（"auto → 3840x2160@60（…）"），
+			 * 别再套一层括号，日志是给人看的。 */
+			printf("GLOUT: 模式协商 %s\n", mc.why);
+		} else {
+			g.mode = conn->modes[0];	/* 兜底：EDID 首选 */
+		}
+	}
 	g.dw = g.mode.hdisplay;
 	g.dh = g.mode.vdisplay;
 	if (g.dw == 0 || g.dh == 0) {	/* 有些 EDID 首选模式不可用 */
@@ -751,6 +820,14 @@ static int kms_pick(void)
 		g.crtc_id = res->crtcs[0];
 	drmModeFreeConnector(conn);
 	drmModeFreeResources(res);
+	{	/* 事实出口：GL 路径也要落 /tmp/vout-geo，否则壳/监控读到的还是
+		 * 上一次 DRM 平面路径（或根本没有）的几何。 */
+		struct drm_mode_modeinfo mi = mode_to_modeinfo(&g.mode);
+		char geo[48];
+
+		vout_mode_fmt(&mi, geo, sizeof(geo));
+		vout_geo_publish(geo);
+	}
 	printf("GLOUT: 屏幕 %ux%u@%u crtc=%u conn=%u\n", g.dw, g.dh,
 	       g.mode.vrefresh, g.crtc_id, g.conn_id);
 	/* 刷新周期按 mode 算，不用 vrefresh：后者常被驱动凑整，2560x1440@60

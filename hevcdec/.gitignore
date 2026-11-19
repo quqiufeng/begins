@@ -5,6 +5,10 @@ v4l2hevc-aarch64
 *.yuv
 # 自检程序（make raptest / hdr-selftest / csigtest）
 raptest
+voutprobe
+modetest
+# 发布快照（make dist 生成，随时可重建；历史版本走 tag/附页）
+dist/
 hdr-selftest
 hdrtest
 csigtest

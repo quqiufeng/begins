@@ -34,10 +34,10 @@ GL_LIBS  := $(CROSSLIB)/libEGL.so.1 $(CROSSLIB)/libGLESv2.so.2 $(CROSSLIB)/libgb
 GL_CFLAGS := -O2 -Wall -Wformat
 
 # 播放器 = 主循环 + Renderer 分发 + 两个后端 + vout
-PLAY_SRC := v4l2hevc.c spscolor.c render.c render_drm.c render_gl.c vout.c aout.c pctl.c osd.c
-PLAY_HDR := render.h vout.h hdrcolor.inc csig.h spscolor.h aout.h pctl.h rcmap.h osd.h
+PLAY_SRC := v4l2hevc.c spscolor.c render.c render_drm.c render_gl.c vout.c vout_mode.c aout.c pctl.c osd.c
+PLAY_HDR := render.h vout.h vout_mode.h hdrcolor.inc csig.h spscolor.h aout.h pctl.h rcmap.h osd.h
 
-.PHONY: all clean probe pctlffi drm gl vout voutprobe glselftest aout aoutprobe hdrselftest mpvctl rcd
+.PHONY: all clean modetest probe pctlffi drm gl vout voutprobe glselftest aout aoutprobe hdrselftest mpvctl rcd
 
 all: $(BIN)
 
@@ -62,8 +62,8 @@ GLSELF := glselftest-aarch64
 
 glselftest: $(GLSELF)
 
-$(GLSELF): gl-selftest.c glout.c osd.c $(PLAY_HDR) $(GL_LIBS)
-	aarch64-linux-gnu-gcc $(GL_CFLAGS) -DGLOUT_NO_MAIN -o $@ gl-selftest.c glout.c osd.c \
+$(GLSELF): gl-selftest.c glout.c osd.c vout_mode.c $(PLAY_HDR) $(GL_LIBS)
+	aarch64-linux-gnu-gcc $(GL_CFLAGS) -DGLOUT_NO_MAIN -o $@ gl-selftest.c glout.c osd.c vout_mode.c \
 	  -idirafter /usr/include -idirafter /usr/include/libdrm -lm $(GL_LIBS)
 
 # aout: 独立音频输出模块（裸 ALSA ioctl，不用 mpv/libasound 做输出）
@@ -116,12 +116,16 @@ vout.o: vout.c vout.h
 vout-aarch64.o: vout.c vout.h
 	aarch64-linux-gnu-gcc -O2 -Wall -Wextra -static -c -o $@ $<
 
-# 自检：probe 只读（桌面在跑也安全），run 会接管 CRTC
-voutprobe: vout-selftest.c vout.c vout.h
-	$(CC_HOST) -O2 -Wall -Wextra -o $@ vout-selftest.c vout.c -lm
+# 协商逻辑离线单测：不需要设备，喂假 EDID 模式表验策略（auto/别名/50Hz/交错）
+modetest: vout-mode-test.c vout_mode.c vout_mode.h
+	$(CC_HOST) -O2 -Wall -Wextra -o $@ vout-mode-test.c vout_mode.c
 
-voutprobe-aarch64: vout-selftest.c vout.c vout.h
-	aarch64-linux-gnu-gcc -O2 -Wall -Wextra -static -o $@ vout-selftest.c vout.c -lm
+# 自检：probe 只读（桌面在跑也安全），run 会接管 CRTC
+voutprobe: vout-selftest.c vout.c vout_mode.c vout.h vout_mode.h
+	$(CC_HOST) -O2 -Wall -Wextra -o $@ vout-selftest.c vout.c vout_mode.c -lm
+
+voutprobe-aarch64: vout-selftest.c vout.c vout_mode.c vout.h vout_mode.h
+	aarch64-linux-gnu-gcc -O2 -Wall -Wextra -static -o $@ vout-selftest.c vout.c vout_mode.c -lm
 
 # 提示条离线自检（osd.c 的同一份代码烘 PPM，改文案/字形后肉眼看一遍）
 osdtest: osd-selftest.c osd.c osd.h
@@ -186,5 +190,5 @@ clean:
 	      glselftest glselftest-aarch64 \
 	      aout aout-aarch64 aoutctl aoutctl-aarch64 aoutprobe-aarch64 \
 	      mpvctl mpvctl-aarch64 rcinputd rcinputd-aarch64 \
-	      vout.o vout-aarch64.o voutprobe voutprobe-aarch64 raptest hdr-selftest hcvisual osdtest osd.ppm \
+	      vout.o vout-aarch64.o voutprobe voutprobe-aarch64 modetest raptest hdr-selftest hcvisual osdtest osd.ppm \
 	      libpctl.so libpctl-aarch64.so

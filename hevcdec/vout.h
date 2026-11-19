@@ -83,7 +83,17 @@ struct vout_stats {
 	int pending;		/* 交了但还没收到回调的帧数（含上一帧） */
 };
 
-/* drmdev 为 NULL 时取 /dev/dri/card0。失败返回 NULL 并已打日志。 */
+/* drmdev 为 NULL 时取 /dev/dri/card0。失败返回 NULL 并已打日志。
+ *
+ * 输出分辨率不再写死：open 时先调 vout_display_probe() 问「屏幕支持什么」，
+ * 再按环境变量 VOUT_MODE 协商「输出什么」（见 vout_mode.h）。
+ *   VOUT_MODE 未设        跟随屏幕当前模式（没有就 EDID 首选）
+ *   VOUT_MODE=1080p       只给尺寸：720p/1080p/1440p/2160p/4k 或 WxH
+ *   VOUT_MODE=2560x1440@60  精确要这条
+ *   VOUT_MODE=preferred   忽略当前模式，用 EDID 首选
+ *   VOUT_MODE=max         支持的最大面积（<=4096 宽）
+ * 屏幕不支持请求的尺寸时不硬上：打日志后降级 auto，实际用的模式在
+ * "VOUT: <conn> 输出 WxH@R（来源）" 这行里。 */
 struct vout *vout_open(const char *drmdev);
 
 /* ---------- 同步接口（深度 1，老行为） ----------
