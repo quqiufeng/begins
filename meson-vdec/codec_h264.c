@@ -38,6 +38,10 @@
 /* Size of Motion Vector per macroblock */
 #define MB_MV_SIZE	96
 
+/* G12A 固件的 H.264 参考槽表大小：AV_SCRATCH_0 的 (refs-1) 字段只能到 3，
+ * 写到 4 固件直接停摆（详见 codec_h264_src_change 里的说明）。 */
+#define H264_MAX_REF_SLOTS	4
+
 /* Frame status data */
 #define PIC_STRUCT_BIT	5
 #define PIC_STRUCT_MASK	GENMASK(2, 0)
@@ -340,7 +344,26 @@ static void codec_h264_src_change(struct amvdec_session *sess)
 	/* Number of macroblock lines */
 	h264->mb_height = mb_total / h264->mb_width;
 
+	/*
+	 * G12A 固件的 H.264 参考槽表只有 4 项：AV_SCRATCH_0 里“参考槽数 - 1”
+	 * 那个字节（bit[15:8]）写到 4 就会让固件在第一个 AU 后彻底停摆——
+	 * 不进 ISR、不出帧、6 个码流 buffer 全卡在驱动里，用户态只能看到
+	 * “1.6s 无新帧”然后重建会话。写 3 一切正常（实测 ref_field=5 配
+	 * refm1=3 能跑完 48 帧，ref_field=4 配 refm1=4 立刻卡死）。
+	 *
+	 * SPS 允许 max_num_ref_frames 到 16，所以这里按硬件能力截断到 4：
+	 * 这类流仍然能解码出帧、能跑完，不再整段卡死，代价是最老的参考帧
+	 * 被覆盖复用——画面在快速运动/长时间无 IDR 时会有可见错误（实测
+	 * x264 ref=8 的流 PSNR 约 16dB，ref<=4 正常）。要完美就得在用户态
+	 * 检出 refs>4 时回退软解，那是另一件事。
+	 * ref_size 仍按上游的 16 槽分配，只多占内存、不会越界。
+	 */
 	h264->max_refs = ((parsed_info >> MAX_REF_BIT) & MAX_REF_MASK) + 1;
+	if (h264->max_refs > H264_MAX_REF_SLOTS) {
+		dev_dbg(core->dev, "max_refs %u > HW limit %u, clamped\n",
+			h264->max_refs, H264_MAX_REF_SLOTS);
+		h264->max_refs = H264_MAX_REF_SLOTS;
+	}
 
 	crop_infor = amvdec_read_dos(core, AV_SCRATCH_6);
 	crop_bottom = (crop_infor & 0xff);
