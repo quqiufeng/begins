@@ -329,7 +329,7 @@ RESET(in-session)
 **1. seek 黑屏跟软重置无关，但也不是"发个信号就没了"（两个坑连在一起）**
 
 `design_player.md` §6 第 2 条"seek 黑 0.8 s"的成因是**整链重开**，不是会话重建：
-`tvplay-node.sh` 的 `restart_at()` 走的是 `sh "$0" play ...`，`pkill -9 -f v4l2hevc-aarch64`
+壳的 `restart_at()`（v4 的 `tvplay-node.sh`，v19 已并入 `tvplay.sh`）走的是 `sh "$0" play ...`，`pkill -9 -f v4l2hevc-aarch64`
 把持 DRM master 的进程打死，屏幕才掉回内核控制台文本（`X96Max-Player.md` §5.4）。
 
 **但"把 `restart_at` 改成 `kill -USR1`"是错的**，这一步今天必须记下来，否则会被当成
@@ -381,10 +381,10 @@ RESET(in-session)
 
 | 检查 | 手段 | 判据 |
 |---|---|---|
-| 管道两侧是兄弟进程 | 读 `tvplay-node.sh:104-110` 的 `sh -c 'ffmpeg … \| … "$HW" -'` | 找不到"杀掉 ffmpeg 后 `v4l2hevc` 还在跑"的路径 |
+| 管道两侧是兄弟进程 | 读壳（v4 起就是 `sh -c 'ffmpeg … \| … "$HW" -'`） | 找不到"杀掉 ffmpeg 后 `v4l2hevc` 还在跑"的路径 |
 | 上游死 → 下游 EOF | `v4l2hevc.c:930-940`：`r==0` → `s_eof=1` → 退流 | 只有 `EINTR && g_reinit` 才有"不退出"的出口，EOF 没有 |
 | 信号无载荷 | `on_usr1` 只置 `g_reinit`，`sig_atomic_t` | 无 target/offset 字段可传 |
-| 位置只在 ffmpeg 参数里 | `grep -n '\-ss' tvplay-node.sh` | `-ss` 出现处全在 ffmpeg 命令行，C 侧无 seek ioctl |
+| 位置只在 ffmpeg 参数里 | `grep -n '\-ss' tvplay.sh`（壳助手的 `feed` 子命令） | `-ss` 出现处全在 ffmpeg 命令行，C 侧无 seek ioctl |
 
 四条都能用 static 检查在本地做完，判据是"反例不存在"而不是"实验成功"。
 这就是为什么轨 A 现在就能结题，而板子在不在都不影响。

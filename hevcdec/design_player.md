@@ -6,7 +6,7 @@
 - **Renderer A（`drm`）**：NV12 dma-buf 直挂 KMS overlay plane，零拷贝 + vblank 节拍器（`vout.c`）
 - **Renderer B（`gl`）**：EGL/GBM + panfrost GLES3，dmabuf 当纹理，shader 里做 HDR10→SDR（`glout.c`）
 - 两者同一接口 `render.h`，运行期 `RENDER=drm|gl` 切换；**不存在两套播放器**
-- **遥控器控制**：`rcinputd` → `tvplay-node.sh key` → 暂停/拖动/音量/退出
+- **遥控器控制**：`rcinputd` → 壳的 `key` 子命令（盒子上是 `/tmp/tvplay-node.sh`，源码即 `tvplay.sh` 内嵌 v19）→ 暂停/拖动/音量/退出
 
 硬件：Amlogic S905X2（X96Max）/ meson-vdec `/dev/video0` / panfrost G31 /
 DPU 主平面只收 RGB / HDMI 2560x1440@60（`video=HDMI-A-1:2560x1440@60`）。
@@ -163,7 +163,7 @@ ffmpeg 崩/被杀 → pipe 关闭 → read() 返回 0 → s_eof=1 → stream_don
 ```
 
 EOS 就是这么来的：**正常播完和 ffmpeg 挂掉走的是同一条路**。
-壳（`tvplay-node.sh`）只把 `| hevcdec` 的退出码当整条链的结果，拿不到前半段。
+壳（助手脚本）只把 `| hevcdec` 的退出码当整条链的结果，拿不到前半段。
 表现是播到一半画面冻在最后一帧、`pos()` 还在走、遥控器"有反应但不生效"。
 
 反例更糟：ffmpeg 卡住不吐字节（HTTP 断流、磁盘 IO hang）时，主循环阻塞在 `read()` 里，
@@ -212,7 +212,7 @@ EOS 就是这么来的：**正常播完和 ffmpeg 挂掉走的是同一条路**�
 
 ### 1.7 参数集探测（SPS）
 
-- 输入 `argv[1]` 可以是文件，也可以是 `-`（stdin 管道，`tvplay-node.sh` 用的就是这条）。
+- 输入 `argv[1]` 可以是文件，也可以是 `-`（stdin 管道，壳的 `play` 起的命名管道走的就是这条）。
 - 只预读一小段（`PREFILL`，默认 1 MiB）用于求 SPS；管道里还没读到 SPS 时再预读 4 MiB 重试一次。
 - `sps_size()` 自己解析 VPS/SPS/PPS 取真实宽高，失败才用 `argv[2]/argv[3]` 或默认 640x360。
   坑：`conformance_window` 的 `crop_left/right/top/bottom` 必须**紧跟 flag** 读，
@@ -341,7 +341,7 @@ GL 那摊已经为"静态链"付过一次这样的学费了。
 那收益值不值？**真 PTS 这一项就够格，因为现在的窟窿是硬的**：
 
 - `v4l2hevc.c:379-380` 把 output buffer 的 timestamp 硬编码成 `g_au_seq / 25` —— 25 fps 是焊死的；
-- 而配速默认值在 `:1599` 是 `24.0`，`tvplay-node.sh` 又按 `FPS=` 传 0（=不限速）；
+- 而配速默认值在 `:1599` 是 `24.0`，壳又按 `FPS=` 传 0（=不限速）；
 - 也就是说**同一个片子，送帧时按 25 算、上屏时按 24 算或不限速**，两个数都跟片源无关。
   1080p 以下看不出（24/25 差 4%），4K 就是 §3.5 记的"快 15%"那类漂移的放大器。
 - 附带白拿：`duration`（现在 `probe` 要 fork 一次 `ffprobe` 只为拿一个数，
@@ -368,7 +368,7 @@ GL 那摊已经为"静态链"付过一次这样的学费了。
 
 一句话：**hevcdec 里没有一行音频代码**（`v4l2hevc.c` 全文 grep `audio|alsa` 为空），
 声音由第二条命令 `mpv --no-video --ao=alsa --audio-device=alsa/hw:0,0` 独立出声，
-两边唯一的约定是**同一个 `--start`**（`tvplay-node.sh:79-86`）。
+两边唯一的约定是**同一个 `--start`**（`play` 的 mpv 分支与解码器同一处起算）。
 
 | 环节 | 谁做 |
 |---|---|
@@ -633,7 +633,7 @@ ADDFB2
 
 目标矩形只跟源尺寸有关，`play_rect()` 里缓存（`rect_ok/rsw/rsh`）。
 `DSTGEO=WxH+X+Y` 是**一次性**强制覆盖，用于单变量排查缩放/尺寸；
-`tvplay-node.sh` 就是把显示器几何 `2560x1440` 从这里传进来。
+壳就是把显示器几何 `2560x1440` 从这里传进来。
 
 ### 2.4 节拍器：vblank 序列，不是 usleep
 
@@ -838,7 +838,7 @@ LUT 上传成 `RGBA32F` 纹理（`GLLUT8=1` 可退成 RGBA8 省带宽）。
 
 方案 B 没有 vblank 节拍器（`FPS` 对它无效），谁先出帧谁上屏。
 不靠 `ffmpeg -re` 就会按解码速度播放（4K 实测快 15%，1080p 会飞）。
-`tvplay-node.sh` 因此在供流命令里硬编码 `-re`。
+壳因此在供流命令（`feed`）里硬编码 `-re`。
 
 ### 3.6 性能变体：GL 只做源分辨率映射，放大交给 DPU（未并入主干）
 
@@ -1181,7 +1181,7 @@ DPU 能省的只剩 pass2 那次放大（1080p→720p 的拷贝），0.5 ms 是�
   长片必然缓慢漂移；`-re` 本身也是按平均码率，不做音频对齐。
 - **seek 不再黑屏，但只在新壳上**：`play.sh key` 现在先问播放器控制口
   （spawn 模式下 kill 子 ffmpeg + 新 `-ss` 重开 + 重建 V4L2 会话，DRM/GL 不放手，
-  §5.4），接不住才退回整链重开。老前端 `tvplay-node.sh` 仍直接 `restart_at`，
+  §5.4），接不住才退回整链重开。老前端（v4 的 `tvplay-node.sh`；v19 已并入 `tvplay.sh`，seek 走 `feed`）仍直接 `restart_at`，
   走的是整链重开（~0.8 s 黑屏）。
 - **不能换码流**：一个 V4L2 会话只能吃一条流，任何跳变都走 `g_reinit`
   （重开 `/dev/video0`），固件真 hang 时还要 `g_hard_reset_on_reinit` 整块复位。
@@ -1205,7 +1205,7 @@ DPU 能省的只剩 pass2 那次放大（1080p→720p 的拷贝），0.5 ms 是�
 ```
 2.4G 遥控器 (evdev /dev/input/eventN)
    │  rcinputd（EVIOCGRAB 独占）
-   ▼  exec /tmp/tvplay-node.sh key <动作名>
+   ▼  exec /tmp/tvplay-node.sh key <动作名>   ← 盒子上这份由 tvplay.sh 内嵌 v19 解出
 tvplay-node.sh key   ← 语义全在这里（暂停/拖动/音量/退出）
    ├─ pkill -STOP/-CONT 整条 HEVC 链（视频 + ffmpeg + 音频 mpv）
    ├─ mpvctl + /tmp/tvplay.sock（mpv IPC：音量/静音）
@@ -1332,7 +1332,7 @@ state 里的参数重新执行 `play hevc <KEYB64> <T> …`（每个参数都必
 | `alive` | → 进程数 |
 | `log` | `tail -N /tmp/tvplay.log` |
 
-版本串 `tvplay-node-v4` 写在脚本头部，加/改子命令时前端 `ensure_node` 的匹配串要同步改。
+版本串写在内嵌脚本头部（v4 是 `tvplay-node-v4`，当前线上是 `tvplay-node-v19`），加/改子命令时 `tvplay.sh` 的 `ensure_node` 匹配串要同步改。仓库里不再保存独立副本。
 
 ### 5.6 起播与部署
 

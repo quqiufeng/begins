@@ -127,7 +127,7 @@ target_vbl = slot(τ_us + L_total) - 1    /* 再往前让出 L_d 那一槽，否
 
 ```
 ┌─ 控制面（壳）─────────────────────────────────────┐
-│ tvplay-node.sh   意图: play/pause/seek/stop       │
+│ tvplay.sh        意图: play/pause/seek/stop       │
 │   只写意图: URL GEO START PAUSE_AT                │
 └───────────────────────────────────────────────────┘
        │ fork/exec                  │ mpvctl IPC
@@ -203,7 +203,7 @@ PLAYING ──seek──→ SEEKING ──拿到 IRAP──→ PLAYING
 
 架构变没变，看删了什么最清楚：
 
-- `ffmpeg -re`，及 `tvplay-node.sh:74-77` 那段 4 行解释注释
+- `ffmpeg -re`，及 `tvplay.sh` 内嵌 v19 `feed` 子命令里解释 `-re` 的那段注释
 - `b.timestamp = g_au_seq / 25`
 - `g_hard_reset_on_reinit`
 - `HDR=` 环境推断、`TM_SRC_PEAK` 默认 1000
@@ -527,11 +527,11 @@ x86/arm64 上配 `__ATOMIC_ACQUIRE` 足够，不需 barrier 指令。
 一句话：**终态必须是一个进程；`mpv --no-video` + `hevcdec` 两条链并存只是过渡结构，不是架构。**
 
 现状不是"一个播放器 + 一个音频工具"，而是**两个各自独立、互不知情的播放器**：
-mpv 自己解容器、自己配 ALSA、自己计时、自己 seek（`tvplay-node.sh:83-88`）；
-hevcdec 自己拉 ffmpeg 管道、靠 `-re` 被动流出、按帧计数上屏（`:93`）。
+mpv 自己解容器、自己配 ALSA、自己计时、自己 seek（`tvplay.sh` 内嵌 v19 的 `play` 子命令，mpv 分支）；
+hevcdec 自己拉 ffmpeg 管道、靠 `-re` 被动流出、按帧计数上屏（`feed` 子命令的 `ffmpeg -re`）。
 两者之间共享的东西只有三样：同一个 `$STATE` 文件、同一个 `$URL`、以及壳手工维护的 `START`/`OFF` 两个数。
 
-壳的注释已经把这层窗户纸捅破了一次（`tvplay-node.sh:172-174`）：
+壳的注释已经把这层窗户纸捅破了一次（`tvplay.sh` 内嵌 v19 `key toggle` 分支的注释）：
 "画面(v4l2hevc/ffmpeg)和声音(独立 mpv)是两个进程，只 toggle mpv 只会哑掉声音、画面照跑 ——
 必须整条 STOP/CONT"。**"必须整条"就是架构在报警**：任何一次用户操作都得同时打到两条链上，
 且没有任何一方知道另一方是否成功。
@@ -544,7 +544,7 @@ hevcdec 自己拉 ffmpeg 管道、靠 `-re` 被动流出、按帧计数上屏（
 
 | 开环补偿 | 位置 | 本该闭环的量 | 为什么开环修不了 |
 |---|---|---|---|
-| `-re` 上游节流 | `tvplay-node.sh:93` | **节拍** | 容器时间基在 ffmpeg 进程里，播放器读不到；换 VFR / 25÷1.001 片源就换节拍，无人观测（§2.2.1 M1） |
+| `-re` 上游节流 | `feed` 的 `ffmpeg -re` | **节拍** | 容器时间基在 ffmpeg 进程里，播放器读不到；换 VFR / 25÷1.001 片源就换节拍，无人观测（§2.2.1 M1） |
 | `LEAD=6` 缓冲深度 | `v4l2hevc.c:1261`，判据 `:1469-1473` | **领先量 `pts - τ`** | 只限制"喂了几帧"，不知道"差多少毫秒"；掉帧与堆积都不可见 |
 | `START`/`OFF` 的 `sed` 修补 | `:122`、`:201-202` | **位置** | 暂停时长、seek 目标靠事后改状态文件补齐，两条链各自重来一遍 |
 
@@ -562,7 +562,7 @@ hevcdec 自己拉 ffmpeg 管道、靠 `-re` 被动流出、按帧计数上屏（
 都没有错——错在没人能同时看见两边。加一个参数只会多一个开环旋钮，
 今天 `START`/`OFF`/`LEAD`/`FPS`/`-re` 五个旋钮已经互相补偿到没人能解释画面为什么对。
 
-**为什么现在不立刻合并**：音频外包的唯一硬理由写在 `tvplay-node.sh:80`——
+**为什么现在不立刻合并**：音频外包的唯一硬理由写在 `tvplay.sh` 内嵌 v19 `feed` 的顶部注释——
 "ffmpeg 的 `-f alsa` 在这块板子上缓冲太浅（8s 15 次 xrun）"。
 这个理由今天仍然成立，而它的解法不是"再找一个播放器"，是 `aout` 自己管 ring
 （170 ms 缓冲 + 42.7 ms period 上报，§2.1.1）。**合并的前提是 `aout` 能替代 mpv 的音频能力，
@@ -596,16 +596,21 @@ hevcdec 自己拉 ffmpeg 管道、靠 `-re` 被动流出、按帧计数上屏（
 
 ### 2.2.1 台账：现在同时存在五个钟，彼此不一致
 
-台账按**代码行号**核过一遍（`v4l2hevc.c` 1774 行、`tvplay-node.sh` 250 行，均当日版本）。
+台账按**代码行号**核过一遍（`v4l2hevc.c` 1774 行、壳助手 `tvplay.sh` 内嵌 v19 共 452 行，均当日版本）。
+
+> **引用口径**：仓库里原先那份 `hevcdec/tvplay-node.sh`（v4）已删除——线上跑的是 v19，
+> 源码即 `tvplay.sh` 里内嵌的那份脚本（`cat tvplay.sh` 可见 57–510 行整段）。
+> 本文不再引用它的行号（v4/v19 行号差一倍多，引了必然过期），一律按**子命令名**定位：
+> `feed`（供流）/ `play`（起播，含 mpv 分支）/ `key`（遥控器动作）/ `state`（位置查询）。
 每一行都写清“谁写、谁读、删给哪一步”——只列名字不列行号的台账，一个月后就对不上代码了。
 
 | 钟 | 写入点（证据） | 谁在读 | 单位/精度 | 问题 |
 |---|---|---|---|---|
-| **M1 供流节拍** | `ffmpeg -re`：`tvplay-node.sh:93` | 无人（隐式） | 不可读 | 隐式、随 ffmpeg 版本变；**今天真正的钟在这里** |
+| **M1 供流节拍** | `ffmpeg -re`：`feed` 子命令 | 无人（隐式） | 不可读 | 隐式、随 ffmpeg 版本变；**今天真正的钟在这里** |
 | **M2 帧时间戳** | `b.timestamp.tv_sec = g_au_seq/25`，`.tv_usec = (g_au_seq%25)*40000`（`v4l2hevc.c:373-374`） | `v4l2hevc` 自己 | 40 ms 固定步长 | **硬编码 25fps**，与 M3 的 24 差 4% |
 | **M3 上屏节拍** | `g_play_fps = 24.0`（`v4l2hevc.c:1072/1260`） | 背压判据 `au_idx - got >= g_play_lead`（`:1472-1473`，`LEAD=6` 见 `:1073/1261`） | 帧计数 | 只限制**领先多少帧**，不决定**何时上屏**；24fps 是默认真假值 |
 | **M4 音频** | mpv / `aout` | **没有人读** | 采样级（真值） | 唯一精确的钟，却没接进任何判据 |
-| **M5 壳的进度** | `el = $(now) - START + OFF`（`tvplay-node.sh:244`；暂停分支 `:242`，`pos()` `:13-21`） | 壳、进度显示、seek | **整秒**（`date +%s`） | 墙钟差 + `START` 被 `sed` 改写（`:122`、`:201`）；秒级颗粒度比门限粗 40 倍 |
+| **M5 壳的进度** | `el = $(now) - START + OFF`（`state` 子命令；暂停分支读 `PAUSE_AT`） | 壳、进度显示、seek | **整秒**（`date +%s`） | 墙钟差 + `START` 被 `printf`/`sed` 改写（`play` 起播、`key` 重启整链两处）；秒级颗粒度比门限粗 40 倍 |
 
 所以不是"四个钟"，是**五个**。M5 之前没被算进来，因为它躲在壳里、长得像"进度条逻辑"
 而不是"时钟逻辑"——但 `seek_target = τ + OFF` 正是靠它算的（§2.1“谁消费 τ”第三条：`seek_target = τ + OFF`），
@@ -642,7 +647,7 @@ hevcdec 自己拉 ffmpeg 管道、靠 `-re` 被动流出、按帧计数上屏（
 # 1) 时间戳不许由计数器造
 ! grep -n "tv_sec *= *g_au_seq\|/ *25;" v4l2hevc.c
 # 2) 壳不许自己算时间
-! grep -n 'el=\$(( *\$(now)' tvplay-node.sh
+! grep -n 'el=\$(( *\$(now)' tvplay.sh   # 壳已并入 tvplay.sh 内嵌 v19
 # 3) 只有 clock.c 许调 clock_gettime（诊断须带 RAW 前缀）
 [ "$(grep -rln clock_gettime *.c | grep -v '^clock.c$' | wc -l)" -eq 0 ]
 ```
@@ -698,7 +703,7 @@ mpv 版本只是把 `clock.c` 的 `clock_anchor_audio()` 从“period 上报”�
 这一节原来只有一句话（"`demux.c` 给每个 AU 附 `pts`"）。当场实测后，这句话必须改写：
 **管道里根本没有 PTS，而且跨过 raw ES 边界就永久拿不回来。**
 
-#### 先把现状钉死（`tvplay-node.sh:92-94`）
+#### 先把现状钉死（`tvplay.sh` 内嵌 v19 `feed` 的 ffmpeg 命令行）
 
 ```
 ffmpeg ... -re -ss "$START" -i "$URL" -map 0:v:0 -c:v copy -f hevc - | v4l2hevc -
@@ -772,8 +777,8 @@ A 的封装开销：合成片上实测 raw ES 9,696 B → mpegts 26,884 B（2.8�
   探测 vaapi/vulkan/opencl/gnutls/srt…，探测到就 `#if CONFIG_*` 编进去，静态链时全要你补；
 - **`--disable-network --enable-protocol=file`** 还是 `--enable-network --enable-protocol=http,tcp`：
   **这一条本次没验清，不能拍**。`$URL` 是调用方 b64 传进来的
-  （`tvplay-node.sh:27,34`：`URL=$(dec "$2")`），脚本里看不到 scheme——
-  是裸路径、`file://` 还是 `http://` 只能在 `key` 分支（`:58,105`）那一侧确认。
+  （`feed`/`play` 里都是 `URL=$(dec "$2")`），脚本里看不到 scheme——
+  是裸路径、`file://` 还是 `http://` 只能在调用方 `tvplay.sh` 那一侧确认。
   两条路都能走通，代价不同：开 network 就必须同时接上下面的 `AVIOInterruptCB`，
   否则 seek 阻塞后无解；关 network 则一旦将来改成推流就整个要重配重编。
 
@@ -802,7 +807,7 @@ A 的封装开销：合成片上实测 raw ES 9,696 B → mpegts 26,884 B（2.8�
 ##### 验收（都能一行验）
 
 ```sh
-grep -c 'ffmpeg' tvplay-node.sh          # 期望 0（进程没了，脚本里也不该留）
+grep -c 'ffmpeg' tvplay.sh               # 期望 0（进程没了，内嵌 v19 的 play 里也不该留）
 pgrep -c ffmpeg                          # 播放中期望 0（§2.2 判定标准的同一条）
 ldd v4l2hevc-aarch64 | grep -c 'libav'   # 静态链时期望 0
 grep -n 'av_rescale_q' demux.c           # 期望 ≥1；同时 grep -c '/ *90 *\* *1000' 期望 0
@@ -869,7 +874,7 @@ mpvctl /tmp/tvplay.sock '{"command":["get_property","pause"]}'
 
 由此得到四条硬约束：
 
-1. **属性/选项名集中一处**：新建 `mpvprops.h`，不许在 `tvplay-node.sh` 里散着写 `--aid` / `--vol-max`。改名时只改一个头文件。
+1. **属性/选项名集中一处**：新建 `mpvprops.h`，不许在 `tvplay.sh` 内嵌 v19 的助手脚本里散着写 `--aid` / `--vol-max`。改名时只改一个头文件。
 2. **启动自检，缺则降级**：逐个 `mpvctl get_property <name>` 探一遍，缺一个就在 `/tmp/tvplay.events` 记 `cap_missing=<name>` 并走降级分支——**不许静默继续**（§3.1 那种"写进去从没被读"的键就是这么来的）。
 3. **文档不把版本相关的语义写成规范**：§2.4 关于 `time-pos` 的两条坑要标"待盒子版本确认"，否则下一版 mpv 一改，前提就假了，而论证还站在上面。
 4. **`mpvctl` 只发稳定命令**：`get_property` / `set` / `add` / `cycle` 这类不受属性集合影响的命令优先；`cycle mute` 若在盒子上不生效，退回 `get_property mute` + `set mute` 两步。
@@ -902,7 +907,7 @@ mpvctl /tmp/tvplay.sock '{"command":["get_property","pause"]}'
 现成的 563 行里有四块是对的，一步都不用改：
 
 - **hw params 直接指定** period/buffer（`aout.c:105-150`，`iv_set` 精确卡 `PERIOD_SIZE`/`PERIODS`）：
-  这是绕开「8 s 15 次 xrun」（`docs/playback.md:182`，`tvplay-node.sh:80`）的唯一手段，`plug`/`dmix` 拿不到。
+  这是绕开「8 s 15 次 xrun」（`docs/playback.md:182`，`feed` 顶部注释）的唯一手段，`plug`/`dmix` 拿不到。
 - **xrun 恢复**：`EPIPE` → `PREPARE` 继续，不退出（`aout.c:207-215`），`ESTRPIPE/EBADFD` 同路（`:227-230`）。
   `g_underruns_recovered` 就是 §2.1.1 里 XRUN flag 的来源。
 - **暂停两级降级**：`PAUSE` ioctl 失败才写静音占 dma（`g_pause_mode` 1→2，`aout.c:389-406`）。
@@ -950,7 +955,7 @@ xrun 置位/清除成对。第二个（暂停锚点）最容易漏：漏了读�
 
 | 操作 | 今天 | 第二步之后 |
 |---|---|---|
-| 暂停 | `pkill -STOP` 四个 pattern（`tvplay-node.sh:109-112`）+ `mpvctrl toggle`（`:178`） | `state.c` 内三行：`ring` 保持不动 → `AOUT_PAUSE` ioctl（失败走 `g_pause_mode=2`）→ `clock_freeze(1)`。**同一次请求，同一次失败** |
+| 暂停 | `pkill -STOP` 四个 pattern（`key toggle` 里两处、共四条）+ `mpvctl set_property pause` | `state.c` 内三行：`ring` 保持不动 → `AOUT_PAUSE` ioctl（失败走 `g_pause_mode=2`）→ `clock_freeze(1)`。**同一次请求，同一次失败** |
 | seek | 视频重开整链 + mpv 自己 `seek`（`:193`），两边各算目标（§5.5） | 一个 `target_us`：`av_seek_frame`（音频轨与视频轨同一次）→ 丢 ring 至关键帧 → `epoch++` → 等 `|τ - target| < 200 ms` |
 | 音量 | `mpvctl add volume`（`volume-max` 会夹到 130，`mpvctl vol +5` 读旧值写新值会丢连按） | `aout` 内部整数增益（`aout.c:176-190` 的 `scale_s16/32`，调用点 `:308`），一条命令一次写，无往返 |
 | 音轨选择 | mpv `aid`（取值集合随版本变，§2.6 表） | `av_find_best_stream` + 显式 index；换轨 = `epoch++` + hw params 重协商 |
@@ -967,15 +972,15 @@ xrun 置位/清除成对。第二个（暂停锚点）最容易漏：漏了读�
    若先只做音频进来、视频仍走 `ffmpeg -f hevc -`，就是两个 demuxer 读同一个 URL 两遍，
    §2.2 的"两进程读同一文件"原样复现，只是搬到了进程内——**这种中间态不许停留超过一个提交**。
 3. **依赖先落地**。`crosslib/` 里今天只有 `libdrm` / `libEGL` / `libGLESv2` / `libgbm`，
-   **没有任何 `libav*`**；盒子上跑的是 ffmpeg 可执行文件（`tvplay-node.sh:92-94`）。
+   **没有任何 `libav*`**；盒子上跑的是 ffmpeg 可执行文件（`feed` 的 ffmpeg 命令行）。
    要么静态链 `libavformat+libavcodec+libswresample`（`-static`，与 `aout` 现状一致，二进制约 +8~10 MB，**待实测**），
    要么盒子有可分发的 `libavcodec.so`（**待确认**：`ls /usr/lib/*/libavcodec*`）。
    这条不确认，第二步的估算就是空的。
 
 #### 删除清单（这一步删什么）
 
-- `mpv --no-video` 整条命令，及 `tvplay-node.sh:83-88` 的 `--aid/--volume/--cache/--audio-device`
-- `tvplay-node.sh:80` 那句「ffmpeg 的 `-f alsa` 在这块板子上缓冲太浅」——**理由消失，注释一起删**
+- `mpv --no-video` 整条命令，及 `play` 的 mpv 分支里那串 `--aid/--volume/--cache/--audio-device`
+- `feed` 顶部那句「ffmpeg 的 `-f alsa` 在这块板子上缓冲太浅」——**理由消失，注释一起删**
 - `mpvctl` 的 `volume`/`mute`/`pause` 子命令（保留 `get_property` 当诊断）
 - `aout` 的 `read(STDIN_FILENO, ...)` 主路径（`aout.c:271`）；stdin 模式只留作独立进程模式
 - ffmpeg 命令行的 `-map 0:a:0 -ac 2 -ar 48000 -f s16le pipe:4` 四个参数（改由 `swr` 配置表达，可读可测）
@@ -1029,10 +1034,10 @@ xrun 置位/清除成对。第二个（暂停锚点）最容易漏：漏了读�
 
 ### 3.1 现状：状态在壳里，且壳自己不信它
 
-唯一的状态是 `/tmp/tvplay.state`。实际写入 **11 个键**（`tvplay-node.sh:56-62`）：
-`START OFF PLAYER KEYB64 TRACKB64 AUDIO FPS GEO RENDER PAUSE_AT PAUSED_FOR`。
-注意 URL 不留原文只留 `KEYB64`，音轨 id 存成 `TRACKB64` 而不是 `TRACK`。
-读的时候 `.` 一下就信了（`:17`、`:104`、`:240`），没有校验、没有锁、没有版本号。
+唯一的状态是 `/tmp/tvplay.state`。v19 起播时实际写入 **9 个键**（`play` 子命令的 `printf`）：
+`START OFF PAUSE_AT PLAYER TRACK AUDIO FPS GEO KEYB64`。
+注意 URL 不留原文只留 `KEYB64`，音轨 id 存成 `TRACK`（不再是 v4 的 `TRACKB64`）。
+读的时候 `.` 一下就信了（`feed`/`play`/`state`/`key` 四处），没有校验、没有锁、没有版本号。
 
 四个症状，全部在源码注释或行为里自承：
 
@@ -1125,7 +1130,7 @@ struct player {
 ### 4.1 现在完全没有
 
 `rcinputd.c` 的键位表（`:112-120`）只有 10 个动作：`mute/menu/volup/voldn/toggle/fwdmore/backmore/fwd/back`，
-`tvplay-node.sh:184` 把 `menu|home` 直接丢弃（"无 UI，忽略"）。
+v4 把 `menu|home` 直接丢弃（"无 UI，忽略"）；v19 的 `key` 只认 `toggle/fwd/back/fwdmore/backmore/volup/voldn/mute/quit`，`menu/home` 连分支都没有，落到 `esac` 后直接 `exit 0`。
 `TRACK/AUDIO` 是 mpv 的音轨 id，不是列表游标。一次只能放一个 URL。
 
 后果：连续剧只能一次次从 SSH 起播，每次都是完整冷启动 + 黑屏。
@@ -1430,7 +1435,7 @@ F/2 < |d| ≤ 2s               渐进：每帧最多 K 槽，靠帧数收敛（�
 ### 6.4 实测数据（盒子上跑，可复现）
 
 `docs/playback.md` 里已记：`ffmpeg -f alsa` 在 hw:0,0 上 8 秒 15 次 xrun，
-所以音频才外包给 mpv（`tvplay-node.sh:77` 有注释）。这件事没变。
+所以音频才外包给 mpv（`feed` 里有注释）。这件事没变。
 mpv `--cache=20` 意味着音频侧有 20s 余量，**几乎不可能欠载**——
 所以“音频是主钟”（§2.1）在这条链上不仅语义正确，也是唯一稳定的那一侧。
 **前提是音频侧不能欠载**——mpv `--cache=20` 提供了这个前提；换成自家 `aout` 时，
@@ -1452,7 +1457,7 @@ mpv `--cache=20` 意味着音频侧有 20s 余量，**几乎不可能欠载**—
 
 §1.6 删除清单追加 4 项：
 
-- `SIGSTOP/SIGCONT` 暂停四连 + `PAUSE_AT` 补贴算术（`tvplay-node.sh:109-124`：`pause_video()` 四条 `pkill -STOP`，`resume_video()` 用 `START += now - PAUSE_AT` 补时间）
+- `SIGSTOP/SIGCONT` 暂停四连 + `PAUSE_AT` 补贴算术（`key toggle`：暂停四条 `pkill -STOP` + `save_pa $(now)`；恢复 `save_pa 0` + 四条 `pkill -CONT`，时间补偿靠 `state` 里 `el = PA - START + OFF` 算，v19 已不再改写 `START`）
 - `/tmp/tvplay.state` 的 8 个变量与 `sed -i` 改写（`pos()`、`el=`）
 - `g_au_seq / 25` 假时间戳（`v4l2hevc.c:373-374`）
 - `seek_guard` 的 3s 窗口（改 300ms，语义从"丢弃"改"取最后"）
