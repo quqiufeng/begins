@@ -2042,27 +2042,45 @@ swap:
 		/* EBUSY = 上一个 flip 还挂在 CRTC 上没完成（内核同一时刻
 		 * 只允许一个 pending flip）。以前这里直接放弃 → 进程 die →
 		 * 上层整链重启闪屏。现在先把挂起的事件收掉再重试。
+		 *
+		 * 但真机上这个 pending flip 能一直收不掉（桌面 suspend 时留下
+		 * 的那笔事后没人再收），于是每帧空转 60×(20+1)ms ≈ 1.26s，
+		 * 把一帧的时间预算吃光 → 解码器下游堵住 → 整链掉到 1fps，
+		 * 音频线程跟着饿出 xrun（听感就是「没声音」）。所以重试预算
+		 * 砍到 3 次；连续失败就记住这台机器 legacy flip 不可用，之后
+		 * 直接走 SetCrtc 直切，每 120 帧再探一次 flip，能通了就回退。
 		 */
-		while (tries++ < 60) {
-			if (!drmModePageFlip(g.dfd, g.crtc_id, fbr,
-					     DRM_MODE_PAGE_FLIP_EVENT,
-					     &g.flip_done)) {
-				ok = 1;
-				break;
+		static int dead, dead_n;
+
+		if (dead && (dead_n = (dead_n + 1) % 120)) {
+			errno = EBUSY;		/* 已知不可用：直通兜底 */
+		} else {
+			while (tries++ < 3) {
+				if (!drmModePageFlip(g.dfd, g.crtc_id, fbr,
+						     DRM_MODE_PAGE_FLIP_EVENT,
+						     &g.flip_done)) {
+					ok = 1;
+					break;
+				}
+				if (errno != EBUSY) break;
+				wait_flip_to(20);	/* 收掉旧的 flip 完成事件 */
+				usleep(1000);
 			}
-			if (errno != EBUSY) break;
-			wait_flip_to(20);	/* 收掉旧的 flip 完成事件 */
-			usleep(1000);
 		}
 		if (ok) {
+			dead = 0;
+			dead_n = 0;
 			wait_flip();
 			record_flip(t_req);
 		} else {
 			/* 兜底：SetCrtc 会同步等旧 flip 收尾，代价是一次
 			 * 直切（可能轻微闪），但比整链重启强得多。
 			 */
-			printf("GLOUT: PageFlip 重试 %d 次仍失败(%s)，改用 SetCrtc\n",
-			       tries - 1, strerror(errno));
+			if (!dead)
+				printf("GLOUT: PageFlip 连续失败(%s)，改走 SetCrtc 直切"
+				       "（之后每 120 帧再试一次 flip）\n",
+				       strerror(errno));
+			dead = 1;
 			if (drmModeSetCrtc(g.dfd, g.crtc_id, fbr, 0, 0,
 					   &g.conn_id, 1, &g.mode)) {
 				printf("GLOUT: SetCrtc 兜底也失败: %s\n",

@@ -481,6 +481,14 @@ do_play() {
 	# set -f：关掉通配，$AF 里的 `0:a:0` 之类不会被当 glob 展开。
 	# AUDIO_FIFO 直接 export：写成 `${X:+AUDIO_FIFO=...}` 那个赋值不会生效，
 	# 展开出来的是一个「命令名」，报 AUDIO_FIFO=/tmp/play.afifo: not found。
+	# 桌面的 run.sh 会 export LD_PRELOAD=/opt/desktop/lib/kmsflip.so（把
+	# drmModeSetCrtc 降级成 PageFlip，免得电视弹信号条）。那个 shim 只对桌面
+	# 成立，却会被 play.sh 原样继承给播放器：播放器的 SetCrtc 兜底也被改成
+	# PageFlip，失败后 shim 直接丢帧不回落 → CRTC 上的 pending flip 永远没人
+	# 收尾 → 之后每帧 PageFlip 都 -EBUSY。表现就是上屏 1fps、解码器下游堵住、
+	# 音频线程跟着饿出 xrun（听感 = 没声音）。播放器自己管 DRM，这里必须清掉。
+	unset LD_PRELOAD KMSFLIP KMSFLIP_LOG
+
 	export SRC SS DUR DA NAKED BIN LOG RENDER SCALE AFIFO_USE SOCK AUDIO HTTP_OPT
 	export VC VF VWH IN_FMT CODEC=""
 	[ "$VC" = h264 ] && CODEC=h264
