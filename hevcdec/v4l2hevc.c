@@ -659,6 +659,7 @@ static int s_fmt_cap(unsigned w, unsigned h)
 	struct v4l2_format f = {0};
 
 	f.type = CAP_T;
+
 	f.fmt.pix_mp.width = w;
 	f.fmt.pix_mp.height = h;
 	f.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12M;
@@ -2315,6 +2316,70 @@ static long pl_pos_ms(void)
 
 static int pl_au(void) { return g_au_pub; }
 
+/* ---------- 起播/seek 的音画对齐（闸门 + 开闸时机）----------
+ * 病根：音频是主钟，可它自己不知道画面走到哪。ffmpeg 那条音频流一 spawn 就
+ * 按 -re 往前灌，而视频这边还要预读 1MB、解析 SPS、开 V4L2 会话、等 RAP，
+ * 首帧上屏时声音往往已经跑了 1~2 s；配速又锚在"首帧 = 音频此刻"，那 1~2 s
+ * 就永久留在片子里 —— 听感就是"声音比画面快两秒"。
+ *
+ * 反过来用背压：首帧没上屏前关闸，aout 不取 fifo，ffmpeg 写满管道就停住，
+ * 音频内容最多超前一个管道深度（<0.4 s）。首帧到了开闸，再等声卡真把 DMA
+ * 拉起来（played_ms 从 0 动起来）才让画面走，抵消 start_threshold 的垫底。
+ *
+ * 只在 spawn 模式做：非 spawn 是同一个 ffmpeg 顺序写两路，卡住声音就卡住
+ * 画面（互等）。AUDIO_GATE=0 可关掉做对照。
+ */
+static int gate_enabled(void)
+{
+	const char *e = getenv("AUDIO_GATE");
+
+	if (!g_spawn_mode) return 0;
+	if (e && *e && atoi(e) == 0) return 0;
+	return aout_played_ms() >= 0;	/* 没声卡就不用闸了 */
+}
+
+/* 首帧回执：闸门开着，等这一帧真上屏了再放声音（见 render_pump 之后） */
+static int g_gate_wait;
+
+static void audio_gate(int on)
+{
+	if (!gate_enabled()) return;
+	aout_set_gate(on);
+	if (on) aout_flush_input();
+}
+
+/* seek 用：闸门放下 + 丢掉旧 PCM + ALSA 缓冲清空、位置归零 */
+static void audio_reseek(void)
+{
+	if (!gate_enabled()) return;
+	aout_set_gate(1);
+	aout_flush_input();
+	aout_drop();
+}
+
+/* 首帧开闸：等声卡起转（played_ms 动了）再放画面，最多等 1 s */
+static void audio_ungate(void)
+{
+	double t0;
+	long fed = aout_fed_ms(), ms = aout_played_ms();
+
+	if (!gate_enabled()) {
+		/* 诊断：不开闸时"首帧这一刻声音已经吃进去多少"就是超前量 */
+		if (fed > 0) {
+			printf("AVSYNC: 首帧未开闸 fed=%ld ms ← 声音超前量\n", fed);
+			fflush(stdout);
+		}
+		return;
+	}
+	aout_set_gate(0);
+	t0 = now_s();
+	while ((ms = aout_played_ms()) == 0 && now_s() - t0 < 1.0)
+		usleep(2000);
+	printf("AVSYNC: 首帧开闸 fed=%ld→%ld played=%ld ms（等声卡 %.0f ms）\n",
+	       fed, aout_fed_ms(), ms, (now_s() - t0) * 1000.0);
+	fflush(stdout);
+}
+
 /* ---------- SPAWN：ffmpeg 收成子进程，seek 不整链重开 ----------
  * 以前 seek = play.sh 重开整条链，持 DRM master 的进程被杀 → 黑 0.8s。
  * 现在 kill 子进程 + 新 -ss 重开 + L2 重建 V4L2，DRM/GL 不动。
@@ -2578,6 +2643,9 @@ static int spawn_reseek(double ss)
 
 	printf("SEEK: 就地重开供流 → %.3f s（DRM/GL 不动）\n", ss);
 	fflush(stdout);
+	/* 先掐声音：旧位置的尾巴（管道 + ALSA 缓冲 <0.7 s）不掐掉，
+	 * 跳到新位置后会先播一截老片。 */
+	audio_reseek();
 	spawn_kill();
 	if (s_fd >= 0) {
 		close(s_fd);
@@ -2763,6 +2831,28 @@ static void on_frame_done(void *ctx, void *owner, double pts, uint32_t latch,
 	cap_recycle((int)((struct capbuf *)owner - capbuf));
 	if (status == RENDER_DROPPED && g_verbose)
 		printf("RENDER: drop pts=%.3f\n", pts);
+	/* 声画真值探针（SYNC=1）：只认"已上屏"的回调，配速/帧号/音频位置三笔
+	 * 账都在这一行里对。err = 音频走过的时间 - 画面该走到的时间；正数 =
+	 * 声音跑到画面前头（听感"声音快"），负数 = 画面超前（"声音拖"）。
+	 * 起播那一刻两者都该是 0：闸门保证首帧上屏时音频内容还在 0 秒。
+	 */
+	if (status == RENDER_SHOWN && getenv("SYNC")) {
+		static int n;
+
+		n++;
+		if (n % 24 == 0) {
+			/* 绝对值，不相对首帧：音频 played 从"内容 0 秒"起数，
+			 * 画面第 n 帧就该在 (n-1)/fps。两者相减就是此刻耳朵
+			 * 听到的位置和眼睛看到的位置差多少——起播错位也算在内。
+			 */
+			long au = aout_played_ms();
+			long vp = (long)((n - 1) * 1000.0 / g_play_fps);
+
+			printf("AVSYNC2 shown=%d err=%+ldms 音频=%.2fs 画面=%.2fs\n",
+			       n, au - vp, au / 1000.0, vp / 1000.0);
+			fflush(stdout);
+		}
+	}
 }
 
 /* OUTPUT 格式：一个 AU 一个 buffer。初次启动和 seek 重建会话共用。 */
@@ -3351,6 +3441,8 @@ static void audio_boot(void)
 	}
 	printf("AUDIO: 内建 aout 48000 Hz 2ch s16le（%s）\n", fifo);
 	atexit(aout_stop);
+	/* 闸门放下：等视频首帧上屏才开闸，免得 ffmpeg 早早把声音灌到画面前头 */
+	audio_gate(1);
 }
 
 int main(int argc, char **argv)
@@ -4059,6 +4151,11 @@ no_stall:;
 				g_err_rec = 0;	/* 真的出帧了，自愈计数归零 */
 				printf("REINIT: first frame\n");
 			}
+			/* 首帧到手只记一笔：开闸要等这一帧真上屏之后（见
+			 * render_pump 后面那段）。在 submit 前开闸，声音会抢在
+			 * 首帧 swap 完成之前跑掉几十~一百毫秒。 */
+			if ((g_mark_first || !got) && aout_gate() > 0)
+				g_gate_wait = 1;
 			if (!got)
 				t_first_rx = t_rx;
 			t_last_rx = t_rx;
@@ -4171,6 +4268,13 @@ no_stall:;
 			 * 里一次翻完——中间的等于白翻（算 miss），屏幕上是卡顿。 */
 			if (rend)
 				render_pump(rend, 0);
+			/* 首帧已经交出去并走完了 pump（GL：swap 已返回 = 在屏上；
+			 * DRM：已排到下一个 vblank 槽）——这时候才开闸，声音和
+			 * 画面从同一刻的 0 起步。 */
+			if (g_gate_wait) {
+				g_gate_wait = 0;
+				audio_ungate();
+			}
 			got++;
 			g_au_pub = got;
 			if (!g_sync_dbg && getenv("SYNC"))
@@ -4180,9 +4284,10 @@ no_stall:;
 
 				if (ams >= 0) {
 					if (g_sync_ms0 < 0) g_sync_ms0 = ams;
-					printf("SYNC got=%ld audio_ms=%ld frame_pos=%.2f "
-					       "audio_pos=%.2f d=%+ldms\n",
-					       (long)got, ams, (double)got / g_play_fps,
+					printf("SYNC got=%ld audio_ms=%ld fed=%ld wall=%.2f "
+					       "frame_pos=%.2f audio_pos=%.2f d=%+ldms\n",
+					       (long)got, ams, aout_fed_ms(),
+					       now_s() - t0, (double)got / g_play_fps,
 					       (double)(ams - g_sync_ms0) / 1000.0,
 					       (ams - g_sync_ms0) - (long)(got * 1000.0 / g_play_fps));
 					fflush(stdout);

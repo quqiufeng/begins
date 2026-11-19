@@ -397,3 +397,44 @@ MPV_EXTRA="--sid=5 --sub-auto=no" ~/bin/tvcast.sh 关键词   # 临时锁字幕�
 
 `MPV_EXTRA` 是**唯一**该用的临时覆盖口；不要改 `tvcast.sh` 里的散参数——那部分已经搬进
 `mpv.conf`，两边同时改会互相打脸。
+
+## 7. 音画同步：闸门 + 真值探针（hevcdec 内建 aout）
+
+症状：起播时"声音比画面快一两秒"，之后全程保持这个差。
+
+病根不在 ffmpeg，也不在配速公式，而在**起播顺序**：音频那条 ffmpeg 一 spawn 就按 `-re`
+往前灌 PCM，而视频这边还要预读 1 MB、解析 SPS、开 V4L2 会话、等 RAP 才能出首帧。
+音频的 `played_ms` 已经从 0 跑到几百毫秒，画面才刚上屏；配速又锚在"首帧 = 音频此刻"，
+这段错位就被永久写进这条片子的时间轴里。
+
+修法（两道，缺一不可）：
+
+1. **闸门**（`aout_set_gate`，`AUDIO_GATE=0` 可关掉做对照）：首帧没上屏前 aout 不往上读
+   FIFO，ffmpeg 写满管道就停住（背压），音频内容最多超前一个管道深度，播不出去。
+2. **开闸时机**：首帧 **submit + render_pump 之后**才开闸（`g_gate_wait` 回执），不是首帧
+   拿到就开——GL 的 swap 才是"已在屏上"，提前开闸等于白送一次 swap 的时长（实测 90~130 ms）。
+
+量法（`SYNC=1`，只认 `RENDER_SHOWN` 回调，绝对值不比相对值）：
+
+```
+AVSYNC2 shown=240 err=+40ms 音频=10.00s 画面=9.96s
+```
+
+`err = aout_played_ms() - (shown-1)*1000/fps`，正数 = 声音跑到画面前头。盒子实测量级：
+
+| 配置 | err（起播后恒定） |
+|---|---|
+| 闸门开 + 首帧上屏后开闸 | **+40 ms**（= 1 帧 @24fps，感知不到） |
+| `AUDIO_GATE=0`（旧行为） | **+823 ms**（就是"声音快"的听感） |
+
+要点：`err` 必须用**绝对**位置算。拿"首帧那一刻的 played"当 0 的相对量永远得 0，
+因为它把起播错位一起减掉了——早期版本就这么自欺过一次。
+
+盒子上跑这套测试前必须让桌面让出 DRM master，否则 `GLOUT: 拿不到 DRM master` +
+`SetCrtc: Permission denied`，一帧都不上屏，所有 SYNC 数字全是假的：
+
+```bash
+ssh root@X96 'systemctl stop desktop.service console-wall.service; systemctl mask --runtime desktop.service'
+# 测完必须还原
+ssh root@X96 'systemctl unmask --runtime desktop.service; systemctl start console-wall.service desktop.service'
+```

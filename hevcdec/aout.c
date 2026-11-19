@@ -74,6 +74,9 @@ static short *g_ring;                 /* 只是块内存，按帧索引用 */
 static size_t g_ring_cap;             /* 帧 */
 static size_t g_ring_rd, g_ring_wr, g_ring_used;
 static int    g_in_eof;
+static volatile int  g_gate;         /* 1 = 暂不取上游 PCM（起播/seek 对齐闸门） */
+static volatile int  g_drop_req;     /* 1 = 请求 play_thread 丢缓冲重来（seek 用） */
+static long          g_fed;           /* 累计从上游读到的帧（= 音频内容走到第几帧） */
 static pthread_mutex_t rlk = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  rcv = PTHREAD_COND_INITIALIZER;
 static volatile int  g_listen = -1;   /* 控制口 listen fd：上游 EOF 时要能把它踢醒 */
@@ -329,6 +332,22 @@ static void *read_thread(void *arg)
 	while (!g_quit && !g_in_eof) {
 		size_t space, cont;
 
+		/* 起播/seek 对齐闸门：视频首帧还没上屏前不往上取，ffmpeg 写满
+		 * 管道就停在那里（背压），音频内容不会跑到画面前头去。 */
+		if (g_gate) {
+			struct timespec ts;
+
+			pthread_mutex_lock(&rlk);
+			while (g_gate && !g_quit && !g_in_eof) {
+				clock_gettime(CLOCK_REALTIME, &ts);
+				ts.tv_nsec += 100 * 1000000L;
+				if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+				pthread_cond_timedwait(&rcv, &rlk, &ts);
+			}
+			pthread_mutex_unlock(&rlk);
+			if (g_quit || g_in_eof) break;
+		}
+
 		pthread_mutex_lock(&rlk);
 		space = g_ring_cap - g_ring_used;
 		while (!space && !g_quit && !g_in_eof) {
@@ -373,6 +392,7 @@ static void *read_thread(void *arg)
 			}
 			{
 				size_t got = (size_t)n / g_frame_bytes;
+				g_fed += (long)got;
 				pthread_mutex_lock(&rlk);
 				g_ring_wr = (g_ring_wr + got) % g_ring_cap;
 				g_ring_used += got;
@@ -397,6 +417,24 @@ static void *play_thread(void *arg)
 	while (!g_quit) {
 		unsigned int frames;
 		int eof;
+
+		/* seek：闸门放下、ring 已清空后由这里动手 —— DROP 必须在写线程
+		 * 里做，别在别人的线程上跟 writei 抢同一个 pcm。 */
+		if (g_drop_req) {
+			if (pcmfd >= 0) {
+				ioctl(pcmfd, SNDRV_PCM_IOCTL_DROP, 0);
+				ioctl(pcmfd, SNDRV_PCM_IOCTL_PREPARE, 0);
+			}
+			pthread_mutex_lock(&lk);
+			g_written = 0;		/* 位置重新从 0 数：新片段的 0 秒 */
+			g_frozen_ms = -1;
+			g_pause_mode = 0;
+			pthread_mutex_unlock(&lk);
+			g_drop_req = 0;		/* 最后才清：调用方靠它判断落地 */
+			pthread_cond_broadcast(&cv);
+			pthread_cond_broadcast(&rcv);
+			continue;
+		}
 
 		if (g_paused) {
 			pthread_mutex_lock(&lk);
@@ -825,8 +863,68 @@ int  aout_vol(void)
 long aout_played_ms(void)
 {
 	if (pcmfd < 0) return -1;
+	if (g_drop_req) return 0;	/* 正在丢缓冲重来：位置还没归零完，先当 0 */
 	if (g_frozen_ms >= 0) return g_frozen_ms;
 	return played_frames() * 1000L / (long)g_rate;
+}
+
+/* ---------- 闸门 / 丢弃：给播放器做音画起播对齐（seek 也走这条）---------
+ * 开闸（on=0）后上游才被允许继续灌；关闸时 ffmpeg 卡在 write(fifo) 上，
+ * 音频内容最多超前一个管道深度。用法见 v4l2hevc.c 的 audio_gate()。
+ */
+void aout_set_gate(int on)
+{
+	pthread_mutex_lock(&rlk);
+	g_gate = on ? 1 : 0;
+	pthread_mutex_unlock(&rlk);
+	pthread_cond_broadcast(&rcv);
+}
+
+int aout_gate(void) { return g_gate; }
+
+/* 已从上游吃进多少毫秒的 PCM —— 这是"音频内容的位置"，不受 ALSA 缓冲影响。
+ * 起播对齐要的是它：played_ms 在 start_threshold 垫满前一直是 0。 */
+long aout_fed_ms(void)
+{
+	if (pcmfd < 0) return -1;
+	return g_fed * 1000L / (long)g_rate;
+}
+
+/* 把管道里已经躺着的旧 PCM 读掉丢弃，并清 ring —— seek 时那截是旧位置的
+ * 声音，留着就会在新位置上先播 0.3 s 的老片。关闸之后再调。 */
+void aout_flush_input(void)
+{
+	char junk[8192];
+	int fl;
+
+	pthread_mutex_lock(&rlk);
+	g_ring_rd = g_ring_wr = g_ring_used = 0;
+	pthread_mutex_unlock(&rlk);
+	pthread_cond_broadcast(&rcv);
+
+	if (g_in_fd < 0) return;
+	fl = fcntl(g_in_fd, F_GETFL, 0);
+	if (fl < 0 || (fl & O_NONBLOCK)) return;	/* 别动别人的非阻塞设置 */
+	fcntl(g_in_fd, F_SETFL, fl | O_NONBLOCK);
+	while (read(g_in_fd, junk, sizeof junk) > 0)
+		;
+	fcntl(g_in_fd, F_SETFL, fl);
+}
+
+/* 丢掉 ALSA 缓冲 + 位置归零（seek 后新片段从 0 秒算）。由 play_thread 执行，
+ * 这里等它落地（最多 300 ms），免得调用方紧接着读到的还是旧 played_ms。 */
+void aout_drop(void)
+{
+	int i;
+
+	if (pcmfd < 0) return;
+	pthread_mutex_lock(&rlk);
+	g_drop_req = 1;
+	pthread_mutex_unlock(&rlk);
+	pthread_cond_broadcast(&rcv);
+	pthread_cond_broadcast(&cv);
+	for (i = 0; i < 150 && g_drop_req; i++)
+		usleep(2000);
 }
 
 int aout_xrun(void)

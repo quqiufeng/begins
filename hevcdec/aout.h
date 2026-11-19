@@ -20,6 +20,12 @@ int  aout_paused(void);
 void aout_set_vol_abs(int v);		/* 0..100，内部夹住 */
 int  aout_vol(void);
 long aout_played_ms(void);		/* hw_ptr 折算的已播毫秒；无音频 -1 */
+/* 起播/seek 对齐闸门：1 = 不取上游 PCM（ffmpeg 被背压顶住），0 = 放行 */
+void aout_set_gate(int on);
+int  aout_gate(void);
+void aout_flush_input(void);		/* 丢管道里残留的旧 PCM（seek） */
+long aout_fed_ms(void);			/* 已从上游吃进的毫秒（内容位置） */
+void aout_drop(void);			/* 丢 ALSA 缓冲 + 位置归零（seek） */
 int  aout_xrun(void);
 int  aout_running(void);
 void aout_stop(void);
