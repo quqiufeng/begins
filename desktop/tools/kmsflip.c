@@ -263,15 +263,19 @@ done:
 		int i;
 
 		ret = -1;
-		for (i = 0; i < 25; i++) {
+		for (i = 0; i < 4; i++) {
 			ret = real_pageflip(fd, crtcId, bufferId, 0, NULL);
 			if (!ret) break;
 			if (ret != -EBUSY) break;
-			usleep(2000);
+			usleep(1000);
 		}
 		if (ret) {
-			say("       └ PageFlip 放弃 %d，回落 SetCrtc（同模式，不重配 vout）", ret);
-			ret = real_setcrtc(fd, crtcId, bufferId, x, y, connectors, count, mode);
+			/* 绝不回落 SetCrtc：本路径模式没变，同模式 SetCrtc 在
+			 * meson 上仍会重写 vout 时序 —— 电视就弹一次信号黄条。
+			 * 这一帧直接丢，当作已生效返回；画面由下一帧的 PageFlip
+			 * 接手（模式不变，跳过 SetCrtc 没有任何副作用）。 */
+			say("       └ PageFlip 放弃 %d，丢帧不回落 SetCrtc（避免电视弹条）", ret);
+			ret = 0;
 		}
 	}
 	depth = 0;
