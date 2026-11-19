@@ -207,7 +207,16 @@ fbcon_hold() {
 	return 0
 }
 
+fbcon_watch_stop() {
+	_wd=/tmp/play.fbcon.wd
+	_wpid=$(cat "$_wd" 2>/dev/null)
+	[ -n "$_wpid" ] && kill "$_wpid" 2>/dev/null
+	rm -f "$_wd" /tmp/play.fbcon.owner
+	return 0
+}
+
 fbcon_release() {
+	fbcon_watch_stop
 	_b=$(vtcon_bind) || return 0
 	[ "$(cat "$_b" 2>/dev/null)" = 1 ] && return 0
 	echo 1 > "$_b" 2>/dev/null && say "fbcon 已重新绑定（命令行恢复）"
@@ -215,25 +224,37 @@ fbcon_release() {
 }
 
 # 看门狗：播放器崩了/被 kill -9 时没人执行 stop，命令行会一直黑着。
-# 连续 8s 见不到播放器才 rebind —— seek 重开的间隙只 ~1s，不会误触。
+#
+# 盯的是「这次的播放会话」（play.sh 自己的 pid），不是播放器进程。
+# seek/fwd 是整条链重开，播放器会消失好一阵（NAS 上缓冲时能到好几秒），
+# 盯播放器就会误判成崩溃 → 把 fbcon 绑回来 → 一次 modeset → HDMI 重新
+# 锁存 → 电视弹一次「当前信号信息」黄条。旧版 8s 阈值就是这么抖出黄条的。
+# 会话还活着就说明它迟早自己收尾（正常退出走 fbcon_release），不用管；
+# 会话真没了（kill -9/崩溃）且连播 3s 没有任何播放器，才 rebind。
+#
+# owner 文件负责交接：新会话起播时改写 owner 并起自己的看门狗，
+# 老看门狗每秒核对一次，发现 owner 不是自己就安静退出 —— 绝不在
+# 新会话已经上屏之后再手贱 rebind 一次。
 fbcon_watch() {
 	_b=$(vtcon_bind) || return 0
 	[ -w "$_b" ] || return 0
 	_wd=/tmp/play.fbcon.wd
-	if [ -f "$_wd" ] && kill -0 "$(cat "$_wd" 2>/dev/null)" 2>/dev/null; then
-		return 0
-	fi
+	_own=/tmp/play.fbcon.owner
+	_self=$$
+	fbcon_watch_stop	# 上一会话的看门狗交给这一会话
+	printf '%s\n' "$_self" > "$_own"
 	setsid sh -c '
+self='"$_self"'; bind='"$_b"'; own='"$_own"'
 n=0
 while :; do
 	sleep 1
+	[ "$(cat "$own" 2>/dev/null)" = "$self" ] || exit 0
+	if kill -0 "$self" 2>/dev/null; then n=0; continue; fi
 	if pgrep -x v4l2hevc-aarch6 >/dev/null 2>&1 || \
 	   pgrep -x v4l2hevc >/dev/null 2>&1 || \
-	   pgrep -x mpv >/dev/null 2>&1; then n=0
-	else
-		n=$((n + 1))
-		[ "$n" -ge 8 ] && { echo 1 > "'"$_b"'"; exit 0; }
-	fi
+	   pgrep -x mpv >/dev/null 2>&1; then n=0; continue; fi
+	n=$((n + 1))
+	[ "$n" -ge 3 ] && { echo 1 > "$bind"; rm -f "$own"; exit 0; }
 done' </dev/null >/dev/null 2>&1 &
 	echo $! > "$_wd"
 	return 0
