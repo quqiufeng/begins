@@ -263,11 +263,13 @@ done:
 		int i;
 
 		ret = -1;
-		for (i = 0; i < 4; i++) {
+		for (i = 0; i < 12; i++) {
 			ret = real_pageflip(fd, crtcId, bufferId, 0, NULL);
 			if (!ret) break;
 			if (ret != -EBUSY) break;
-			usleep(1000);
+			/* 播放器 60fps 一直在排 flip，等一个 vblank 量级：
+			 * 它那一次 pending 落地后 CRTC 会空出几 ms 给我们。 */
+			usleep(2500);
 		}
 		if (ret) {
 			/* 绝不回落 SetCrtc：本路径模式没变，同模式 SetCrtc 在
