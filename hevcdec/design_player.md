@@ -1398,12 +1398,15 @@ IRAP 等不到。
 5. `glscale.inc` 的 DPU 硬件放大变体（28→55 fps）尚未并入主干。
 6. 遥控器部分键没有标准 KEY 码（`code=0`），需按 `MSC_SCAN` 补 `COMBO_SCAN` 表。
 7. 方案 A 的 CPU 色调映射不可用于 4K（~800 ms/帧），仅作兜底/验证。
-8. **H.264 在这块板子上解不出帧**（2026-11-19 实测，720p x264 8bit 4:2:0 mkv）：
-   会话能开、`S_FMT` 全对（1280x720 / NV12）、喂进 6 个 AU，`DQBUF` 一个都不出，
-   1.6 s 后被 `STALL` 看门狗重建会话，连着重试 5 次后播放器退出（`STALL: 连续 5 次
-   自愈失败，退出`）；dmesg 里每次都只有 `meson-vdec: hard reset n=6`，没有别的错。
-   播放器侧参数是对的（`CODEC=h264` + `V4L2_PIX_FMT_H264`，`ffprobe` 也报了
-   `h264,1280,720`），所以怀疑 `meson-vdec/codec_h264.c` 这条路（staging 里的
-   H.264 分支从来没有在这颗 S905X2 上跑通过）。**当前别拿 H.264 片源验播放链**，
-   表现是"位置在走、遥控有反应、屏幕全黑"——`play.sh` 现在会在起播前明喊一句。
-   要真支持 H.264，得先在核里把 codec_h264 打通，与用户态无关。
+8. **H.264 硬解是通的**（2026-11-19 复核，1080p h264 8bit 4:2:0）：
+   `PERF decode=29.45 fps (424 frames / 14.397s)`，`VDEC: 会话打开成功 1920x1080`，
+   `RENDER: gl (caps hdr)` 正常上屏，dmesg 无 watchdog 重建。
+   早前「解不出帧、只会黑屏」的结论是**误判**，真因在 spawn 链路：
+   播放器 `spawn_argv()` 的切词上限是 32 个 token（`store[32][512]` +
+   `n >= 32` 硬判断），而 NAS 源带 `-rw_timeout/-reconnect×4` 后模板实测
+   37 个 token，截断点正好落在音频的 `-f s16le`，argv 以孤零零的 `-f` 收尾，
+   ffmpeg 报 `Missing argument for option 'f'` 秒退 → 播放器读到空流 →
+   `FAIL stream 空` → 黑屏。看上去像解码器不行，实际视频数据一个字节都没进来。
+   已改成 `SPAWN_MAX=128`（`v4l2hevc.c`），`play.sh` 那句"H.264 解不出帧"的
+   预喊也删了。教训：**子进程 exec 的 argv 要有断言**（模板 token 数 > 上限时
+   宁可报错退出，也别静默截断），否则错误会被下游误读成"硬件不行"。

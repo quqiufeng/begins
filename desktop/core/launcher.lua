@@ -275,8 +275,9 @@ function M:open_media(item)
 		cmd = ("%s %s"):format(shq(cfg.play_cmd), shq(arg))
 	end
 	-- 播放器要看「上屏判据」：play.sh 只认 RENDER:/PLAY: 两行，别靠屏幕亮没亮。
-	-- 硬解不认的编码（盒子只吃 HEVC）会让 play.sh 卡在等播放器退出，
-	-- 没有看门狗时桌面就是全程假死。
+	-- 播放器起不来（片源/供流/参数任何一处挂掉）会让 play.sh 卡在等播放器退出，
+	-- 没有看门狗时桌面就是全程假死。注意别把这归给「编码不支持」：H.264 硬解是通的
+	-- （2026-11-19 实测 1080p 29.4fps），黑屏多是 spawn argv 被截断/空流。
 	return self:run("播放器", cmd, {
 		watch = {
 			log = cfg.play_log,

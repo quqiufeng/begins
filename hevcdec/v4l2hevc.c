@@ -2360,9 +2360,14 @@ static void spawn_kill(void)
 }
 
 /* 模板切词 + {SS} 替换，argv 以 NULL 收尾 */
+/* 模板切词上限：NAS + HTTP_OPT(reconnect×4) + 音频映射实测 37 个 token，
+ * 老上限 32 会把 -f s16le 的 s16le 咬掉，argv 以孤零零的 -f 收尾，
+ * ffmpeg 直接 "Missing argument for option 'f'" 拒绝启动（黑屏 + 秒退）。 */
+#define SPAWN_MAX 128
+
 static int spawn_argv(double ss, char *argv[], int max)
 {
-	static char store[32][512];
+	static char store[SPAWN_MAX][512];
 	char num[32];
 	const char *p = g_spawn_tpl;
 	int n = 0;
@@ -2377,7 +2382,7 @@ static int spawn_argv(double ss, char *argv[], int max)
 			p++;
 			continue;
 		}
-		if (n >= max - 1 || n >= 32)
+		if (n >= max - 1)
 			break;
 		o = store[n];
 		s0 = p;
@@ -2396,17 +2401,29 @@ static int spawn_argv(double ss, char *argv[], int max)
 		argv[n++] = o;
 	}
 	argv[n] = NULL;
+	/* 到顶时若模板还有词没切：宁可报错，也别把「半个 argv」exec 出去。
+	 * 2026-11-19 就栽在这：上限 32 把 `-f s16le` 截成光秃秃的 `-f`，
+	 * ffmpeg 报 Missing argument、秒退，下游读成「H.264 硬解不出帧」查了半天。 */
+	if (n >= max - 1) {
+		while (*p == ' ' || *p == '\t' || *p == '\n')
+			p++;
+		if (*p) {
+			printf("SPAWN: 模板超过 %d 个词，拒绝启动（会被截断成半个 argv）\n",
+			       max - 1);
+			return -1;
+		}
+	}
 	return n;
 }
 
 /* 起一个供流子进程，返回它的 stdout 管道读端（-1 = 失败） */
 static int spawn_start(double ss)
 {
-	char *argv[32];
+	char *argv[SPAWN_MAX];
 	int pf[2], j;
 	pid_t p;
 
-	if (spawn_argv(ss, argv, 32) < 1) {
+	if (spawn_argv(ss, argv, SPAWN_MAX) < 1) {
 		printf("SPAWN: 模板为空\n");
 		return -1;
 	}
