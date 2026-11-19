@@ -219,7 +219,11 @@ static long played_frames(void)
 	return w - d < 0 ? 0 : w - d;
 }
 
-/* ---------- 音量：本地整数增益，0..100 ---------- */
+/* ---------- 音量：本地整数增益，0..200 ----------------------------------
+ * 板子没有可写的主音量（TDMOUT_B Lane 已被写死在 100%），片源又常常只剩
+ * -6..-18dBFS，所以允许超过 100 继续补：>100 是会硬削波的，只在片源特别
+ * 小声时用，正常片子的电平补偿在 ffmpeg 侧做（play.sh 的 AGAIN）。
+ */
 
 static void scale_s16(short *s, unsigned int frames, int vol)
 {
@@ -568,7 +572,7 @@ static void set_pause(int on)
 static void set_vol(int v)
 {
 	if (v < 0) v = 0;
-	if (v > 100) v = 100;
+	if (v > 200) v = 200;
 	pthread_mutex_lock(&lk);
 	g_vol = v;
 	pthread_mutex_unlock(&lk);

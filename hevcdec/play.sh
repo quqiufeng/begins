@@ -47,6 +47,13 @@ AFIFO=${AFIFO:-/tmp/play.afifo}  # ffmpeg 写 PCM 的管道，内建 aout 从这
 # xrun（默认 8192/2048 = 170/42ms，实测一片下来几十次）。16k/4k≈340/85ms 稳得多。
 AUDIO_BUF=${AUDIO_BUF:-16384}
 AUDIO_PERIOD=${AUDIO_PERIOD:-4096}
+# 增益：这块板的 ALSA 主音量写不了（TDMOUT_B Lane 已是 100%，SPDIF 那路
+# 0% 是给别的输出路径的），声音大小只能在 PCM 上做。实测片源峰值只剩
+# -6.5..-18dBFS、对白 mean -28..-40dB，电视得开到 60 才够响 —— 相当于
+# 白白空着 10~20dB 的动态余量。这里统一补 AGAIN dB，再用 alimiter 卡住
+# 过冲（只压最响的几个峰，不做整体归一化，不会像 loudnorm 那样吃 CPU）。
+AGAIN=${AGAIN:-12}            # dB，0=不补；太大就削波变糊
+DRC=${DRC:-0}                 # 0=关掉 AC3/TrueHD 的 dialnorm/DRC（会额外压低音量）
 DEBUG=0
 DRYRUN=0                      # -n：只解析片源/打印命令，不播
 
@@ -454,14 +461,16 @@ do_play() {
 	# "Output file does not contain any stream" 直接失败 —— 连画面一起没了。
 	AF=""; AFIFO_USE=""
 	if [ "$AUDIO" = 1 ] && [ "$NAKED" = 0 ]; then
-		_ha=0
+		_ha=0; _ac=""
 		if command -v ffprobe >/dev/null 2>&1; then
 			# shellcheck disable=SC2086
-			if ffprobe -v error $IN_FMT $HTTP_OPT -select_streams a:0 \
-				-show_entries stream=index \
-				-of csv=p=0 "$SRC" 2>/dev/null | grep -q .; then
-				_ha=1
-			fi
+			_a=$(ffprobe -v error $IN_FMT $HTTP_OPT -select_streams a:0 \
+				-show_entries stream=index,codec_name \
+				-of csv=p=0 "$SRC" 2>/dev/null)
+			case "$_a" in
+			"") ;;
+			*) _ha=1; _ac=${_a#*,} ;;   # "1,aac" -> aac
+			esac
 		else
 			_ha=1	# 没有 ffprobe：假定有音轨，别把正常的片子搞成静音
 		fi
@@ -473,7 +482,25 @@ do_play() {
 			# 视频管道一堵音频就跟着断喂（xrun 每秒一次的根因）。
 			# 这里写成独立模板，播放器 fork 第二个 ffmpeg，只吃音频、只写 fifo。
 			AF=""
-			AUDIO_SPAWN="ffmpeg -hide_banner -loglevel warning -nostdin -y -re -ss {SS} $DA $HTTP_OPT $IN_FMT -i $SRC -vn -map 0:a:0 -f s16le -ar 48000 -ac 2 $AFIFO"
+			# 增益链：volume 补偿源本身小的电平，alimiter 只压过冲的峰。
+			# level=0 关掉 alimiter 的自动抬电平（那会变成整体归一化，
+			# 对白和爆炸的响度关系就乱了）。
+			AFA=""
+			case "$AGAIN" in
+			""|0|0.0|-*) ;;
+			*) AFA="-af volume=${AGAIN}dB,alimiter=limit=0.97:level=0:attack=5:release=50" ;;
+			esac
+			# -drc_scale 是**输入**选项（作用在解码器上），必须排在 -i 前面：
+			# 放到 -i 后面会被当成输出选项，ffmpeg 直接报参数错退出，
+			# 表现是音频子进程一起就 defunct、整片静音。
+			# 它只对 ac3/eac3/truehd/dts 有意义（dialnorm/DRC 会把整条轨压低
+			# 好几 dB），对 aac/pcm 挂上去只会换来一句 "has not been used"。
+			AFI=""
+			case "$_ac" in
+			ac3|eac3|truehd|mlp|dts|dca)
+				[ "$DRC" = 1 ] && AFI="-drc_scale 1" || AFI="-drc_scale 0" ;;
+			esac
+			AUDIO_SPAWN="ffmpeg -hide_banner -loglevel warning -nostdin -y -re -ss {SS} $DA $AFI $HTTP_OPT $IN_FMT -i $SRC -vn -map 0:a:0 $AFA -f s16le -ar 48000 -ac 2 $AFIFO"
 		else
 			say "片源没有音轨，只放画面"
 			# 电视上看不见终端：屏幕上也得说一句，否则"按音量键没反应"，
@@ -795,7 +822,10 @@ seek_inplace() {
 }
 
 # 音量只能在播放器里做（软件增益）：这块板的 ALSA 没有可写的主音量
-# （ACODEC 不存在，只有 SPDIF/TDM 的通道音量，动它就是动别的输出路径）。
+# （ACODEC 不存在，只有 SPDIF/TDM 的通道音量，动它就是动别的输出路径；
+#  TDMOUT_B 那四路 Lane 实测已经都在 100%，硬件侧没有余量了）。
+# 所以两层：起播时 ffmpeg 补 AGAIN dB（对全片恒定的电平补偿），遥控器
+# 的 ±10 再在播放器里做 0..200 的线性增益（>100 会削波，临时救急用）。
 vol_step() {
 	_d=$1
 	if [ "${AUDIO:-0}" != 1 ]; then
