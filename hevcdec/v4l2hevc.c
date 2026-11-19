@@ -2321,6 +2321,8 @@ static int pl_au(void) { return g_au_pub; }
  * 模板按空白切词，词里的 {SS} 换成秒数。SS 给起播位置。
  */
 static char   g_spawn_tpl[1024];
+static char   g_atpl[1024];	/* 音频专用模板：独立 ffmpeg，只喂 $AFIFO */
+static pid_t  g_achild = -1;
 static int    g_spawn_mode;
 static pid_t  g_child = -1;
 static double g_seek_to = -1.0;
@@ -2342,6 +2344,11 @@ static void spawn_kill(void)
 {
 	int st, k;
 
+	if (g_achild > 0) {
+		kill(g_achild, SIGTERM);
+		waitpid(g_achild, &st, 0);
+		g_achild = -1;
+	}
 	if (g_child <= 0)
 		return;
 	kill(g_child, SIGTERM);
@@ -2365,11 +2372,11 @@ static void spawn_kill(void)
  * ffmpeg 直接 "Missing argument for option 'f'" 拒绝启动（黑屏 + 秒退）。 */
 #define SPAWN_MAX 128
 
-static int spawn_argv(double ss, char *argv[], int max)
+static int spawn_argv(const char *tpl, double ss, char *argv[], int max)
 {
 	static char store[SPAWN_MAX][512];
 	char num[32];
-	const char *p = g_spawn_tpl;
+	const char *p = tpl;
 	int n = 0;
 
 	snprintf(num, sizeof num, "%.3f", ss);
@@ -2423,7 +2430,7 @@ static int spawn_start(double ss)
 	int pf[2], j;
 	pid_t p;
 
-	if (spawn_argv(ss, argv, SPAWN_MAX) < 1) {
+	if (spawn_argv(g_spawn_tpl, ss, argv, SPAWN_MAX) < 1) {
 		printf("SPAWN: 模板为空\n");
 		return -1;
 	}
@@ -2449,6 +2456,40 @@ static int spawn_start(double ss)
 	close(pf[1]);
 	g_child = p;
 	printf("SPAWN: pid=%d -ss %.3f\n", (int)p, ss);
+
+	/* 音频必须自己一条流。
+	 * 同一个 ffmpeg 既要写视频 stdout 又要写音频 fifo，-re 下它是顺序写的：
+	 * 播放器这边一卡（渲染 submit 失败、解码器攒够一批才收），视频管道满了
+	 * 就堵在 write()，音频跟着一起停喂 → 内建 aout 的 ring 见底 → EPIPE。
+	 * 实测就是"xrun 每秒一次、ring 水位只有十几毫秒"。音频单开一条 ffmpeg
+	 * 后，画面怎么抖都跟声音无关。
+	 */
+	if (g_atpl[0]) {
+		char *aargv[SPAWN_MAX];
+		pid_t ap;
+
+		if (spawn_argv(g_atpl, ss, aargv, SPAWN_MAX) >= 1 &&
+		    (ap = fork()) >= 0) {
+			if (ap == 0) {
+				int dn;
+
+				/* 不 setsid：留在播放器的进程组里，
+				 * play.sh 停链时整组 kill 才收得掉，不会漏一个孤儿 ffmpeg。 */
+				dn = open("/dev/null", O_RDWR);
+				if (dn >= 0) {
+					dup2(dn, STDIN_FILENO);
+					dup2(dn, STDOUT_FILENO);
+					if (dn > 2) close(dn);
+				}
+				for (j = 3; j < 256; j++)
+					close(j);
+				execvp(aargv[0], aargv);
+				_exit(127);
+			}
+			g_achild = ap;
+			printf("SPAWN: audio pid=%d -ss %.3f\n", (int)ap, ss);
+		}
+	}
 	fflush(stdout);
 	return pf[0];
 }
@@ -3359,7 +3400,11 @@ int main(int argc, char **argv)
 		const char *sp = getenv("SPAWN");
 
 		if (sp && *sp) {
+			const char *ap = getenv("AUDIO_SPAWN");
+
 			snprintf(g_spawn_tpl, sizeof g_spawn_tpl, "%s", sp);
+			if (ap && *ap)
+				snprintf(g_atpl, sizeof g_atpl, "%s", ap);
 			g_spawn_mode = 1;
 			g_ss0 = getenv("SS") ? atof(getenv("SS")) : 0.0;
 			/* play.sh 会导出 DUR（片源总长）；裸跑没有就是未知，

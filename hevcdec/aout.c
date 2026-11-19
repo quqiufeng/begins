@@ -67,6 +67,15 @@ static int           g_pause_mode;      /* 0 未生效 / 1 硬件 PAUSE / 2 写�
 static long          g_written;         /* 已写进 ring 的帧（累计） */
 static long          g_frozen_ms = -1;  /* 暂停时冻结的播放位置 */
 static int           g_xrun, g_vol = 100;
+static double        g_last_ok;         /* 上次 writei 成功返回的时刻（诊断用） */
+
+/* ring：声明必须在 write_all_frames 之前（xrun 诊断要读水位） */
+static short *g_ring;                 /* 只是块内存，按帧索引用 */
+static size_t g_ring_cap;             /* 帧 */
+static size_t g_ring_rd, g_ring_wr, g_ring_used;
+static int    g_in_eof;
+static pthread_mutex_t rlk = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  rcv = PTHREAD_COND_INITIALIZER;
 static volatile int  g_listen = -1;   /* 控制口 listen fd：上游 EOF 时要能把它踢醒 */
 static int           g_underruns_recovered;
 static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
@@ -161,6 +170,29 @@ static int hw_setup(void)
 	/* 回读硬件真正给的尺寸 */
 	g_buf = p.intervals[SNDRV_PCM_HW_PARAM_BUFFER_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].max;
 	g_period = p.intervals[SNDRV_PCM_HW_PARAM_PERIOD_SIZE - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL].max;
+	/* 关键：start_threshold 必须设成 buf-period。
+	 * 不设的话内核默认值是 1 个 period，第一次 writei 就启动 DMA，ALSA 缓冲里只有
+	 * 85 ms 的货，上游（ffmpeg → 管道）随便抖一下就是 EPIPE，一条日志里连续
+	 * "xrun #1 #2 #3" 就是这么来的。设成 buf-period 后，起播前先把缓冲垫满。 */
+	{
+		struct snd_pcm_sw_params sp;
+
+		memset(&sp, 0, sizeof sp);
+		sp.tstamp_mode   = SNDRV_PCM_TSTAMP_NONE;
+		sp.period_step   = 1;
+		sp.avail_min     = g_period;
+		sp.start_threshold = g_buf > g_period ? g_buf - g_period : g_period;
+		sp.stop_threshold  = g_buf;
+		sp.silence_threshold = 0;
+		sp.silence_size  = 0;
+		if (ioctl(pcmfd, SNDRV_PCM_IOCTL_SW_PARAMS, &sp) < 0)
+			fprintf(stderr, "aout: sw_params: %s（继续，但起播可能欠垫）\n",
+				strerror(errno));
+		else if (!g_quiet)
+			fprintf(stderr, "aout: 起播门槛 %.0f ms（缓冲 %.0f ms）\n",
+				sp.start_threshold * 1000.0 / g_rate,
+				g_buf * 1000.0 / g_rate);
+	}
 	if (ioctl(pcmfd, SNDRV_PCM_IOCTL_PREPARE, 0) < 0) return -1;
 	return 0;
 }
@@ -226,8 +258,17 @@ static int write_all_frames(const void *buf, unsigned int frames)
 				g_underruns_recovered++;
 				pthread_mutex_unlock(&lk);
 				ioctl(pcmfd, SNDRV_PCM_IOCTL_PREPARE, 0);
-				if (!g_quiet)
-					fprintf(stderr, "aout: xrun #%d，已 prepare 恢复\n", g_xrun);
+				if (!g_quiet) {
+					size_t used;
+
+					pthread_mutex_lock(&rlk);
+					used = g_ring_used;
+					pthread_mutex_unlock(&rlk);
+					fprintf(stderr, "aout: xrun #%d，已 prepare 恢复（距上次写入 %.0f ms，ring 水位 %zu 帧 %.0f ms）\n",
+						g_xrun,
+						g_last_ok > 0 ? (now_s() - g_last_ok) * 1000.0 : -1.0,
+						used, used * 1000.0 / g_rate);
+				}
 				continue;
 			}
 			if (errno == EINVAL || errno == ENODEV) {
@@ -256,19 +297,102 @@ static int write_all_frames(const void *buf, unsigned int frames)
 	return 0;
 }
 
+/* ---------- ring：读上游 与 写 ALSA 必须分家 ----------
+ *
+ * 老结构是一条线程 read() 完立刻 writei()：读管道的那几毫秒里 ALSA 缓冲在同步流失，
+ * 上游抖一下（ffmpeg 起播、磁盘/网络一顿）就直接 EPIPE。现在读线程只管往 ring 里灌，
+ * 写线程永远有货可写，ALSA 缓冲能一直垫满，抖动靠 ring 吸收。
+ * 单位一律用"帧"，省得去算跨环时把一帧劈两半。
+ */
+
+static int ring_init(void)
+{
+	/* 1 s 的抖动余量；太短吸收不了 ffmpeg 的顿，太长起播反应慢 */
+	size_t frames = g_rate ? g_rate : 48000;
+
+	if (frames < g_period * 4) frames = g_period * 4;
+	g_ring = malloc(frames * g_frame_bytes);
+	if (!g_ring) return -1;
+	g_ring_cap = frames;
+	g_ring_rd = g_ring_wr = g_ring_used = 0;
+	g_in_eof = 0;
+	return 0;
+}
+
+static void *read_thread(void *arg)
+{
+	(void)arg;
+	while (!g_quit && !g_in_eof) {
+		size_t space, cont;
+
+		pthread_mutex_lock(&rlk);
+		space = g_ring_cap - g_ring_used;
+		while (!space && !g_quit && !g_in_eof) {
+			struct timespec ts;
+			clock_gettime(CLOCK_REALTIME, &ts);
+			ts.tv_nsec += 200 * 1000000L;      /* 200 ms 一醒，好看见 g_quit */
+			if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+			pthread_cond_timedwait(&rcv, &rlk, &ts);
+			space = g_ring_cap - g_ring_used;
+		}
+		cont = g_ring_cap - g_ring_wr;         /* 到环尾还剩多少帧 */
+		pthread_mutex_unlock(&rlk);
+		if (g_quit || g_in_eof) break;
+		if (cont > space) cont = space;
+		if (!cont) {                           /* 正好写到环尾：绕回 0 */
+			pthread_mutex_lock(&rlk);
+			g_ring_wr = 0;
+			pthread_mutex_unlock(&rlk);
+			continue;
+		}
+
+		{
+			ssize_t n = read(g_in_fd,
+					 (char *)g_ring + g_ring_wr * g_frame_bytes,
+					 cont * g_frame_bytes);
+			if (n == 0) {                  /* 上游 EOF = 播完 */
+				pthread_mutex_lock(&rlk);
+				g_in_eof = 1;
+				pthread_mutex_unlock(&rlk);
+				pthread_cond_broadcast(&rcv);
+				pthread_cond_broadcast(&cv);
+				break;
+			}
+			if (n < 0) {
+				if (errno == EINTR) continue;
+				fprintf(stderr, "aout: 输入: %s\n", strerror(errno));
+				pthread_mutex_lock(&rlk);
+				g_in_eof = 1;
+				pthread_mutex_unlock(&rlk);
+				pthread_cond_broadcast(&rcv);
+				break;
+			}
+			{
+				size_t got = (size_t)n / g_frame_bytes;
+				pthread_mutex_lock(&rlk);
+				g_ring_wr = (g_ring_wr + got) % g_ring_cap;
+				g_ring_used += got;
+				pthread_mutex_unlock(&rlk);
+				pthread_cond_broadcast(&rcv);
+			}
+		}
+	}
+	return NULL;
+}
+
 static void *play_thread(void *arg)
 {
 	unsigned int chunk = g_period;                 /* 一次一个 period，够大够省 */
 	size_t chunk_bytes = (size_t)chunk * g_frame_bytes;
 	char *buf = malloc(chunk_bytes);
-	size_t have = 0;
 	double t0 = now_s();
 
 	(void)arg;
 	if (!buf) die("malloc");
 
 	while (!g_quit) {
-		ssize_t n;
+		unsigned int frames;
+		int eof;
 
 		if (g_paused) {
 			pthread_mutex_lock(&lk);
@@ -278,43 +402,54 @@ static void *play_thread(void *arg)
 				write_all_frames(buf, chunk);
 				continue;
 			}
-			while (g_paused && !g_quit)
-				pthread_cond_wait(&cv, &lk);
 			pthread_mutex_unlock(&lk);
+			/* 等 resume：rcv/cv 两边都可能在叫 */
+			pthread_mutex_lock(&rlk);
+			while (g_paused && !g_quit) {
+				struct timespec ts;
+				clock_gettime(CLOCK_REALTIME, &ts);
+				ts.tv_nsec += 100 * 1000000L;
+				if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+				pthread_cond_timedwait(&rcv, &rlk, &ts);
+			}
+			pthread_mutex_unlock(&rlk);
 			continue;
 		}
 
-		n = read(g_in_fd, buf + have, chunk_bytes - have);
-		if (n == 0) {                                 /* 上游 EOF = 播完 */
-			if (have >= g_frame_bytes) {          /* 尾巴不满一个 period 也要放出去 */
-				unsigned int tail = (unsigned int)(have / g_frame_bytes);
-				int vol;
-				pthread_mutex_lock(&lk);
-				vol = g_vol;
-				pthread_mutex_unlock(&lk);
-				if (vol != 100) {
-					if (g_fmt == SNDRV_PCM_FORMAT_S16_LE)
-						scale_s16((short *)buf, tail, vol);
-					else
-						scale_s32((int *)buf, tail, vol);
-				}
-				write_all_frames(buf, tail);
-			}
-			g_quit = 1;
-			if (g_listen >= 0) shutdown(g_listen, SHUT_RDWR);
-			break;
+		/* 从 ring 取货：等够一个 period 再写，EOF 时把尾巴也放出去 */
+		pthread_mutex_lock(&rlk);
+		while (!g_quit && g_ring_used < chunk && !g_in_eof && !g_paused) {
+			struct timespec ts;
+			clock_gettime(CLOCK_REALTIME, &ts);
+			ts.tv_nsec += 200 * 1000000L;
+			if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+			pthread_cond_timedwait(&rcv, &rlk, &ts);
 		}
-		if (n < 0) {
-			if (errno == EINTR) continue;
-			fprintf(stderr, "aout: 输入: %s\n", strerror(errno));
-			break;
+		frames = g_ring_used < chunk ? (unsigned int)g_ring_used : chunk;
+		eof = g_in_eof && g_ring_used == frames;
+		if (frames) {
+			size_t first = g_ring_cap - g_ring_rd;
+			if (first > frames) first = frames;
+			memcpy(buf, (char *)g_ring + g_ring_rd * g_frame_bytes,
+			       first * g_frame_bytes);
+			if (first < frames)
+				memcpy(buf + first * g_frame_bytes, g_ring,
+				       (frames - first) * g_frame_bytes);
+			g_ring_rd = (g_ring_rd + frames) % g_ring_cap;
+			g_ring_used -= frames;
 		}
-		have += (size_t)n;
-		if (have < chunk_bytes) continue;
+		pthread_mutex_unlock(&rlk);
+		if (frames) pthread_cond_broadcast(&rcv);   /* 叫醒读线程：空出位置了 */
 
-		/* 满一个 period 才写，帧对齐 */
+		if (!frames) {                                /* EOF 且 ring 空了 */
+			if (eof) {
+				g_quit = 1;
+				if (g_listen >= 0) shutdown(g_listen, SHUT_RDWR);
+			}
+			continue;
+		}
+
 		{
-			unsigned int frames = chunk;
 			int vol;
 			pthread_mutex_lock(&lk);
 			vol = g_vol;
@@ -326,11 +461,11 @@ static void *play_thread(void *arg)
 					scale_s32((int *)buf, frames, vol);
 			}
 		}
-		have = 0;
-		if (write_all_frames(buf, chunk) < 0) {
+		if (write_all_frames(buf, frames) < 0) {
 			fprintf(stderr, "aout: writei: %s\n", strerror(errno));
 			break;
 		}
+		g_last_ok = now_s();
 	}
 	free(buf);
 
@@ -424,6 +559,7 @@ static void set_pause(int on)
 		g_pause_mode = 0;
 		pthread_cond_broadcast(&cv);
 		pthread_mutex_unlock(&lk);
+		pthread_cond_broadcast(&rcv);
 		if (mode == 1)
 			ioctl(pcmfd, SNDRV_PCM_IOCTL_PAUSE, AOUT_PAUSE_OFF);
 	}
@@ -564,6 +700,13 @@ int main(int argc, char **argv)
 		sigaction(SIGALRM, &sa, NULL);
 	}
 
+	if (ring_init() < 0) die("ring malloc");
+	{
+		pthread_t rth;
+
+		if (pthread_create(&rth, NULL, read_thread, NULL) != 0) die("pthread_create");
+		pthread_detach(rth);
+	}
 	if (pthread_create(&th, NULL, play_thread, NULL) != 0) die("pthread_create");
 	ctl_serve();
 
@@ -592,7 +735,7 @@ int main(int argc, char **argv)
  * 而不是 exit（没有声音也不能把画面带走）。
  */
 #ifdef AOUT_EMBED
-static pthread_t g_th;
+static pthread_t g_th, g_rt;
 static int g_th_on;
 
 int aout_open(int rate, int ch, const char *fmt, int buf, int period,
@@ -644,6 +787,9 @@ int aout_start(int infd)
 	g_in_fd = infd;
 	if (!pcmfd) return -1;
 	if (g_th_on) return 0;
+	if (ring_init() < 0) return -1;
+	if (pthread_create(&g_rt, NULL, read_thread, NULL) != 0) return -1;
+	pthread_detach(g_rt);
 	if (pthread_create(&g_th, NULL, play_thread, NULL) != 0) return -1;
 	g_th_on = 1;
 	return 0;
@@ -696,6 +842,7 @@ void aout_stop(void)
 	if (pcmfd < 0) return;
 	g_quit = 1;
 	pthread_cond_broadcast(&cv);
+	pthread_cond_broadcast(&rcv);
 	if (g_th_on) { pthread_join(g_th, NULL); g_th_on = 0; }
 	ioctl(pcmfd, SNDRV_PCM_IOCTL_DROP, 0);
 	close(pcmfd);

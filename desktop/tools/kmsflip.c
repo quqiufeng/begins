@@ -32,6 +32,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -48,6 +49,9 @@ typedef int (*addfb2m_fn)(int, uint32_t, uint32_t, uint32_t, const uint32_t *,
                           const uint32_t *, const uint32_t *, const uint64_t *,
                           uint32_t *, uint32_t);
 typedef int (*rmfb_fn)(int, uint32_t);
+
+/* SetMaster 撞上 EBUSY 时最多等多久（秒）：够 vdec 收尾 + 进程退干净 */
+#define MASTER_RETRY 15.0
 
 static setcrtc_fn real_setcrtc;
 static pageflip_fn real_pageflip;
@@ -192,6 +196,80 @@ static uint32_t alias_fb(int fd, uint32_t src)
 	return dst;
 }
 
+/* ---- 管线被关成 fb=0 的抢救 ----
+ * 现场（2026-11-19）：桌面里按 ENTER 起播放器，播放器退出时 SDL 调
+ * drmModeSetCrtc(crtc, fb=0) 关 CRTC；meson 随即停掉 vout，vblank 不再产生。
+ * 之后的进程无论是桌面还是播放器，每次 drmModePageFlip 都返回 -EBUSY，
+ * 因为排队的原子提交永远等不到 vblank 落地，一次不落地则 CRTC 一直
+ * commit_pending —— 本进程所有翻页全被拒。而本 shim 把 -EBUSY 当「丢帧」
+ * 返回 0，SDL 以为上屏了，于是画面永久黑，只有重启桌面才能恢复。
+ * 出路只有一条：真 SetCrtc（阻塞式）把 vout 重新点起来。屏幕已经黑了，
+ * 此刻弹一次信号黄条无所谓；连续翻页成功就不再触发。 */
+static int crtc_has_fb(int fd, uint32_t crtcId, drmModeModeInfo *mode)
+{
+	drmModeCrtcPtr c;
+	int has;
+
+	c = real_getcrtc ? real_getcrtc(fd, crtcId) : NULL;
+	if (!c) return -1;
+	has = c->buffer_id != 0;
+	if (mode && c->mode_valid) *mode = c->mode;
+	drmModeFreeCrtc(c);
+	return has;
+}
+
+/* 从已接上的 encoder 反查 connector，真 SetCrtc 需要这个列表 */
+static int conns_for_crtc(int fd, uint32_t crtcId, uint32_t *out, int max)
+{
+	drmModeResPtr res;
+	int i, n = 0;
+
+	res = drmModeGetResources(fd);
+	if (!res) return 0;
+	for (i = 0; i < res->count_encoders; i++) {
+		drmModeEncoderPtr e = drmModeGetEncoder(fd, res->encoders[i]);
+		int j;
+
+		if (!e) continue;
+		if (e->crtc_id == crtcId) {
+			for (j = 0; j < res->count_connectors && n < max; j++) {
+				drmModeConnectorPtr c =
+					drmModeGetConnector(fd, res->connectors[j]);
+				if (!c) continue;
+				if (c->encoder_id == e->encoder_id &&
+				    c->connection == DRM_MODE_CONNECTED)
+					out[n++] = c->connector_id;
+				drmModeFreeConnector(c);
+			}
+		}
+		drmModeFreeEncoder(e);
+		if (n) break;
+	}
+	drmModeFreeResources(res);
+	return n;
+}
+
+static int rescue_setcrtc(int fd, uint32_t crtcId, uint32_t fbId,
+                          const drmModeModeInfo *mode)
+{
+	uint32_t conns[8] = { 0 };
+	drmModeModeInfo m;
+	int n, ret;
+
+	if (!mode || !mode->clock) {
+		memset(&m, 0, sizeof m);
+		if (crtc_has_fb(fd, crtcId, &m) < 0 || !m.clock) return -EINVAL;
+		mode = &m;
+	}
+	if (!fbId) return -EINVAL;
+	n = conns_for_crtc(fd, crtcId, conns, 8);
+	if (!n) return -ENOENT;
+	ret = real_setcrtc(fd, crtcId, fbId, 0, 0, conns, n, (drmModeModeInfoPtr)mode);
+	say("    [rescue] 管线被关(fb=0) → 真 SetCrtc fb=%u conns=%d 返回 %d",
+	    fbId, n, ret);
+	return ret;
+}
+
 /* 同一个模式 = 时钟/有效区/总时序/刷率都一样。只比 hdisplay 不够：
  * 1080p50 和 1080p60 尺寸相同但确实是两种模式，那必须走真 modeset。 */
 static int same_mode(const drmModeModeInfo *a, const drmModeModeInfo *b)
@@ -234,6 +312,7 @@ int drmModeSetCrtc(int fd, uint32_t crtcId, uint32_t bufferId, uint32_t x, uint3
 	drmModeFBPtr fb = NULL;
 	struct orig *o;
 	int ret, treat = 0;	/* 0=真 SetCrtc 1=翻页 2=吞掉 */
+	int no_fb = 0;		/* 进来时 CRTC 已经被关成 fb=0 */
 	char cm[32] = "无", rm[32] = "无";
 
 	boot();
@@ -249,7 +328,7 @@ int drmModeSetCrtc(int fd, uint32_t crtcId, uint32_t bufferId, uint32_t x, uint3
 	fmt_mode(cm, sizeof cm, cur && cur->mode_valid ? &cur->mode : NULL);
 
 	o = orig_for(crtcId);
-	if (o && !o->armed && cur) {
+	if (o && !o->armed && cur && cur->buffer_id) {
 		o->buffer_id = cur->buffer_id;
 		o->mode = cur->mode;
 	}
@@ -260,6 +339,15 @@ int drmModeSetCrtc(int fd, uint32_t crtcId, uint32_t bufferId, uint32_t x, uint3
 		goto realpath;
 	}
 	if (o && !o->armed && bufferId != o->buffer_id) o->armed = 1;
+
+	/* C 管线被关：SDL/播放器退出时会把 CRTC 设成 fb=0，meson 停 vout 后
+	 * vblank 没了，本进程的 PageFlip 全部 -EBUSY 且永远不落地。这时绝
+	 * 不能再降级成翻页，必须放行真 modeset 把管线点起来。 */
+	if (cur && !cur->buffer_id) {
+		say("#%d [recover] crtc=%u fb=%u 当前 CRTC 无 fb，走真 modeset",
+		    seq, crtcId, bufferId);
+		goto realpath;
+	}
 
 	/* A 还原抑制 */
 	if (o && o->armed && bufferId == o->buffer_id && same_mode(mode, &o->mode)) {
@@ -298,6 +386,7 @@ realpath:
 	return ret;
 
 done:
+	no_fb = cur && !cur->buffer_id;
 	if (fb) drmModeFreeFB(fb);
 	if (cur) drmModeFreeCrtc(cur);
 	if (mode_kind == 1 || treat == 2) {
@@ -327,7 +416,16 @@ done:
 			 * 它那一次 pending 落地后 CRTC 会空出几 ms 给我们。 */
 			usleep(2500);
 		}
-		if (ret) {
+		if (ret && no_fb) {
+			/* 唯一例外：CRTC 本来就被关成 fb=0（播放器/上个进程
+			 * 退出时干的），翻页永远 -EBUSY。这种时候只能真
+			 * SetCrtc 把管线点起来，否则画面永久黑。屏幕已经黑
+			 * 了，弹一次信号黄条无所谓。 */
+			int r2 = rescue_setcrtc(fd, crtcId, bufferId, mode);
+
+			if (!r2) ret = 0;
+			else say("       └ rescue 也失败 %d", r2);
+		} else if (ret) {
 			/* 绝不回落 SetCrtc：本路径模式没变，同模式 SetCrtc 在
 			 * meson 上仍会重写 vout 时序 —— 电视就弹一次信号黄条。
 			 * 这一帧直接丢，当作已生效返回；画面由下一帧的 PageFlip
@@ -374,6 +472,14 @@ int drmModePageFlip(int fd, uint32_t crtc, uint32_t fb, uint32_t flags, void *ud
 			if (!r2) ret = 0;
 		}
 	}
+	/* -EBUSY 且 CRTC 主 plane 是 fb=0：vout 已被关，vblank 不来，翻页
+	 * 永远不会落地。不抢救就是永久黑屏（就是「按一下就黑」那次的现场）。 */
+	if (ret == -EBUSY && !depth && crtc_has_fb(fd, crtc, NULL) == 0) {
+		uint32_t a = alias_fb(fd, fb);
+
+		if (!a) a = fb;
+		if (!rescue_setcrtc(fd, crtc, a, NULL)) ret = 0;
+	}
 	if (mode_kind && !depth) {	/* 每帧一次，全记会把日志刷爆：只留计数 */
 		static int bad;
 
@@ -402,12 +508,51 @@ int drmModeRmFB(int fd, uint32_t fb)
 
 int drmSetMaster(int fd)
 {
-	int ret;
+	int ret, n = 0;
 
 	boot();
 	init_once();
 	ret = real_setmaster ? real_setmaster(fd) : 0;
-	if (mode_kind) say("    [master] 拿 = %d   %s", ret, caller());
+	/* EBUSY = 另一个 DRM fd 还挂着 master：典型是刚退出的播放器/阅读器
+	 * （vdec 收尾常卡在 D 态，SIGKILL 也得等它从内核里出来），或 kmshold 那一口。
+	 * 桌面 resume 是一次性 SDL_InitSubSystem：SDL 拿到 EBUSY 就直接放弃，
+	 * 没人再上屏 → 整块屏黑着（这才是「按返回黑屏」的根）。
+	 * 这里替它等一小会儿，master 一放掉就接上。 */
+	while (ret == -1 && errno == EBUSY && n < (int)(MASTER_RETRY * 50)) {
+		usleep(20000);
+		n++;
+		ret = real_setmaster ? real_setmaster(fd) : 0;
+	}
+	if (mode_kind) {
+		if (n) {
+			say("    [master] 拿 = %d（EBUSY 重试 %d 次 %.2fs）   %s",
+			    ret, n, n * 0.02, caller());
+		} else {
+			say("    [master] 拿 = %d   %s", ret, caller());
+		}
+	}
+	if (ret != 0) {
+		int e = errno;
+		char p[64], t[512];
+		ssize_t k;
+
+		snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+		k = readlink(p, t, sizeof t - 1);
+		if (k > 0) t[k] = 0; else snprintf(t, sizeof t, "/dev/dri/card0");
+		say("       └ errno=%d(%s) fd=%d → %s（等满 %.1fs 仍失败）",
+		    e, strerror(e), fd, t, MASTER_RETRY);
+		/* 同一进程里另开一个 fd 再拿一次：区分「设备/进程态」和「这个 fd 的账」 */
+		int nfd = open(t, O_RDWR | O_CLOEXEC);
+		if (nfd >= 0) {
+			int r2 = real_setmaster ? real_setmaster(nfd) : -1;
+			int e2 = errno;
+			say("       └ 新 fd=%d 再拿 = %d errno=%d(%s)", nfd, r2,
+			    r2 ? e2 : 0, r2 ? strerror(e2) : "");
+			close(nfd);
+		} else {
+			say("       └ 新开 %s 失败 errno=%d(%s)", t, errno, strerror(errno));
+		}
+	}
 	return ret;
 }
 

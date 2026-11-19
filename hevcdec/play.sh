@@ -315,6 +315,8 @@ cleanup_old() {
 	done
 	pkill -9 -f 'ffmpeg .*-f hevc' 2>/dev/null
 	pkill -9 -f 'ffmpeg .*-f h264' 2>/dev/null
+	# 音频那条独立 ffmpeg（-vn -f s16le）：漏了它，下次起播会有两路抢 fifo
+	pkill -9 -f 'ffmpeg .*-f s16le' 2>/dev/null
 	# 上次异常退出会把 fifo 留在原地，ffmpeg 见到就 "File already exists" 收工
 	rm -f "$AFIFO"
 	# 老链路把声音交给游离的 mpv/mpvctl：不清掉就是两路抢同一个 PCM
@@ -467,7 +469,11 @@ do_play() {
 			rm -f "$AFIFO"
 			mkfifo -m 600 "$AFIFO" || die "建不了 $AFIFO"
 			AFIFO_USE=$AFIFO
-			AF="-map 0:a:0 -f s16le -ar 48000 -ac 2 $AFIFO"
+			# 音频不再挂在视频那条 ffmpeg 上：同一个进程顺序写两路输出，
+			# 视频管道一堵音频就跟着断喂（xrun 每秒一次的根因）。
+			# 这里写成独立模板，播放器 fork 第二个 ffmpeg，只吃音频、只写 fifo。
+			AF=""
+			AUDIO_SPAWN="ffmpeg -hide_banner -loglevel warning -nostdin -y -re -ss {SS} $DA $HTTP_OPT $IN_FMT -i $SRC -vn -map 0:a:0 -f s16le -ar 48000 -ac 2 $AFIFO"
 		else
 			say "片源没有音轨，只放画面"
 			# 电视上看不见终端：屏幕上也得说一句，否则"按音量键没反应"，
@@ -495,10 +501,23 @@ do_play() {
 	export CODEC
 	if [ -n "$AFIFO_USE" ]; then export AUDIO_FIFO="$AFIFO_USE"; else unset AUDIO_FIFO; fi
 	export AUDIO_BUF AUDIO_PERIOD
+
+	# 声卡没加载就等于彻底没声音：axg-sound-card 是 =m，开机没人 modprobe，
+	# 播放器只会打一行 "AUDIO: 声卡打不开" 然后只放画面（2026-11-19 重启后
+	# /proc/asound/cards 是空的，就是这么哑掉的）。这里兜一下，别静默。
+	if [ "$AUDIO" = 1 ]; then
+		_i=0
+		while [ ! -e /proc/asound/card0 ] && [ "$_i" -lt 15 ]; do
+			[ "$_i" = 0 ] && modprobe snd_soc_meson_axg_sound_card 2>/dev/null
+			_i=$((_i + 1)); sleep 0.2
+		done
+		[ -e /proc/asound/card0 ] || say "警告：声卡没起来（modprobe axg_sound_card 失败），只放画面"
+	fi
 	[ -n "$FPS" ] && export FPS
 	[ -n "$LEAD" ] && export LEAD
 	[ -n "$DITHER" ] && export TMDITHER="$DITHER"
 	export AF
+	[ -n "${AUDIO_SPAWN:-}" ] && export AUDIO_SPAWN
 
 	# ── spawn 模式：ffmpeg 收成播放器的子进程（design §5.4、§6.2）──
 	# 只有 spawn 才谈得上这三件事（都是实测过、不是推测）：
@@ -521,7 +540,7 @@ do_play() {
 		*[[:space:]]*)
 			say "片源/fifo 路径含空格：退回管道模式（spawn 模板不分词）" ;;
 		*)
-			export SPAWN="ffmpeg -hide_banner -loglevel warning -nostdin -y -re -ss {SS} $DA $HTTP_OPT $IN_FMT -i $SRC -map 0:v:0 -c:v copy -f $VF - $AF"
+			export SPAWN="ffmpeg -hide_banner -loglevel warning -nostdin -y -re -ss {SS} $DA $HTTP_OPT $IN_FMT -i $SRC -map 0:v:0 -c:v copy -f $VF -"
 			export SS DUR
 			SPAWNED=1 ;;
 		esac
