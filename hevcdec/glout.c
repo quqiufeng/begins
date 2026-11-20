@@ -578,8 +578,9 @@ static struct {
 	drmModeModeInfo mode;
 	struct gbm_bo *prev_bo;
 	uint32_t prev_fb;
-	struct gbm_bo *fly[4];
-	int fhead, ftail, nfly;
+	struct gbm_bo *fly[8];		/* 在飞的上屏 bo 环（fly[0] 最老） */
+	int nfly;			/* 环里现存几个 */
+	int hold;			/* 环深 GLHOLD，默认 2 */
 	double t_sum, t_max, tsum;
 	/* 分布账：平均 fps 会把"偶尔 40ms"和"稳定 30ms"算成一样，这里分开记 */
 	struct ps_hist h_draw, h_swap, h_flip, h_int;
@@ -1249,6 +1250,18 @@ int glout_init(unsigned sw, unsigned sh)
 		       "会全程黑屏）；本次按 0 处理\n", g.up);
 		g.up = 0;
 	}
+	/* 在飞 bo 环深。曾经怀疑 eglSwapBuffers 的阻塞（1080p60 下
+	 * swap=11ms）是在等空闲 bo，把环深从 1 加到 2/3 —— 实测
+	 * 42.9 / 43.0 / 43.4 fps，24p 下 1 和 2 完全相同：**不是 bo 饥饿**。
+	 * 那 11ms 是 pass1+pass2 的真 GPU 时间（GBM 隐式同步，渲染在
+	 * eglSwapBuffers 里才结算），环深解决不了。
+	 * 4 会直接死：gbm surface 只肯发 3 块 bo，第 4 块永远等不到
+	 * （实测 shown=4 drop=287）。默认 1 = 老语义，2/3 留作旋钮。
+	 */
+	g.hold = getenv("GLHOLD") ? atoi(getenv("GLHOLD")) : 1;
+	if (g.hold < 1) g.hold = 1;
+	if (g.hold > (int)(sizeof(g.fly) / sizeof(g.fly[0])))
+		g.hold = (int)(sizeof(g.fly) / sizeof(g.fly[0]));
 	g.vw = sw ? sw : g.dw;
 	g.vh = sh ? sh : g.dh;
 	if (g.vw > g.dw) g.vw = g.dw;
@@ -1840,13 +1853,8 @@ static int twopass_frame(unsigned w, unsigned h)
 	unsigned dW, dH, pw, ph;
 	double ar_s, ar_d, t0 = now_s();
 	double tA = t0, tB = t0, tC = t0, tD = t0, tE = t0;
-	int dx, dy;
+	int dx, dy, direct;
 
-	if (!g.prog2) {
-		g.prog2 = mk_prog(VS2, FS_COPY);
-		glGenTextures(1, &g.tex_rgb);
-		glGenFramebuffers(1, &g.fbo_rgb);
-	}
 	/* pass1 只做到"屏幕装得下"的尺寸：4K 源直接按 4K 做色调映射是白烧
 	 * 8.3M 片元，缩放后再上屏看不出差别（实测 4K 87ms → 后续测速对比）。
 	 */
@@ -1877,7 +1885,40 @@ static int twopass_frame(unsigned w, unsigned h)
 			ph = ((unsigned)(h * k + 0.5)) & ~1u;
 		}
 	}
-	if (pw != g.rw || ph != g.rh) {
+	/* 等比黑边在渲染 target 坐标系里算（pass2 和"直出"共用同一份）。
+	 * target 是 vw x vh（DPUSCALE=2 时 1920x1080），不是物理屏 —— DPU 把
+	 * 整张 target 一起放大，黑边比例不变，任意宽高比的源都对。
+	 */
+	ar_s = src_ar(w, h);
+	ar_d = (double)g.vw / g.vh;
+	if (ar_s > ar_d) {
+		dW = g.vw;
+		dH = (unsigned)(g.vw / ar_s + 0.5) & ~1u;
+	} else {
+		dH = g.vh;
+		dW = (unsigned)(g.vh * ar_s + 0.5) & ~1u;
+	}
+	dx = (g.vw - dW) / 2;
+	dy = (g.vh - dH) / 2;
+	{
+		/* 目标区域正好等于 pass1 的渲染尺寸时，pass2 只是把刚画好的东西
+		 * 1:1 搬一遍（整屏采样 + 写），纯浪费。这种情况 pass1 直接画到
+		 * target 上，省掉一整遍 fill。
+		 * 典型命中：1080p 源 + DPUSCALE=2（target 也是 1920x1080）。
+		 * GL1DIRECT=0 关掉做 A/B 对比。
+		 */
+		static int diron = -1;
+
+		if (diron < 0)
+			diron = getenv("GL1DIRECT") ? atoi(getenv("GL1DIRECT")) : 1;
+		direct = diron && dW == pw && dH == ph;
+	}
+	if (!direct && !g.prog2) {
+		g.prog2 = mk_prog(VS2, FS_COPY);
+		glGenTextures(1, &g.tex_rgb);
+		glGenFramebuffers(1, &g.fbo_rgb);
+	}
+	if (!direct && (pw != g.rw || ph != g.rh)) {
 		glBindTexture(GL_TEXTURE_2D, g.tex_rgb);
 		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, pw, ph, 0, GL_RGBA,
 			     GL_UNSIGNED_BYTE, NULL);
@@ -1888,10 +1929,21 @@ static int twopass_frame(unsigned w, unsigned h)
 		g.rw = pw; g.rh = ph;
 	}
 	/* pass1 */
-	glBindFramebuffer(GL_FRAMEBUFFER, g.fbo_rgb);
-	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-			       GL_TEXTURE_2D, g.tex_rgb, 0);
-	glViewport(0, 0, pw, ph);
+	if (direct) {
+		/* 直出：目标是 target 本身，黑边用 clear 打（VS 的 UV 翻转正好
+		 * 是上屏需要的方向，pass2 那套不翻的 VS2 只给 FBO 用）。
+		 */
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		glViewport(0, 0, g.vw, g.vh);
+		glClearColor(0, 0, 0, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glViewport(dx, g.vh - dy - dH, dW, dH);
+	} else {
+		glBindFramebuffer(GL_FRAMEBUFFER, g.fbo_rgb);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+				       GL_TEXTURE_2D, g.tex_rgb, 0);
+		glViewport(0, 0, pw, ph);
+	}
 	glUseProgram(g.prog);
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, g.tex_y);
@@ -1915,26 +1967,20 @@ static int twopass_frame(unsigned w, unsigned h)
 	tB = now_s();
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 	tC = now_s();
-	/* pass2：目标是渲染 target（vw x vh），不是屏幕 —— 放大交给 DPU。
-	 * 片元数因此从 dw*dh 降到 vw*vh（720p 源在 1080p 屏上是 25%）。
-	 * 等比黑边在 target 坐标系里算：DPU 把整张 target 一起放大，
-	 * 黑边比例不变，所以在任意宽高比的源上依然是对的。
+	/* pass2：把 FBO 里的成片等比缩放到渲染 target（vw x vh）。
+	 * direct 时 pass1 已经画在 target 上了，这遍整个省掉。
 	 */
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	ar_s = src_ar(w, h);
-	ar_d = (double)g.vw / g.vh;
-	if (ar_s > ar_d) { dW = g.vw; dH = (unsigned)(g.vw / ar_s + 0.5) & ~1u; }
-	else { dH = g.vh; dW = (unsigned)(g.vh * ar_s + 0.5) & ~1u; }
-	dx = (g.vw - dW) / 2;
-	dy = (g.vh - dH) / 2;
-	glClearColor(0, 0, 0, 1);
-	glClear(GL_COLOR_BUFFER_BIT);
-	glViewport(dx, g.vh - dy - dH, dW, dH);
-	glUseProgram(g.prog2);
-	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, g.tex_rgb);
-	glUniform1i(glGetUniformLocation(g.prog2, "uTex"), 0);
-	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	if (!direct) {
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		glClearColor(0, 0, 0, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glViewport(dx, g.vh - dy - dH, dW, dH);
+		glUseProgram(g.prog2);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, g.tex_rgb);
+		glUniform1i(glGetUniformLocation(g.prog2, "uTex"), 0);
+		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	}
 	tD = now_s();
 	osd_draw();		/* 提示条在屏幕坐标里，两 pass 之后再合成 */
 	tE = now_s();
@@ -1952,9 +1998,10 @@ static int twopass_frame(unsigned w, unsigned h)
 			de += tE - tD; ef += te - tE;
 			if (++n % 60 == 0)
 				printf("GLIN setup=%.1f p1=%.1f p2=%.1f osd=%.1f "
-				       "fin=%.1f ms/帧\n", ab / n * 1000,
+				       "fin=%.1f ms/帧%s\n", ab / n * 1000,
 				       bc / n * 1000, cd / n * 1000,
-				       de / n * 1000, ef / n * 1000);
+				       de / n * 1000, ef / n * 1000,
+				       direct ? " [直出,跳 pass2]" : "");
 		}
 	}
 	return 0;
@@ -2233,9 +2280,29 @@ swap:
 	}
 	g.s_flip += now_s() - tf;
 	}
-	if (g.prev_bo && g.prev_bo != bo) {
-		gbm_surface_release_buffer(g.gs, g.prev_bo);
-		g.prev_bo = NULL;
+	/* 在飞 bo 环：只持有 1 块时 eglSwapBuffers 必须等上一块扫出去
+	 * 才能拿回空闲 bo，实测 swap 阻塞 11ms（1080p60 的主瓶颈）。
+	 * 环深 g.hold 让"当前块 + 上一块"同时在飞，最老的一块到点释放。
+	 */
+	if (g.nfly >= g.hold) {
+		int i, dup = 0;
+
+		for (i = 0; i < g.nfly; i++)
+			if (g.fly[i] == bo) { dup = 1; break; }
+		if (!dup) {
+			gbm_surface_release_buffer(g.gs, g.fly[0]);
+			memmove(&g.fly[0], &g.fly[1],
+				sizeof(g.fly[0]) * (g.nfly - 1));
+			g.nfly--;
+		}
+	}
+	if (g.nfly < g.hold &&
+	    g.nfly < (int)(sizeof(g.fly) / sizeof(g.fly[0]))) {
+		int i, dup = 0;
+
+		for (i = 0; i < g.nfly; i++)
+			if (g.fly[i] == bo) { dup = 1; break; }
+		if (!dup) g.fly[g.nfly++] = bo;
 	}
 	g.prev_bo = bo;
 	g.frames++;		/* 画完并交出去了（= 提交，未必上屏） */
