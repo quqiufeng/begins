@@ -146,6 +146,10 @@ hdr-selftest: hdr-selftest.c $(PLAY_HDR)
 raptest: raptest.c $(PLAY_SRC) $(PLAY_HDR)
 	$(CC_HOST) -O1 -Wall -DUSE_DRM -I. -o $@ raptest.c spscolor.c render.c render_drm.c render_gl.c vout.c -lm
 
+# AU 切分自检（§1.4，纯逻辑，不需要 /dev/video0）：喂裸流，打印每个 AU
+autest: autest.c $(PLAY_SRC) $(PLAY_HDR)
+	$(CC_HOST) -O1 -Wall -DUSE_DRM -DAOUT_EMBED -I. -o $@ autest.c spscolor.c render.c render_drm.c render_gl.c vout.c vout_mode.c aout.c pctl.c osd.c -lm
+
 # ── DRM 探针：回答「这块 meson 到底能不能 xxx」的一次性小工具 ──────────────
 # 结论都写进 design_player.md 了，留在仓库是为了能复查现场，不是成品：
 #   atomicms       atomic modeset 到底行不行（带 ALLOW_MODESET 就 EINVAL 的定界）
@@ -190,5 +194,5 @@ clean:
 	      glselftest glselftest-aarch64 \
 	      aout aout-aarch64 aoutctl aoutctl-aarch64 aoutprobe-aarch64 \
 	      mpvctl mpvctl-aarch64 rcinputd rcinputd-aarch64 \
-	      vout.o vout-aarch64.o voutprobe voutprobe-aarch64 modetest raptest hdr-selftest hcvisual osdtest osd.ppm \
+	      vout.o vout-aarch64.o voutprobe voutprobe-aarch64 modetest raptest autest hdr-selftest hcvisual osdtest osd.ppm \
 	      libpctl.so libpctl-aarch64.so

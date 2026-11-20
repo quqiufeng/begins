@@ -126,20 +126,41 @@ ffmpeg -hide_banner -loglevel warning -re -ss "$START" \
 所以注册 `SIGUSR1` 时必须关掉 `SA_RESTART` —— `signal()` 默认会带上，
 否则 `read()` 被系统自动续上，seek 就变成"赌信号落在 poll 还是 read 上"的随机行为。
 
-### 1.4 AU 判据与规范不一致（唯一没修的正确性 bug）
+### 1.4 AU 判据：按 slice 头首比特切，不再假设单 slice（已修）
 
 规范的 AU 边界由 slice header 首比特 `first_slice_segment_in_pic_flag` 决定，
-**一帧可以有多个 slice，也就是多个 VCL NAL**。这里的实现是"见到第二个 VCL 就断"，
+**一帧可以有多个 slice，也就是多个 VCL NAL**。修之前这里是"见到第二个 VCL 就断"，
 等于硬编码了单 slice 假设。
 
-现有 4 个测试片源全是单 slice（脚本统计每个文件都是 `first=300 / nonfirst=0`），
-所以一直没暴露。一旦片源开多 slice（x265 `--slices`、广播级 4K 常见），
-一帧会被切成 N 个 AU → N 个 OUTPUT buffer → 驱动按 AU 记 `timestamps`，
-帧号、POC、DPB 全部错位，表现是花屏/马赛克/丢帧，而不是"时间稍不准"。
+现有 4 个测试片源全是单 slice（`first=300 / nonfirst=0`），所以一直没暴露。
+片源一开多 slice（x265 `--slices`、广播级 4K 常见），一帧会被切成 N 个 AU →
+N 个 OUTPUT buffer → 驱动按 AU 记 `timestamps`，帧号、POC、DPB 全部错位，
+表现是花屏/马赛克/丢帧，而不是"时间稍不准"。
 
-修法很便宜：进 AU 判据前读 slice header 首字节最高位，`1` 才是新图（3 行）。
-顺带两处小毛病：`t <= 31` 把 10–15、22–31 这些保留类型也算成 VCL；
-`iru` 里含 39（前缀 SEI），若 SEI 出现在多 slice 帧中间也会误切。
+复现与量化（`make autest`，纯逻辑，不需要 `/dev/video0`）：
+
+```
+ffmpeg -f lavfi -i testsrc2=size=640x360:rate=25:duration=2 \
+       -c:v libx265 -x265-params "slices=4:keyint=25" slices4.265
+./autest slices4.265      # 修后：au=50 rap=2  extra_slices=150
+                          # 修前：au=200 rap=8   ← 一帧拆 4 个 AU，RAP 也被算成 4 倍
+```
+
+关键是 RAP 数一起错：2 个 IRAP 帧在旧实现里报成 8 个"可起播点"，
+下游的会话重建/seek 门控（§1.10/§1.14）全按这个数做决策。
+
+修法（`v4l2hevc.c: slice_new_pic()`）：
+
+- HEVC 读 slice_segment_header 的第一比特 = 2 字节 NAL 头之后的 `nal[2] & 0x80`。
+  防竞争字节不可能插在最前面（它前面是 NAL 头，不是 `00 00`），所以不用跳零/去 03。
+- H.264 沿用原来的 `first_mb_in_slice`（ue(v) 首比特为 1），两路统一走 `slice_new_pic()`。
+- `nal_vcl()` 收紧成 HEVC 的 0..9 / 16..21：旧实现 `t <= 31` 把 10–15、22–31
+  这些保留类型也算 VCL，真出现就会凭空切断 AU。
+- `nal_iru()` 去掉 39（前缀 SEI），改成"挂起边界"`s_pend_cut`：见到 39 先记下起点，
+  等下一个 VCL 决定归属 —— 是同一图像的续篇 slice 就撤销挂起（SEI 留在本 AU），
+  是新图像就用它当边界（SEI 归下一个 AU）。这样既不会把多 slice 帧在 SEI 处劈开，
+  又保持了单 slice 片源的 AU 边界逐字节不变（4 个测试片源改前改后 `autest` 输出 md5 相同）。
+- 诊断：`RAPDBG=1` 多打 `extra_slices=N`；`SLICEDBG=1` 逐条打非首 slice。
 
 ### 1.5 没有 PTS 的连锁反应
 
@@ -360,10 +381,10 @@ GL 那摊已经为"静态链"付过一次这样的学费了。
   1080p 以下看不出（24/25 差 4%），4K 就是 §3.5 记的"快 15%"那类漂移的放大器。
 - 附带白拿：`duration`（现在 `probe` 要 fork 一次 `ffprobe` 只为拿一个数，
   且 `-ss` 之后这数就不对了）、色彩传递元数据（§3.3 的 HDR 判定现在靠 `HDR=1` 环境变量猜）、
-  以及多 slice 帧的 AU 边界（§1.4 那个补丁根本不用写）。
+  以及多 slice 帧的 AU 边界（§1.4 已经从 slice 头里读出来了）。
 
 **为什么现在不翻案**：上面四个成本里 ①③ 是一次性但很重，②④ 是持续维护成本；
-而当前离"能稳定看片"还差着 AU 判据和上游存活检测（§1.4/§1.6），
+而当前离"能稳定看片"还差着上游存活检测（§1.6），
 先修那两处能把体验拉直，成本是几行。
 
 **翻案条件（任一触发就动手）**：

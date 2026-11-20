@@ -378,20 +378,30 @@ static int nal_type(const unsigned char *p)
 	return (p[0] >> 1) & 0x3f;	/* HEVC：2 字节头 */
 }
 
-/* HEVC：VCL 是 0..31。H.264：VCL 是 1..5（非 IDR 片=1、分区 A/B/C=2..4、
- * IDR=5），6=SEI、7=SPS、8=PPS、9=AUD。 */
+/* HEVC：VCL 只有 0..9（TRAIL/TSA/STSA/RADL/RASL）和 16..21（BLA/IDR/CRA），
+ * 10..15 与 22..31 是保留值——旧实现写 `t <= 31` 把它们也算成 VCL，
+ * 一旦片源真的出现保留类型，AU 会被凭空切断。
+ * H.264：VCL 是 1..5（非 IDR 片=1、分区 A/B/C=2..4、IDR=5），
+ * 6=SEI、7=SPS、8=PPS、9=AUD。 */
 static int nal_vcl(int t)
 {
-	return g_h264 ? (t >= 1 && t <= 5) : (t <= 31);
+	if (g_h264)
+		return t >= 1 && t <= 5;
+	return t <= 9 || (t >= 16 && t <= 21);
 }
 
-/* 出现在 AU 之前、本身属于下一个 AU 的 NAL（HEVC 的 VPS/SPS/PPS/AUD/
- * SEI，H.264 的 SEI/SPS/PPS/AUD）。见到它就说明上一个 AU 已经收口。 */
+/* 出现在 AU 之前、本身属于下一个 AU 的 NAL（HEVC 的 VPS/SPS/PPS/AUD，
+ * H.264 的 SEI/SPS/PPS/AUD）。见到它就说明上一个 AU 已经收口。
+ *
+ * HEVC 的 prefix SEI（39）故意不在这里：它是"下一帧"的开头，但同图的
+ * 后续 slice 之间也可能插 SEI（编码器把 SLI/解码单元信息插在 slice 之间），
+ * 见到 39 就收口会把多 slice 的一帧拆成两个 AU。改由扫描循环按"下一个
+ * VCL 是不是新图像"来定它归哪一边（挂起边界 s_pend_cut）。 */
 static int nal_iru(int t)
 {
 	if (g_h264)
 		return t == 6 || t == 7 || t == 8 || t == 9;
-	return t == 32 || t == 33 || t == 34 || t == 35 || t == 39 || t == 41;
+	return t == 32 || t == 33 || t == 34 || t == 35 || t == 41;
 }
 
 /* H.264 的 AU 边界藏在 slice 头里：first_mb_in_slice==0 表示新图像开始
@@ -411,6 +421,26 @@ static int h264_new_pic(const unsigned char *nal, size_t n)
 		return (c & 0x80) != 0;
 	}
 	return 0;
+}
+
+/* HEVC 同理，判据是 slice_segment_header() 的第一个比特：
+ * first_slice_segment_in_pic_flag。它在 2 字节 NAL 头之后的第一个 RBSP
+ * 字节的最高位，且防竞争字节不可能插在最前面（前面是 NAL 头，不是 00 00），
+ * 所以直接读 nal[2] & 0x80，不用跳零、不用去 03。
+ * 不判这一位的话，多 slice 的一帧（x265 --slices、广播级 4K 常见）会被
+ * 当成 N 个 AU 喂给驱动：驱动按 vififo offset 对 timestamps，帧号/POC/DPB
+ * 全部错位 —— 屏上就是花屏、马赛克。见 design §1.4。
+ */
+static int hevc_new_pic(const unsigned char *nal, size_t n)
+{
+	if (n < 3)	/* 连首字节都没有，不可能是有效 slice：不切断 */
+		return 0;
+	return (nal[2] & 0x80) != 0;
+}
+
+static int slice_new_pic(const unsigned char *nal, size_t n)
+{
+	return g_h264 ? h264_new_pic(nal, n) : hevc_new_pic(nal, n);
 }
 
 /* NAL 投票判格式：HEVC 的 VPS/SPS/PPS/AUD/SEI 是 0x40/0x42/0x44/0x46/0x4e，
@@ -1329,6 +1359,13 @@ static int s_au_last_rap, s_au_last_rasl;
 /* 本 AU 里第一个 prefix SEI 的偏移（0 = 没有）。SEI 解析放在 AU 收口处做：
  * 只有那时才知道这条 NAL 的结束位置，不用为了找 NAL 尾巴再扫一遍码流。 */
 static size_t s_au_sei;		/* 已废弃，留着不动数据布局 */
+/* 挂起的 AU 边界：见到 prefix SEI(39) 时先记下它的起始码位置，等下一个 VCL
+ * 决定归属——是同一图像的下一个 slice 就撤掉（SEI 留在本 AU），是新图像
+ * 就用它当边界（SEI 归下一个 AU）。0 = 没有挂起。 */
+static size_t s_pend_cut;
+/* 多 slice 统计（SLICEDBG 打印）：一个 AU 里出现第 2 个及以后的 slice 的次数 */
+static int s_au_slices;
+static int g_ms_au, g_ms_slices;
 static size_t s_sei_pl;		/* 当前 SEI NAL 起点；0=没有待解析的 SEI */
 static size_t s_sps_pl;		/* 当前 SPS NAL 起点；0=没有待解析的 SPS */
 static size_t g_stream_bytes;	/* 已消费字节，用于码率统计 */
@@ -1459,6 +1496,8 @@ static void s_compact(void)
 		n_cpt++;
 		s_len -= s_au_start;
 		s_pos -= s_au_start;
+		if (s_pend_cut)
+			s_pend_cut -= s_au_start;
 		s_au_start = 0;
 	}
 	s_release = 0;
@@ -1525,8 +1564,8 @@ static int stream_next_au(const unsigned char **out, size_t *outlen)
 	for (;;) {
 		while (s_pos + 4 <= s_len) {
 			unsigned char *p = s_buf + s_pos;
-			size_t sc, pl;
-			int t, vcl, iru;
+			size_t sc, pl, mcut = 0;	/* mcut：本轮要切的 AU 边界 */
+			int t, vcl, iru, first = 0;	/* first：本 slice 是不是新图像首片 */
 
 			if (!(p[0] == 0 && p[1] == 0 && p[2] == 1)) {
 				s_pos++;
@@ -1560,6 +1599,8 @@ static int stream_next_au(const unsigned char **out, size_t *outlen)
 			}
 			vcl = nal_vcl(t);
 			iru = nal_iru(t);
+			if (vcl)
+				first = slice_new_pic(&s_buf[pl], s_len - pl);
 			/* 注意顺序：SEI 属于"将要开始的 AU"，不能在这里记。
 			 * 之前就在这里赋值，AU 收口时拿到的是下一个 AU 的 SEI 偏移，
 			 * sc - s_au_sei 变成巨大的 size_t，csig_sei() 就把整段压缩数据
@@ -1571,23 +1612,45 @@ static int stream_next_au(const unsigned char **out, size_t *outlen)
 				s_au_rap = 0;
 				s_au_rasl = 0;
 				s_au_sei = 0;
-			} else if ((vcl && s_cur_vcl &&
-				    (!g_h264 || h264_new_pic(&s_buf[pl],
-							     s_len - pl))) ||
-				   (iru && s_cur_vcl)) {
-				size_t len = sc - s_au_start;
+				s_au_slices = 0;
+			} else if (vcl && s_cur_vcl) {
+				/* AU 边界只看 slice 头第一位：多 slice 的一帧
+				 * 只有第一个 slice 才切，后面的都是同图续篇。
+				 * 之前 HEVC 一律"第二个 VCL 就切"，多 slice
+				 * 片源一帧被拆成 N 个 AU，帧号/POC/DPB 全错。
+				 * 见 design §1.4。 */
+				if (first) {
+					mcut = s_pend_cut ? s_pend_cut : sc;
+				} else {
+					/* 同图后续 slice：中间那个 prefix SEI
+					 * 属于本图，撤掉挂起的边界 */
+					s_pend_cut = 0;
+				}
+			} else if (iru && s_cur_vcl) {
+				mcut = sc;
+			}
+			/* prefix SEI 的归属要往后再看一眼：后面接的是同图的
+			 * 续篇 slice 就留在本 AU，接的是新图像就归下一个 AU。
+			 * 不挂起直接切，多 slice 帧中间的 SEI 就会把一帧拆两半。 */
+			if (!mcut && !g_h264 && t == 39 && s_cur_vcl)
+				s_pend_cut = sc;
+			if (mcut) {
+				size_t len = mcut - s_au_start;
 
 				if (!len) {	/* 空 AU，跳过 */
-					s_pos = sc;
+					s_pos = mcut;
+					s_cur_vcl = 0;
+					s_pend_cut = 0;
 					continue;
 				}
 				*out = s_buf + s_au_start;
 				*outlen = len;
 				g_stream_bytes += len;
 				g_stream_au++;
-				s_pos = sc;
-				s_au_start = sc;
+				s_pos = mcut;
+				s_au_start = mcut;
 				s_cur_vcl = 0;
+				s_pend_cut = 0;
 				s_au_sei = (t == 39) ? pl : 0;	/* 归新 AU */
 				s_release = 1;
 				{
@@ -1598,15 +1661,28 @@ static int stream_next_au(const unsigned char **out, size_t *outlen)
 					s_au_last_rasl = rasl;
 					s_au_rap = 0;
 					s_au_rasl = 0;
-					if (k && getenv("RAPDBG"))
-						printf("RAPDBG au=%d rap=%d rec=%d rasl=%d\n",
+					if (s_au_slices) {
+						g_ms_au++;
+						g_ms_slices += s_au_slices;
+					}
+					if ((k || s_au_slices) && getenv("RAPDBG"))
+						printf("RAPDBG au=%d rap=%d rec=%d rasl=%d extra_slices=%d\n",
 						       g_stream_au, k,
-						       rap_recoverable(k), rasl);
+						       rap_recoverable(k), rasl,
+						       s_au_slices);
+					s_au_slices = 0;	/* 下一个 AU 重开计数 */
 					return k ? 2 : 1;	/* 2 = 关键帧 */
 				}
 			}
 			if (vcl) {
 				s_cur_vcl = 1;
+				if (!first) {	/* 同图续篇 slice */
+					s_au_slices++;
+					if (getenv("SLICEDBG"))
+						printf("SLICEDBG au=%d nal=%zu t=%d slice+1 (total=%d)\n",
+						       g_stream_au + 1, pl, t,
+						       s_au_slices);
+				}
 				if (g_h264) {
 					/* H.264 的随机接入点只有 IDR（type 5），
 					 * 空 DPB 上直接可解，等价于 HEVC 的
@@ -1626,6 +1702,26 @@ static int stream_next_au(const unsigned char **out, size_t *outlen)
 			s_pos = pl + 1;
 		}
 		if (s_eof) {
+			/* 挂起的 SEI 后面没有 VCL 了：它属于一个没开始就结束的
+			 * AU（EOS 处常见），当前 AU 就切在它前面。 */
+			if (s_pend_cut) {
+				if (s_au_open && s_pend_cut > s_au_start) {
+					*out = s_buf + s_au_start;
+					*outlen = s_pend_cut - s_au_start;
+					g_stream_bytes += *outlen;
+					g_stream_au++;
+					s_au_start = s_pend_cut;
+					s_cur_vcl = 0;
+					s_pend_cut = 0;
+					s_release = 1;
+					s_au_last_rap = s_au_rap;
+					s_au_last_rasl = s_au_rasl;
+					s_au_rap = 0;
+					s_au_rasl = 0;
+					return s_au_last_rap ? 2 : 1;
+				}
+				s_pend_cut = 0;
+			}
 			if (s_au_open && s_len > s_au_start) {
 				size_t len = s_len - s_au_start;
 				int k = s_au_rap;
@@ -1651,6 +1747,11 @@ static int stream_next_au(const unsigned char **out, size_t *outlen)
 				s_au_rap = 0;
 				s_au_rasl = 0;
 				s_release = 1;
+				if (s_au_slices) {
+					g_ms_au++;
+					g_ms_slices += s_au_slices;
+					s_au_slices = 0;
+				}
 				if (k && getenv("RAPDBG"))
 					printf("RAPDBG au=%d rap=%d rec=%d rasl=%d (eof)\n",
 					       g_stream_au, k,
