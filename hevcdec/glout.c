@@ -572,6 +572,8 @@ static struct {
 	 */
 	unsigned vw, vh;
 	unsigned up;		/* 约定的最大放大倍数（DPU 放大超 4x 糊得明显） */
+	int autoup;		/* 1 = up 由 auto_up() 现算（DPUSCALE 没给），
+				 * 跟着源分辨率走，target 恒等于 屏/up */
 	int dx, dy;
 	unsigned dW, dH;
 	uint32_t crtc_id, conn_id, cur_fb;
@@ -1167,6 +1169,72 @@ static double src_ar(unsigned w, unsigned h)
 	return (double)w * par / (double)h;
 }
 
+/* pass1 的实际渲染尺寸：源等比缩到 1080p 量级以内（GL1MAX 可覆盖高度上限）。
+ * 4K 全尺寸做色调映射是白烧 8.3M 片元，缩一半肉眼看不出差别。
+ * twopass_frame 和 auto_up 必须用同一份，否则自动倍数会算出「target 比
+ * pass1 还小」这种要先缩再放的情况。
+ */
+static void p1_size(unsigned w, unsigned h, unsigned *pw, unsigned *ph)
+{
+	unsigned maxw = 1920, maxh = 1080;
+	const char *mx = getenv("GL1MAX");	/* 覆盖 pass1 高度上限 */
+
+	if (g.dw < maxw) maxw = g.dw;
+	if (g.dh < maxh) maxh = g.dh;
+	if (mx) {
+		maxh = (unsigned)atoi(mx);
+		if (maxh < 240) maxh = 240;
+		if (maxh > g.dh) maxh = g.dh;
+		maxw = (unsigned)((uint64_t)g.dw * maxh / g.dh);
+	}
+	*pw = w;
+	*ph = h;
+	if (w > maxw || h > maxh) {
+		double k = (double)maxw / w;
+
+		if ((double)maxh / h < k) k = (double)maxh / h;
+		*pw = ((unsigned)(w * k + 0.5)) & ~1u;
+		*ph = ((unsigned)(h * k + 0.5)) & ~1u;
+	}
+}
+
+/* 自动选 DPU 放大倍数。
+ *
+ * 出发点：pass1 反正只画到 1080p 量级（p1_size），所以 target 比它大就是
+ * 白写一遍像素 —— 4K 屏 + 1080p 源的老路径正是「1080p 上做 tone map，
+ * 再 GPU 整屏放大到 4K」，多出来的那次 4K fill 纯属浪费，交给 DPU 做。
+ * 4K 源同样如此：pass1 本来就缩到 1080p，target 没理由还是 4K。
+ *
+ * 条件全来自实测的两个死结（见下面 init 里的注释）：target 必须与屏幕同
+ * 比例、且只能是整屏的整数分之一，所以直接按屏尺寸整除来取：
+ *   1. up 整除屏宽高，且 target 各边为偶数（GBM/DPU 的 2 字节对齐）；
+ *   2. target 不小于 pass1 尺寸，否则等于先缩小再放大，白丢清晰度；
+ *   3. target 不超过 1920x1080，更大的 target 只是多填一遍像素。
+ * 取满足条件的**最大** up：target 越小越省 fill，而且只要 target 不小于
+ * pass1 尺寸，多出来的那点放大本来也换不来真细节（720p 源 target 用
+ * 1280x720 就等于 pass1 原尺寸 → 走直出、连 pass2 都省掉；用 1920x1080
+ * 只是让 GPU 先放大一遍再交给 DPU 放大一遍）。上限 4x。
+ * 返回 0 表示不走 DPU 放大，target 就是整屏。
+ */
+static unsigned auto_up(unsigned w, unsigned h)
+{
+	unsigned pw, ph, up;
+
+	p1_size(w, h, &pw, &ph);
+	for (up = 4; up >= 2; up--) {
+		unsigned tw, th;
+
+		if (g.dw % up || g.dh % up) continue;
+		tw = g.dw / up;
+		th = g.dh / up;
+		if ((tw | th) & 1u) continue;
+		if (tw > 1920 || th > 1080) continue;
+		if (tw < pw || th < ph) continue;
+		return up;
+	}
+	return 0;
+}
+
 int glout_init(unsigned sw, unsigned sh)
 {
 	const char *dev = getenv("DRMDEV") ? getenv("DRMDEV") : "/dev/dri/card0";
@@ -1207,9 +1275,14 @@ int glout_init(unsigned sw, unsigned sh)
 	 * 才成立（legacy SetCrtc/PageFlip 对小 fb 一律 ENOSPC）。初始化失败不算
 	 * 致命：退回 legacy 继续跑，只是不能开 DPUSCALE。
 	 */
-	if (getenv("ATOMIC") && atoi(getenv("ATOMIC")))
+	/* 默认就试 atomic：自动 DPU 放大（auto_up）只在 atomic 下成立，而
+	 * play.sh 这条真实链路不传 ATOMIC= ——— 不默认试的话「按源自适应」
+	 * 只在手工跑测试时才生效（实测 play.sh 起播照样是整屏 target）。
+	 * 失败只是回到 legacy（整屏 target + GL 放大），不影响出图，所以
+	 * 默认开、ATOMIC=0 显式关。 */
+	if (!getenv("ATOMIC") || atoi(getenv("ATOMIC")))
 		if (atomic_init() < 0)
-			printf("GLOUT: atomic 初始化失败，退回 legacy 上屏\n");
+			printf("GLOUT: atomic 初始化失败，退回 legacy 上屏（不缩 target）\n");
 	g.gbm = gbm_create_device(g.dfd);
 	if (!g.gbm) gdie("gbm_create_device");
 	/* 渲染目标取「源尺寸」，由 DPU 硬件放大到屏幕（§4.1 形态 A）：
@@ -1240,15 +1313,26 @@ int glout_init(unsigned sw, unsigned sh)
 	 * 720p 源上实测 55.5 fps，整屏 target 是 58.9 fps —— 放大不赚还略亏，
 	 * 却要多一层插值。留着当手动旋钮（DPUSCALE=2/4 + ATOMIC=1 能跑通、
 	 * 300/300 上屏），但不该是默认行为。 */
-	g.up = getenv("DPUSCALE") ? (unsigned)atoi(getenv("DPUSCALE")) : 0;
+	/* 自动模式（默认）：倍数由「源 + 屏」现算，DPUAUTO=0 退回整屏 target。
+	 * 手动 DPUSCALE=n 仍然优先，语义不变（target = 源尺寸，n 是上限）。 */
+	if (getenv("DPUSCALE")) {
+		g.up = (unsigned)atoi(getenv("DPUSCALE"));
+	} else if (getenv("DPUAUTO") && !atoi(getenv("DPUAUTO"))) {
+		g.up = 0;
+	} else {
+		g.up = auto_up(sw ? sw : g.dw, sh ? sh : g.dh);
+		g.autoup = 1;
+	}
 	/* 死结 1 的后果：没有 atomic 就只有 legacy SetCrtc/PageFlip，而这两条
 	 * 对小 fb 一律 ENOSPC —— 显式要了 DPUSCALE 却忘了 ATOMIC=1，实测就是
 	 * 全程黑屏（submit 300 / shown 0，日志只有一行 SetCrtc 失败）。
 	 * 与其让人对着黑屏猜，这里直接否掉并说清原因。 */
 	if (g.up && !g.atomic) {
-		printf("GLOUT: DPUSCALE=%u 需要 ATOMIC=1（legacy 不收小 fb，"
-		       "会全程黑屏）；本次按 0 处理\n", g.up);
+		printf("GLOUT: DPU 放大 %ux 需要 ATOMIC=1（legacy 不收小 fb，"
+		       "会全程黑屏）；本次按 0 处理（target 退回整屏，GL 自己放大）\n",
+		       g.up);
 		g.up = 0;
+		g.autoup = 0;
 	}
 	/* 在飞 bo 环深。曾经怀疑 eglSwapBuffers 的阻塞（1080p60 下
 	 * swap=11ms）是在等空闲 bo，把环深从 1 加到 2/3 —— 实测
@@ -1262,25 +1346,38 @@ int glout_init(unsigned sw, unsigned sh)
 	if (g.hold < 1) g.hold = 1;
 	if (g.hold > (int)(sizeof(g.fly) / sizeof(g.fly[0])))
 		g.hold = (int)(sizeof(g.fly) / sizeof(g.fly[0]));
-	g.vw = sw ? sw : g.dw;
-	g.vh = sh ? sh : g.dh;
-	if (g.vw > g.dw) g.vw = g.dw;
-	if (g.vh > g.dh) g.vh = g.dh;
-	g.vw &= ~1u;
-	g.vh &= ~1u;
-	if (!g.vw || !g.vh) { g.vw = g.dw; g.vh = g.dh; }
-	{
-		double asp_t = (double)g.vw / g.vh;
-		double asp_s = (double)g.dw / g.dh;
+	if (g.autoup) {
+		/* 自动模式：target 由屏尺寸整除得到，与源尺寸无关。pass1 反正会
+		 * 把 4K/1080p 源都缩到 1080p 量级，target 跟着源走只会多填像素
+		 * （4K 源尤其明显：以前 target 4K = 1080p 上做 tone map 再放大
+		 * 回 4K，白写 8.3M 片元）。 */
+		g.vw = g.up ? g.dw / g.up : g.dw;
+		g.vh = g.up ? g.dh / g.up : g.dh;
+		g.vw &= ~1u;
+		g.vh &= ~1u;
+		if (!g.vw || !g.vh) { g.vw = g.dw; g.vh = g.dh; g.up = 0; }
+	} else {
+		g.vw = sw ? sw : g.dw;
+		g.vh = sh ? sh : g.dh;
+		if (g.vw > g.dw) g.vw = g.dw;
+		if (g.vh > g.dh) g.vh = g.dh;
+		g.vw &= ~1u;
+		g.vh &= ~1u;
+		if (!g.vw || !g.vh) { g.vw = g.dw; g.vh = g.dh; }
+		{
+			double asp_t = (double)g.vw / g.vh;
+			double asp_s = (double)g.dw / g.dh;
 
-		if (!g.up || g.vw * g.up < g.dw || g.vh * g.up < g.dh ||
-		    fabs(asp_t - asp_s) > asp_s * 0.005) {
-			g.vw = g.dw;
-			g.vh = g.dh;
+			if (!g.up || g.vw * g.up < g.dw || g.vh * g.up < g.dh ||
+			    fabs(asp_t - asp_s) > asp_s * 0.005) {
+				g.vw = g.dw;
+				g.vh = g.dh;
+			}
 		}
 	}
-	printf("GLOUT: target %ux%u -> 屏 %ux%u（DPU %ux 放大）\n",
-	       g.vw, g.vh, g.dw, g.dh, g.up);
+	printf("GLOUT: target %ux%u -> 屏 %ux%u（DPU %ux 放大%s）\n",
+	       g.vw, g.vh, g.dw, g.dh, g.up,
+	       g.up ? (g.autoup ? "，自动" : "") : "=0，GL 自己放大");
 	g.gs = gbm_surface_create(g.gbm, g.vw, g.vh, GBM_FORMAT_XRGB8888,
 				  GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
 	if (!g.gs) gdie("gbm_surface_create");
@@ -1348,16 +1445,26 @@ int glout_init(unsigned sw, unsigned sh)
  */
 static int ensure_surface(unsigned w, unsigned h)
 {
-	unsigned nw = w ? w : g.dw, nh = h ? h : g.dh;
+	unsigned nw, nh, up = g.up;
 
-	if (!g.up) return 0;
-	if (nw > g.dw) nw = g.dw;
-	if (nh > g.dh) nh = g.dh;
-	if (!g.up || nw * g.up < g.dw || nh * g.up < g.dh) { nw = g.dw; nh = g.dh; }
-	nw &= ~1u;
-	nh &= ~1u;
-	if (!nw || !nh) { nw = g.dw; nh = g.dh; }
-	if (nw == g.vw && nh == g.vh) return 0;
+	if (g.autoup) {
+		/* 换片就是换源尺寸：720p 源能 3x、1080p/4K 源 2x，倍数得重算。
+		 * target 永远由屏整除得来，所以这里不看 w/h 的绝对值。 */
+		up = auto_up(w ? w : g.dw, h ? h : g.dh);
+		if (!up) { nw = g.dw; nh = g.dh; }
+		else { nw = (g.dw / up) & ~1u; nh = (g.dh / up) & ~1u; }
+	} else {
+		nw = w ? w : g.dw;
+		nh = h ? h : g.dh;
+		if (!up) return 0;
+		if (nw > g.dw) nw = g.dw;
+		if (nh > g.dh) nh = g.dh;
+		if (nw * up < g.dw || nh * up < g.dh) { nw = g.dw; nh = g.dh; }
+		nw &= ~1u;
+		nh &= ~1u;
+		if (!nw || !nh) { nw = g.dw; nh = g.dh; }
+	}
+	if (nw == g.vw && nh == g.vh) { g.up = up; return 0; }
 	/* 差距 10% 以内不值得重建：recreate 要丢两帧 */
 	if (abs((int)nw - (int)g.vw) * 10 < (int)g.vw &&
 	    abs((int)nh - (int)g.vh) * 10 < (int)g.vh)
@@ -1389,9 +1496,10 @@ static int ensure_surface(unsigned w, unsigned h)
 	}
 	g.vw = nw;
 	g.vh = nh;
+	g.up = up;
 	g.first = 1;	/* 老 fb 都删了，下一帧必须 SetCrtc 重新点名 */
-	printf("GLOUT: 渲染 target 改为 %ux%u（源 %ux%u → 屏 %ux%u）\n",
-	       nw, nh, w, h, g.dw, g.dh);
+	printf("GLOUT: 渲染 target 改为 %ux%u（源 %ux%u → 屏 %ux%u，DPU %ux%s）\n",
+	       nw, nh, w, h, g.dw, g.dh, up, g.autoup ? " 自动" : "");
 	return 0;
 }
 
@@ -1855,36 +1963,10 @@ static int twopass_frame(unsigned w, unsigned h)
 	double tA = t0, tB = t0, tC = t0, tD = t0, tE = t0;
 	int dx, dy, direct;
 
-	/* pass1 只做到"屏幕装得下"的尺寸：4K 源直接按 4K 做色调映射是白烧
-	 * 8.3M 片元，缩放后再上屏看不出差别（实测 4K 87ms → 后续测速对比）。
-	 */
-	{
-		/* pass1 只做到 1080p 量级：G31 是逐像素的通用 GPU，
-		 * 4K 全尺寸做色调映射要 8.3M 片元（54ms），缩到 1080p 只要
-		 * 2M（37ms），再缩放上屏肉眼看不出差别。
-		 * 屏幕本身比 1080p 小就按屏幕来。
-		 */
-		unsigned maxw = 1920, maxh = 1080;
-		const char *mx = getenv("GL1MAX");	/* 覆盖 pass1 高度上限 */
-
-		if (g.dw < maxw) maxw = g.dw;
-		if (g.dh < maxh) maxh = g.dh;
-		if (mx) {
-			maxh = (unsigned)atoi(mx);
-			if (maxh < 240) maxh = 240;
-			if (maxh > g.dh) maxh = g.dh;
-			maxw = (unsigned)((uint64_t)g.dw * maxh / g.dh);
-		}
-		pw = w;
-		ph = h;
-		if (w > maxw || h > maxh) {
-			double k = (double)maxw / w;
-
-			if ((double)maxh / h < k) k = (double)maxh / h;
-			pw = ((unsigned)(w * k + 0.5)) & ~1u;
-			ph = ((unsigned)(h * k + 0.5)) & ~1u;
-		}
-	}
+	/* pass1 只做到 1080p 量级：4K 全尺寸做色调映射是白烧 8.3M 片元，
+	 * 缩一半肉眼看不出差别。auto_up() 也用这一份尺寸做除数守卫，
+	 * 保证 target 永远不小于 pass1（否则等于先缩再放）。 */
+	p1_size(w, h, &pw, &ph);
 	/* 等比黑边在渲染 target 坐标系里算（pass2 和"直出"共用同一份）。
 	 * target 是 vw x vh（DPUSCALE=2 时 1920x1080），不是物理屏 —— DPU 把
 	 * 整张 target 一起放大，黑边比例不变，任意宽高比的源都对。
