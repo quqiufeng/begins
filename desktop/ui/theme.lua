@@ -189,14 +189,22 @@ function M.cycle(step)
 		if n == M.name then cur = i; break end
 	end
 	step = step or 1
-	return M.use(M.ORDER[(cur - 1 + step) % #M.ORDER + 1])
+	local n = M.ORDER[(cur - 1 + step) % #M.ORDER + 1]
+
+	M.use(n)
+	M.save(n)		-- 记下来：下次启动还是这套
+	return n
 end
 
 -- 随机换一套色系，但绝不给当前这套（MENU 刷新时用；连按两次保证看着有变化）
 function M.random()
 	local n = #M.ORDER
 
-	if n <= 1 then return M.use(M.ORDER[1] or M.DEFAULT) end
+	if n <= 1 then
+		M.use(M.ORDER[1] or M.DEFAULT)
+		M.save()
+		return M.name
+	end
 
 	local cur = 0
 
@@ -207,12 +215,57 @@ function M.random()
 	local i = math.random(n - 1)
 
 	if cur > 0 and i >= cur then i = i + 1 end
-	return M.use(M.ORDER[i] or M.DEFAULT)
+	M.use(M.ORDER[i] or M.DEFAULT)
+	M.save()
+	return M.name
 end
 
 M.mix = mix
 
--- 载入时定色系：DESKTOP_THEME > 默认 moon
-M.use(os.getenv("DESKTOP_THEME") or M.DEFAULT)
+-- ---------- 记住用户选的色系 ----------
+-- 以前只有 DESKTOP_THEME 一个来源：T 键 / 刷新换出来的配色只在内存里，
+-- 桌面一重启（进新目录、退出播放器后重新拉起）就掉回 moon —— 用户看到的
+-- 是「主题自己变来变去」。现在落盘到 <state>/theme，载入时按
+-- DESKTOP_THEME > 落盘值 > 默认 moon 的顺序取。
+local function state_dir()
+	local d = os.getenv("DESKTOP_STATE_DIR")
+		or ((os.getenv("HOME") or "/root") .. "/.config/desktop")
+
+	return d
+end
+
+function M.file()
+	return os.getenv("DESKTOP_THEME_FILE") or (state_dir() .. "/theme")
+end
+
+function M.save(name)
+	local p = M.file()
+	local f = io.open(p, "w")
+
+	if not f then
+		-- 目录可能还不存在：建一次再写（失败就算了，下次启动只是回默认）
+		os.execute(("mkdir -p '%s' 2>/dev/null"):format(state_dir()))
+		f = io.open(p, "w")
+		if not f then return false end
+	end
+	f:write((name or M.name or M.DEFAULT) .. "\n")
+	f:close()
+	return true
+end
+
+function M.load()
+	local f = io.open(M.file(), "rb")
+
+	if not f then return nil end
+	local s = f:read("*l")
+	f:close()
+	if not s then return nil end
+	s = s:gsub("%s+$", "")
+	if M.THEMES[s] then return s end
+	return nil
+end
+
+-- 载入时定色系：DESKTOP_THEME > 落盘值 > 默认 moon
+M.use(os.getenv("DESKTOP_THEME") or M.load() or M.DEFAULT)
 
 return M

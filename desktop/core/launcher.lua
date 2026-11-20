@@ -266,6 +266,41 @@ function M:open_ebook(item)
 	return self:run("阅读器", cmd)
 end
 
+-- 纯音频：mp3/flac/wav/aac/m4a。绝不能交给 play.sh（那是 V4L2 硬解视频链，
+-- 没有视频流会立刻 "没有视频流" 退出，用户看到的就是「音乐格式不支持」）。
+-- 这条路只做一件事：把文件交给 vlc（没装就用 mpv）出声，不放视频、
+-- 也不要上屏看门狗——音乐没有 "RENDER:" 那一行，等它反而会被当成失败掐掉。
+function M:open_audio(item)
+	local cfg = self.cfg
+	local arg = item.path
+
+	if dav.is_dav(item.path) and dav.conf(cfg) then
+		arg = dav.play_arg(cfg.nas, item.path)	-- vlc/mpv 都认 http(s)
+	end
+	if (cfg.music_cmd or "") == "" and (cfg.music_script or "") == "" then
+		return nil, "没装音乐播放器（vlc / mpv 都不在）"
+	end
+
+	local cmd
+
+	if cfg.music_script ~= "" then
+		cmd = apply_template(cfg.music_script, arg)
+	else
+		local base = cfg.music_cmd:match("([^/]+)$") or cfg.music_cmd
+
+		if base:match("vlc$") then
+			cmd = ("%s --play-and-exit --no-video --no-one-instance %s")
+				:format(shq(cfg.music_cmd), shq(arg))
+		elseif base == "mpv" then
+			cmd = ("%s --no-video --really-quiet --no-resume-playback %s")
+				:format(shq(cfg.music_cmd), shq(arg))
+		else
+			cmd = ("%s %s"):format(shq(cfg.music_cmd), shq(arg))
+		end
+	end
+	return self:run("音乐", cmd)
+end
+
 function M:open_media(item)
 	local cfg = self.cfg
 	local cmd
@@ -313,7 +348,13 @@ function M:open(fs, preview, item)
 			return nil, "没找到阅读器：" .. tostring(self.cfg.reader_cmd)
 		end
 		return self:open_ebook(item) and "opened", nil
-	elseif kind == "video" or kind == "audio" then
+	elseif kind == "audio" then
+		-- 音乐单走一条路（见 open_audio），别再喂给硬解视频链
+		local ok, err = self:open_audio(item)
+
+		if err then return nil, err end
+		return ok and "opened", nil
+	elseif kind == "video" then
 		if not self:has_player() then
 			return nil, "没找到播放器：" .. tostring(self.cfg.play_cmd)
 		end

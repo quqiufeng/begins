@@ -260,11 +260,12 @@ local function on_key(name)
 	elseif name == "PAGEDOWN" or name == "CHANNELDOWN" then g:page(fs, 1)
 	elseif name == "HOME" then g:home(fs)
 	elseif name == "MENU" then
-		-- 刷新顺手换一套随机配色（同一份 12 套调色板，版式不动）
+		-- 刷新就只是刷新。以前这里顺手 theme.random()，结果每刷一次
+		-- 桌面颜色就换一套（进新目录、退出播放器回来都会走这条路），
+		-- 看着像"主题自己乱变"。配色只由 T 键改，并且会落盘记住。
 		rescan()
-		theme.random()
-		toast(("已刷新 · 配色：%s"):format(theme.label or theme.name), 2)
-		logf("MENU 刷新 + 随机配色 → " .. tostring(theme.name))
+		toast("已刷新", 1.5, theme.text_dim)
+		logf("MENU 刷新")
 	elseif name == "END" then g:endk(fs)
 	elseif name == "OK" or name == "ENTER" or name == "RETURN" or name == "SPACE" then
 		open_current()

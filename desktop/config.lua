@@ -150,6 +150,17 @@ M.reader_cmd = env("DESKTOP_READER_CMD", "/opt/reader/build/native-reader")
 M.reader_script = env("DESKTOP_READER_SCRIPT", "")   -- 整条命令模板，%s = 文件
 M.play_cmd = env("DESKTOP_PLAY_CMD", "/root/play.sh")
 M.play_script = env("DESKTOP_PLAY_SCRIPT", "")
+
+-- 音乐（纯音频）必须单开一条路。play.sh 是 V4L2 硬解视频链：mp3/flac/wav
+-- 里没有视频流，喂进去只会 "没有视频流" 秒退，用户看到的就是「音乐格式不支持」。
+-- vlc 优先（用户点名要的），没装就退回盒子自带的 mpv，两边都只是"纯音频出声"。
+M.music_cmd = env("DESKTOP_MUSIC_CMD", "")
+M.music_script = env("DESKTOP_MUSIC_SCRIPT", "")   -- 整条命令模板，%s = 文件
+if M.music_cmd == "" and M.music_script == "" then
+	M.music_cmd = first_existing({
+		"/usr/bin/cvlc", "/usr/bin/vlc", "/usr/bin/mpv",
+	}) or ""
+end
 M.launch_log = env("DESKTOP_LAUNCH_LOG", "/tmp/desktop-launch.log")
 
 -- 外部 app 的自动化口 / 状态文件：桌面把它们汇总成一份语义 state 给 agent，
