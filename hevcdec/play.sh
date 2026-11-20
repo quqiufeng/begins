@@ -411,6 +411,24 @@ do_play() {
 	VF=hevc; VWH=""
 	[ "$VC" = h264 ] && { VF=h264; [ -n "$VW" ] && VWH="$VW $VH"; }
 	say "编码：$VC（ffmpeg -f $VF）${VWH:+ ${VW}x$VH}${IN_FMT:+  输入 $IN_FMT}"
+	# 帧率：播放器配速的分子是"帧号/帧率"，默认 24 是给电影留的。片源
+	# 30/25/50fps 时不告诉它就慢 25%～翻倍：24fps 的假设下第 30 帧该在
+	# 1.25 s 出现，实际内容里它在 1.0 s —— 画面每秒欠 5 帧，两分钟就差
+	# 十秒，听感就是"音频没同步画面"。所以片源自己报多少就是多少，
+	# 调用方（桌面/遥控器）不用猜，显式给了 FPS 就以它为准。
+	if [ -z "$FPS" ] && [ "$NAKED" = 0 ] && command -v ffprobe >/dev/null 2>&1; then
+		_rf=$(ffprobe -v error $IN_FMT $HTTP_OPT -select_streams v:0 \
+			-show_entries stream=r_frame_rate -of csv=p=0 "$SRC" 2>/dev/null | head -n 1)
+		case "$_rf" in
+		*/1) _rf=${_rf%/1} ;;
+		*/*) _rf=$(awk -v r="$_rf" 'BEGIN{split(r,a,"/"); if (a[2] > 0) printf "%.3f", a[1]/a[2]}') ;;
+		esac
+		case "$_rf" in ''|*[!0-9.]*|0|0.000) _rf="" ;; esac
+		if [ -n "$_rf" ]; then
+			FPS=$_rf
+			say "帧率：${FPS}fps（片源报的，配速用）"
+		fi
+	fi
 	# H.264 硬解这块板子是通的（实测 2026-11-19：1080p h264 解 424 帧
 	# /14.4s ≈ 29.5 fps，gl 后端正常上屏）。2026-11-19 之前那句"H.264 解不出帧、
 	# 只会黑屏"是误判，真因是播放器 spawn_argv 的切词上限只有 32 个 token：

@@ -2441,6 +2441,10 @@ double g_play_fps = 24.0;	/* 播放配速；0 = 不限速（测吞吐） */
  * 出来——"跳段"（两边一起丢）和"错位"（只丢画面）是两种完全不同的病，
  * 光看日志分不清。d = 音频走过的时长 - 画面帧号走过的时长。 */
 static int    g_sync_dbg;
+/* seek 之后上屏的帧数：诊断口径。got 是"这次进程一共解了多少帧"，跨 seek
+ * 不清零，拿它当位置量（got/fps）就会在 seek 后凭空多出十几秒 —— 2026-11-20
+ * 就是被这条假数据带偏，找了一轮"音画差 20 秒"的幽灵 bug。 */
+static long   g_shown_n;
 static long   g_sync_ms0 = -1;
 static double g_play_lead = 6;		/* 解码最多领先上屏几帧（背压） */
 static int g_need_tm;			/* 后端不吃 HDR：播放器侧先 CPU 转 SDR */
@@ -2463,71 +2467,128 @@ static int    g_au_pub;			/* 已解出 AU 数（诊断用） */
  * 起播锚定：音频线程通常比视频先跑几百毫秒（ffmpeg 先填满 ring），拿绝对
  * 位置对齐会白丢一截画面。锚在第一帧上，之后才跟音频走。
  *
- * 暂停不平移锚点会出事：暂停期间 played_ms 冻住、墙钟照走，resume 后 due
- * 已经落后一大截，画面会一口气追帧。所以锚点记下当时的累计暂停量，due
- * 里再加回去。
+ * 暂停不用平移锚点：due 只跟 (ft - at) 这个差值有关，暂停期间两边一起冻住，
+ * resume 后差值不变，不会一口气追帧。
  *
  * 停走保护：声卡 xrun / FIFO 断流时 played_ms 不动，画面不能陪着冻死；
  * 超过 1s 没动就退回墙钟，等它再动起来重新锚定（不跳帧）。
  */
-static long   g_pace_ms0 = -1;	/* 锚点：那一帧时的 played_ms */
-static long   g_pace_got0;	/* 锚点帧号 */
-static double g_pace_wall0;	/* 锚点墙钟 */
-static double g_pace_pause0;	/* 锚点时的累计暂停秒数 */
+static double g_seg_ss;		/* 本段内容 0 秒 = 片里的第几秒（seek 后重设） */
+static long   g_seek_got;	/* 本段起点的帧号（got 在 seek 后不清零，得自己减） */
 static long   g_pace_seen;	/* 上次看到的 played_ms */
-static double g_pace_seen_t;	/* played_ms 上次变化的墙钟 */
+static double g_pace_seen_t;	/* played_ms 上次变化的墙钟（0 = 本段还没动过） */
+static double g_aclk;		/* 平滑后的音频位置（秒） */
+static double g_aclk_t;		/* 上次采样墙钟（0 = 还没采过） */
+static double g_pace_anc;	/* 配速的目标偏移（秒）：见 aclk_pos 上面那段 */
+static int    g_pace_anc_set;	/* 本段锚点是否已经量过 */
 
+/* 平滑的音频钟：配速只能用它，不能用 aout_played_ms() 的裸值。
+ *
+ * 裸值 = written - delay，delay 来自 SNDRV_PCM_IOCTL_DELAY，这颗 SoC 上
+ * 是按 period 跳的：同一帧里连读两次能差 60~80 ms（实测 got=6 时
+ * 一次 184 ms、一次 116 ms）。拿它直接算 due，等于把抖动当成"画面跑
+ * 偏了"，每帧多睡/少睡几十毫秒，帧率就在 24~36 之间抖；起播那一刻更
+ * 糟：刚 PREPARE 完 delay 偏小，played 会瞬间虚高一小截，第一帧就吃到
+ * 一笔负的 due，整段画面从此永久早 80~100 ms。
+ *
+ * 所以位置只按墙钟推，再用裸值慢慢纠（8%/帧，晶振差 0.1% 也够跟上）；
+ * 只有真跳变（seek、xrun 重灌、暂停超过 0.5 s）才直接对齐。 */
+static double aclk_pos(long ms, double now)
+{
+	double raw = (double)ms / 1000.0;
+
+	if (ms < 0) return -1;
+	if (g_aclk_t <= 0 || now - g_aclk_t > 0.5 ||
+	    raw - g_aclk > 0.5 || g_aclk - raw > 0.5) {
+		g_aclk = raw;
+		g_aclk_t = now;
+		return g_aclk;
+	}
+	g_aclk += now - g_aclk_t;
+	/* 纠偏系数要小：这个钟同时被配速器"钉住"（每帧都要求
+	 * aclk == vp），纠偏太猛就成了两个环互相顶——实测 0.08 时
+	 * aclk 会稳定地压在裸值上方 ~100 ms，配速器再把这 100 ms
+	 * 原样搬到画面上（err 恒 -98ms）。0.002 只够吸晶振差
+	 * （0.1% 也就几秒跟上），不跟延迟抖动较劲。 */
+	g_aclk += (raw - g_aclk) * 0.002;
+	g_aclk_t = now;
+	return g_aclk;
+}
+
+/* 配速：声音是主钟，但"这一帧什么时候该出现"只能由帧号算。
+ *
+ * 两边的绝对内容位置都在手边：画面 vp = (got - g_seek_got) / fps，
+ * 声音 au = played_ms / 1000（aout_drop 时归零，seek 后两边零点一致）。
+ * 要让这一帧上屏的时刻 T 满足 au(T) == vp，也就只差 (vp - au) 要等。
+ *
+ *   due = now + (vp - au)
+ *
+ * 早先的写法 due = wall0 + (ms - ms0) 只有音频这一笔账：锚点之后
+ * played_ms 每 5~10 ms 才动一格，连着两帧往往读到同一个值 → due 相同
+ * → 不睡，画面按解码速度往前冲（24fps 的片子解码能到 50~60 fps，
+ * 画面跑到声音前面，听感就是"音频没同步画面"）。反过来把帧号那一笔
+ * 再加一遍就是两份账一起涨（那次实测 24fps 只跑出 12 fps）。
+ *
+ * 但绝对位置本身没有记忆：起播那一刻的读数偏了多少，整段就永久偏
+ * 多少（实测起播后恒 -100 ms：第一帧的 played_ms 刚 PREPARE 完还没
+ * 稳，读数虚高一截，这笔"贷"被 due 记住，之后每帧都按它睡，声音就一直
+ * 慢 0.1 s）。所以外挂一个慢环：每次真上屏都量一次 e = 听到 - 画面显
+ * 示的位置，|e| 超死区就一点点挪目标 g_pace_anc（2%/帧，50 帧≈1.7 s
+ * 收干净），死区内不动——抖动源的量级是 ±20 ms，别去追它。
+ *
+ * 用绝对位置还顺手解决两件事：①开闸后声卡要 ~150 ms 才起转，那段
+ * 时间里已经上屏的几帧会永久变成"画面比声音早 150 ms"——按绝对位置算
+ * 就只是第一帧多等 150 ms，之后完全对齐；②声卡晶振和墙钟差 0.1% 也
+ * 不积累，每帧重新量一次。
+ *
+ * 大跳（seek 重建、xrun 后 ring 一次预灌、断流 1 s）不是漂移，是跳变：
+ * 大于 2 s 就不追也不等，当帧直接放掉。 */
 static double play_due(long got)
 {
 	long ms = aout_played_ms();
-	double now = now_s(), pause = pctl_pause_seconds();
+	double now = now_s();
+	double vp, au;
 
-	if (ms >= 0) {
-		if (ms != g_pace_seen) {
-			g_pace_seen = ms;
-			g_pace_seen_t = now;
-		}
-		if (now - g_pace_seen_t <= 1.0) {
-			if (g_pace_ms0 < 0) {
-				g_pace_ms0 = ms;
-				g_pace_got0 = got;
-				g_pace_wall0 = now;
-				g_pace_pause0 = pause;
-			}
-			/* due 只由音频时钟推：锚点墙钟 + 音频走过的时长。
-			 * 早先这里还额外加了 (got-got0)/fps，等于把"帧号进度"
-			 * 和"音频进度"当两笔账一起记，dua 每帧要涨两份
-			 * （2/fps = 83ms @24fps），睡出来的间隔比帧间隔大一倍，
-			 * 24fps 的片子只能跑到 12fps；而且睡久了 ffmpeg 写视频
-			 * 管子被顶住，音频 FIFO 跟着断粮，played_ms 一次跳掉
-			 * 大半个 ring（实测 +100ms 的台阶），xrun 越滚越多。
-			 */
-			{
-				double due = g_pace_wall0 + (pause - g_pace_pause0)
-					     + (double)(ms - g_pace_ms0) / 1000.0;
-				double lim = 2.0 / g_play_fps;
-
-				/* 时钟跳变保护：xrun 恢复 / ring 一次预灌都会让
-				 * played_ms 台阶式前跳，绝对对齐就变成"等它
-				 * 追上来"，画面被硬拖慢。超前超过 2 帧就重锚，
-				 * 宁可少等也不要跟着跳。落后超过 0.3s（音频比
-				 * 画面慢一截）也重锚，避免接着一口气追帧。
-				 */
-				if (due > now + lim || due < now - 0.3) {
-					g_pace_ms0 = ms;
-					g_pace_got0 = got;
-					g_pace_wall0 = now;
-					g_pace_pause0 = pause;
-					return now;
-				}
-				return due;
-			}
-		}
-		g_pace_ms0 = -1;	/* 掉回墙钟，下次音频一动再锚 */
-	} else {
-		g_pace_ms0 = -1;
+	/* 没声卡 / 声音停走 1 s 以上（xrun、FIFO 断流）：退回墙钟按帧率走，
+	 * 画面不能陪着冻死。 */
+	if (ms < 0)
+		return g_t_clock0 + pctl_pause_seconds() + got / g_play_fps;
+	/* 第一次调用必须自己锚住时间戳。老写法只在"ms 变了"时才记时间，
+	 * 起播头一帧 ms 恰好是 0、g_pace_seen 也是 0 → 一帧没记 → 之后
+	 * 1 s 判成"声音停走"，整段退回墙钟自由跑，音频位置再也没被用过
+	 * （aout_played_ms 恒 0 走的就是这条路，实测 anc 随便加都推不动画面，
+	 * 因为 due 里根本没有那一笔）。 */
+	if (!g_pace_seen_t || ms != g_pace_seen) {
+		g_pace_seen = ms;
+		g_pace_seen_t = now;
+	} else if (now - g_pace_seen_t > 1.0) {
+		return g_t_clock0 + pctl_pause_seconds() + got / g_play_fps;
 	}
-	return g_t_clock0 + pause + got / g_play_fps;
+	vp = (double)(got - g_seek_got) / g_play_fps + g_pace_anc;
+	au = aclk_pos(ms, now);
+	/* 只许迟到，不许早到：配速钟绝不能跑到硬件钟前头。
+	 * 平滑钟按墙钟推，声卡那头一旦卡一拍（起播头 100 ms 就这样），
+	 * 画面反而会抢在前面，而且抢出去就回不来（配速只能拖后，没法把
+	 * 已上屏的帧收回来）。取 min 就把"抢跑"这条路堵死：硬件钟落后就
+	 * 跟着等，硬件钟跳前（delay 抖动的虚高）则仍按平滑值走，不会跟着
+	 * 一起抖。 */
+	if ((double)ms / 1000.0 < au)
+		au = (double)ms / 1000.0;
+	/* 段起点锚一次：开闸那一刻音频内容已经跑到前面去了（首帧前 ffmpeg
+	 * 早就把 PCM 灌进 ring，played_ms 一上来就是几十 ms），要是拿"内容
+	 * 0 秒"跟它比，前几帧全是 due<now → 一股脑甩出去抢进度，画面直接
+	 * 抢跑 3~4 帧（实测恒 -100 ms），之后渲染器按 30 fps 定拍走，配速
+	 * 只能往后拖、没法把已经上屏的帧拉回来，这笔领先就永久留在那里。
+	 * 所以段首帧把两条时间轴对齐：画面内容 0 秒 == 此刻的音频位置。 */
+	if (!g_pace_anc_set) {
+		g_pace_anc_set = 1;
+		g_pace_anc = au - vp;
+		if (g_pace_anc > 0.5) g_pace_anc = 0.5;
+		if (g_pace_anc < -0.5) g_pace_anc = -0.5;
+	}
+	if (vp - au > 2.0 || au - vp > 2.0)
+		return now;
+	return now + (vp - au);
 }
 
 static long pl_pos_ms(void)
@@ -2535,10 +2596,10 @@ static long pl_pos_ms(void)
 	long ms = aout_played_ms();
 
 	if (g_t_clock0 <= 0) return 0;
-	/* 有音频就以音频位置为准：它才是"听到第几秒"，墙钟只是它的近似 */
-	if (ms >= 0 && g_pace_ms0 >= 0)
-		return (long)((g_pace_wall0 - g_t_clock0 - g_pace_pause0) * 1000.0)
-		       + (ms - g_pace_ms0);
+	/* 有音频就以音频位置为准：段零点 + played_ms，就是"耳朵听到第几秒"。
+	 * played_ms 在暂停期间冻住，暂停不需要额外修正。 */
+	if (ms >= 0)
+		return (long)(g_seg_ss * 1000.0) + ms;
 	return (long)((now_s() - g_t_clock0 - pctl_pause_seconds()) * 1000.0);
 }
 
@@ -2633,30 +2694,44 @@ static int    g_seek_clamped;	/* 这次 seek 被片尾钳住了（OSD 换词） 
 static int    g_seek_auto;	/* 这次 seek 是饿死自愈发起的（OSD 换词） */
 static double g_end_hi = -1.0;	/* 越界探到的片尾上界（没 DUR 时的兜底） */
 
-static void spawn_kill(void)
+/* 掐死一个子进程，绝不无限等：ffmpeg 自己装了 SIGTERM handler，当它阻塞在
+ * 写满的管道（视频）或写满的 fifo（音频）上时，handler 返回后 write() 被
+ * SA_RESTART 续上 —— 进程永远退不出去，而老的 spawn_kill 对音频子是
+ * waitpid(...,0)：播放器直接卡在内核 do_wait 里，seek 之后画面定住、声音
+ * 断掉（实测 /proc/<pid>/stack = kernel_wait4 卡死在这）。
+ *
+ * hard=1：不客气，直接 SIGKILL。音频子进程就是这种：它此刻十有八九正写满
+ * fifo 死等，SIGTERM 那 2 s 纯属浪费，反正 seek 后这些 PCM 全要丢。
+ */
+static void kill_child(pid_t *pp, int hard)
 {
 	int st, k;
+	pid_t p = *pp;
 
-	if (g_achild > 0) {
-		kill(g_achild, SIGTERM);
-		waitpid(g_achild, &st, 0);
-		g_achild = -1;
-	}
-	if (g_child <= 0)
+	*pp = -1;
+	if (p <= 0)
 		return;
-	kill(g_child, SIGTERM);
+	if (hard) {
+		kill(p, SIGKILL);
+		waitpid(p, &st, 0);
+		return;
+	}
+	kill(p, SIGTERM);
 	for (k = 0; k < 200; k++) {
-		pid_t w = waitpid(g_child, &st, WNOHANG);
+		pid_t w = waitpid(p, &st, WNOHANG);
 
-		if (w == g_child || w < 0)
-			break;
+		if (w == p || w < 0)
+			return;			/* 收掉了 */
 		usleep(10000);
 	}
-	if (k == 200) {
-		kill(g_child, SIGKILL);
-		waitpid(g_child, &st, 0);
-	}
-	g_child = -1;
+	kill(p, SIGKILL);
+	waitpid(p, &st, 0);
+}
+
+static void spawn_kill(void)
+{
+	kill_child(&g_achild, 1);
+	kill_child(&g_child, 0);
 }
 
 /* 模板切词 + {SS} 替换，argv 以 NULL 收尾 */
@@ -2875,6 +2950,10 @@ static int spawn_reseek(double ss)
 	 * 跳到新位置后会先播一截老片。 */
 	audio_reseek();
 	spawn_kill();
+	/* 再 flush 一次：上面那次 flush 时音频子进程还活着，它趁 SIGTERM
+	 * 之前还能往 fifo 里塞满一管（64 KB ≈ 170 ms 的老片）。杀完再排空，
+	 * 新位置才不会以"上一段的声音"开头。 */
+	audio_reseek();
 	if (s_fd >= 0) {
 		close(s_fd);
 		s_fd = -1;
@@ -2890,8 +2969,14 @@ static int spawn_reseek(double ss)
 	g_stream_au = 0;
 	s_fill(1u << 20);
 	g_t_clock0 = now_s() - pctl_pause_seconds() - ss;
-	g_pace_ms0 = -1;
 	g_sync_ms0 = -1;
+	g_shown_n = 0;
+	g_seg_ss = ss;
+	g_seek_got = g_au_pub;	/* 新段第一帧就在这里 */
+	g_pace_seen_t = 0;	/* 新段的音频钟还没"动过"，别拿旧时间戳算停走 */
+	g_aclk_t = 0;		/* 平滑钟重新锚：旧段的位置已经没有意义 */
+	g_pace_anc = 0;		/* 慢环也归零：新段重新量 */
+	g_pace_anc_set = 0;
 	if (g_seek_auto) {
 		osd_show(2.0, "供流卡住，已就地重连");
 		g_seek_auto = 0;
@@ -3080,20 +3165,38 @@ static void on_frame_done(void *ctx, void *owner, double pts, uint32_t latch,
 	 * 声音跑到画面前头（听感"声音快"），负数 = 画面超前（"声音拖"）。
 	 * 起播那一刻两者都该是 0：闸门保证首帧上屏时音频内容还在 0 秒。
 	 */
-	if (status == RENDER_SHOWN && getenv("SYNC")) {
-		static int n;
+	if (status == RENDER_SHOWN) {
+		long n = ++g_shown_n;
+		long raw = aout_played_ms();
+		long e = raw - (long)((n - 1) * 1000.0 / g_play_fps);
 
-		n++;
-		if (n % 24 == 0) {
+		/* 慢环：每真上屏一帧量一次 e = 听到的位置 - 画面该在的位置，
+		 * 死区 40 ms（裸值抖动就有 ±20 ms，别去追它），超了就按 5%
+		 * 往回调 g_pace_anc —— e>0 声音超前，画面得赶（anc 减小），
+		 * e<0 画面超前，画面得等（anc 增大）。绝对位置配速本身对
+		 * 相位没有记忆，起播那一笔偏差只能靠这个外环收掉。 */
+		if (raw >= 0 && (e > 40 || e < -40)) {
+			double d = -(double)e / 1000.0 * 0.05;
+
+			if (d > 0.004) d = 0.004;
+			if (d < -0.004) d = -0.004;
+			g_pace_anc += d;
+			if (g_pace_anc > 1.5) g_pace_anc = 1.5;
+			if (g_pace_anc < -1.5) g_pace_anc = -1.5;
+		}
+
+		if (getenv("SYNC") && n % 24 == 0) {
 			/* 绝对值，不相对首帧：音频 played 从"内容 0 秒"起数，
 			 * 画面第 n 帧就该在 (n-1)/fps。两者相减就是此刻耳朵
 			 * 听到的位置和眼睛看到的位置差多少——起播错位也算在内。
 			 */
-			long au = aout_played_ms();
+			long au = raw;
 			long vp = (long)((n - 1) * 1000.0 / g_play_fps);
 
-			printf("AVSYNC2 shown=%d err=%+ldms 音频=%.2fs 画面=%.2fs\n",
-			       n, au - vp, au / 1000.0, vp / 1000.0);
+			printf("AVSYNC2 shown=%ld sub=%d q=%ld err=%+ldms "
+			       "音频=%.2fs 画面=%.2fs anc=%+.3f aclk=%.3f\n",
+			       n, g_au_pub, (long)g_au_pub - n, au - vp,
+			       au / 1000.0, vp / 1000.0, g_pace_anc, g_aclk);
 			fflush(stdout);
 		}
 	}
@@ -3905,6 +4008,8 @@ int main(int argc, char **argv)
 		printf("PACE: render_has_pace=%d fps=%.2f lead=%.1f\n",
 		       render_has_pace(rend), g_play_fps, g_play_lead);
 		g_t_clock0 = t_play0 - g_ss0;	/* spawn 起播在 SS 秒：位置别从 0 数 */
+		g_seg_ss = g_ss0;
+		g_seek_got = 0;
 
 		/* 控制面起来：/tmp/play.sock（play.sh 用 `player -c ...` 说话）
 		 * + evdev 遥控。盒上不再有 mpvctl / rcinputd 两个常驻件。
@@ -4401,7 +4506,13 @@ no_stall:;
 			}
 			t_rx = now_s();
 			t_frame0 = t_rx;
-			if (g_mark_first) {
+			/* 先留一份"这是重建后的首帧"，再清标志：下面的开闸判定
+			 * 要用它。以前在判定前就清零，seek 后 got 早已 >0，
+			 * (g_mark_first || !got) 恒假 → 闸门再也开不回来 = 快进
+			 * 之后永远静音（实测 play.log 里全片只有一次"首帧开闸"）。 */
+			int first_after_reinit = g_mark_first;
+
+			if (first_after_reinit) {
 				g_mark_first = 0;
 				g_seek_pending = 0;	/* seek 落定：首帧已出 */
 				g_seek_base = -1.0;
@@ -4411,7 +4522,7 @@ no_stall:;
 			/* 首帧到手只记一笔：开闸要等这一帧真上屏之后（见
 			 * render_pump 后面那段）。在 submit 前开闸，声音会抢在
 			 * 首帧 swap 完成之前跑掉几十~一百毫秒。 */
-			if ((g_mark_first || !got) && aout_gate() > 0)
+			if ((first_after_reinit || !got) && aout_gate() > 0)
 				g_gate_wait = 1;
 			if (!got)
 				t_first_rx = t_rx;
@@ -4514,9 +4625,9 @@ no_stall:;
 					n_slp++;
 				}
 				if (getenv("PACEDBG") && got < 40)
-					printf("PACEDBG got=%ld audio_ms=%ld due_now=%.3f "
+					printf("PACEDBG got=%ld shown=%ld audio_ms=%ld due_now=%.3f "
 					       "sleep_ms=%.1f sub_ms=%.1f\n",
-					       (long)got, aout_played_ms(), due - nn,
+					       (long)got, g_shown_n, aout_played_ms(), due - nn,
 					       (due > nn ? (due - nn) * 1000.0 : 0.0),
 					       (now_s() - t_frame0) * 1000.0);
 			}
@@ -4536,7 +4647,7 @@ no_stall:;
 			g_au_pub = got;
 			if (!g_sync_dbg && getenv("SYNC"))
 				g_sync_dbg = 1;
-			if (g_sync_dbg && g_play_fps > 0 && got % 24 == 0) {
+			if (g_sync_dbg && g_play_fps > 0 && g_shown_n % 24 == 0) {
 				long ams = aout_played_ms();
 
 				if (ams >= 0) {
@@ -4544,9 +4655,9 @@ no_stall:;
 					printf("SYNC got=%ld audio_ms=%ld fed=%ld wall=%.2f "
 					       "frame_pos=%.2f audio_pos=%.2f d=%+ldms\n",
 					       (long)got, ams, aout_fed_ms(),
-					       now_s() - t0, (double)got / g_play_fps,
+					       now_s() - t0, (double)g_shown_n / g_play_fps,
 					       (double)(ams - g_sync_ms0) / 1000.0,
-					       (ams - g_sync_ms0) - (long)(got * 1000.0 / g_play_fps));
+					       (ams - g_sync_ms0) - (long)(g_shown_n * 1000.0 / g_play_fps));
 					fflush(stdout);
 				}
 			}
