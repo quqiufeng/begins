@@ -76,7 +76,13 @@ local function call(env, fn, args)
 end
 
 local function state(env)
-	return env.sock.json_req(M.socket, '{"cmd":"state"}', 4000)
+	local r = env.sock.json_req(M.socket, '{"cmd":"state"}', 4000)
+
+	if not r then return nil end
+	-- sock.json_req 会把回包里的 state 平铺到顶层（font_size / page / book …），
+	-- 所以两种形状都要认，否则 font_size 恒 nil → 字号永远只写默认 24±2。
+	if r.state then return r end
+	return { ok = r.ok, state = r }
 end
 
 -- 前台判定：ping 通则在前台；再问一次 state 看在哪一层，
@@ -89,7 +95,7 @@ function M.detect(env)
 	if not r or r.ok ~= true then return false, "no reply" end
 
 	local s = env.sock.json_req(M.socket, '{"cmd":"state"}', 1200)
-	local st = s and s.state
+	local st = s and (s.state or s)   -- json_req 已平铺，s.state 不一定存在
 
 	if not st then return true, "up (state timeout)" end
 	if st.library then return true, ("shelf(%s)"):format(tostring(st.count or "?")) end

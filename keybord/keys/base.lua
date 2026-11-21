@@ -42,7 +42,7 @@ end
 function B.define(app, keys, opt)
 	opt = opt or {}
 	local M = { app = app, desc = opt.desc or app, order = opt.order or 10, list = {} }
-	local byname, bycode = {}, {}
+	local byname, bycode, byact = {}, {}, {}
 
 	for _, e in ipairs(keys) do
 		local ent = { key = e[1], code = tonumber(e[2]), mod = e[3], act = e[4] }
@@ -51,6 +51,8 @@ function B.define(app, keys, opt)
 			byname[ent.key] = ent
 			-- 裸键码只认无修饰的，免得 C-1 把 1 抢走
 			if ent.code and not ent.mod then bycode[ent.code] = ent end
+			-- 动作名 → 表里第一条（keybd DISPATCH=exec 传下来的是动作名，不是键名）
+			byact[ent.act] = byact[ent.act] or ent
 			M.list[#M.list + 1] = ent
 		end
 	end
@@ -82,8 +84,11 @@ function B.define(app, keys, opt)
 		local n = tonumber(k)
 
 		if n and bycode[n] then return bycode[n] end
+		if byact[k] then return byact[k] end
 		-- 探索阶段的手调：直接给动作名（next / app.toc / reader.next）
-		if k:match("^[A-Za-z][%w._%-]*$") then return { key = k, act = k } end
+		-- 表里没有的动作名也放行（font+ / font- 带 +，原正则匹配不到 → keybd
+		-- 传 "font+" 就报「该 app 无此键」，音量键调字号整条失效）
+		if k:match("^[A-Za-z][%w._%-%+]*$") then return { key = k, act = k } end
 		return nil
 	end
 
