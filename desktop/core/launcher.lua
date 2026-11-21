@@ -273,9 +273,13 @@ end
 function M:open_audio(item)
 	local cfg = self.cfg
 	local arg = item.path
+	local nas = dav.is_dav(item.path) and dav.conf(cfg) or nil
 
-	if dav.is_dav(item.path) and dav.conf(cfg) then
-		arg = dav.play_arg(cfg.nas, item.path)	-- vlc/mpv 都认 http(s)
+	-- 外部播放器只认 http(s)：dav:// 是 play.sh 的私有协议，mpv 拿到会
+	-- "Failed to recognize file format" 秒退（日志里就是「音乐 exit 1s」）。
+	-- 认证塞进 userinfo（mpv 认），vlc 另外给 --http-user/--http-pwd。
+	if nas then
+		arg = dav.stream_url(nas, dav.remote(item.path))
 	end
 	if (cfg.music_cmd or "") == "" and (cfg.music_script or "") == "" then
 		return nil, "没装音乐播放器（vlc / mpv 都不在）"
@@ -289,8 +293,14 @@ function M:open_audio(item)
 		local base = cfg.music_cmd:match("([^/]+)$") or cfg.music_cmd
 
 		if base:match("vlc$") then
-			cmd = ("%s --play-and-exit --no-video --no-one-instance %s")
-				:format(shq(cfg.music_cmd), shq(arg))
+			local auth = ""
+
+			if nas then
+				auth = (" --http-user=%s --http-pwd=%s"):format(
+					shq(nas.user or ""), shq(nas.pass or ""))
+			end
+			cmd = ("%s --play-and-exit --no-video --no-one-instance%s %s")
+				:format(shq(cfg.music_cmd), auth, shq(arg))
 		elseif base == "mpv" then
 			cmd = ("%s --no-video --really-quiet --no-resume-playback %s")
 				:format(shq(cfg.music_cmd), shq(arg))

@@ -154,6 +154,27 @@ function M.play_arg(n, path)
 	return "dav://" .. M.hostport(n) .. enc(M.remote(path))
 end
 
+-- 给 mpv / vlc 这类**外部播放器**的 http 地址（带 userinfo 认证）。
+-- 别把 play_arg 的 dav:// 递给它们：那是 play.sh 的私有协议（它自己从 .env
+-- 补认证），mpv 不认识 dav://，秒退（桌面日志里就是「音乐 exit 1s」）。
+local function enc_cred(s)
+	-- userinfo 比路径严：'%' 也得编，':' '/' '@' 必须编
+	return (tostring(s):gsub("[^%w%._~%-]", function(c)
+		return ("%%%02X"):format(c:byte())
+	end))
+end
+
+function M.stream_url(n, remote)
+	local host = M.hostport(n)
+	local auth = ""
+
+	if n.user and n.user ~= "" then
+		auth = enc_cred(n.user) .. ":" .. enc_cred(n.pass or "") .. "@"
+	end
+	return ("%s://%s%s%s"):format((tostring(n.url):match("^https") or "http"), auth,
+		host, enc(remote))
+end
+
 -- 供 curl 直接用的带认证 URL
 function M.http_url(n, remote)
 	return ("%s%s"):format((tostring(n.url):gsub("/+$", "")), enc(remote))
