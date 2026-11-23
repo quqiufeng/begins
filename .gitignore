@@ -3,6 +3,8 @@
 /src/
 
 # 构建产物：二进制与日志可重建
+# 整个 build/ 是构建目录，不入库（3 个旧文件已从索引移出）
+/build/
 build/artifacts/
 build/initrd/init
 build/initrd/root/
