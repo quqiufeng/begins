@@ -70,17 +70,27 @@ function M.hold()
 	return true
 end
 
--- 重新绑定 fbcon。resume 成功之后再调（那时桌面已拿回 master，
--- rebind 不会真的扫出命令行）；resume 失败也必须调，否则命令行一直黑着。
+-- 收尾：默认**不再** bind 回 fbcon。
+--
+-- 以前这里 rebind，实测这就是「退出播放器/阅读器时电视弹信号信息条」的
+-- 那一下：fbcon 绑回去会把主 plane 的 CRTC 模式改成它自己的 1920x1080，
+-- 桌面紧接着 resume 又摆回 3840x2160 —— HDMI 一退一锁两次，电视机跟丢
+-- 信号就弹黄条。rebind 换来的只是「tty1 能看到命令行」，盒子是常显设备，
+-- 这个收益为零。
+-- 需要命令行时手动来一句：echo 1 > /sys/class/vtconsole/vtcon1/bind
+-- （或 FBCON_REBIND=1 起桌面）。
 function M.release()
 	if not held then return false end
 	held = false
 	os.remove(OWNER)
-	local b = bind_path()
+	if os.getenv("FBCON_REBIND") == "1" then
+		local b = bind_path()
 
-	if not b then return false end
-	if (read_file(b) or ""):match("^%s*1") then return true end
-	return write_file(b, "1")
+		if not b then return false end
+		if (read_file(b) or ""):match("^%s*1") then return true end
+		return write_file(b, "1")
+	end
+	return true
 end
 
 function M.is_held() return held end

@@ -67,6 +67,16 @@ local g = grid.new(cfg, theme, ttf, txt, img, ico, sdl)
 local bar = chrome.new(cfg, theme, ttf)
 local pv = preview.new(cfg, sdl, img, ttf)
 local launcher_ = launcher.new(cfg, win, bar)
+
+-- fbcon 从桌面起来就解绑，一直不 bind 回去。
+-- 每次「解绑 → 子进程 modeset → 退出 rebind」都是一次 CRTC 模式跳变
+-- （fbcon 自己的 1080p ↔ 桌面的 4K），HDMI 跟着退锁两次，电视就弹
+-- 「当前信号信息」黄条。桌面是常显进程，控制台文本没有意义，
+-- 解绑一次到底，整条链再也不会让 HDMI 重新锁存。
+-- 要命令行：echo 1 > /sys/class/vtconsole/vtcon1/bind
+local fbcon = require("util.fbcon")
+
+fbcon.hold()
 -- 语义状态：把 fs/preview/播放器/reader 的现场汇总成 state 里的文字
 local sem = semantic.new(cfg, fs, pv, launcher_)
 local auto

@@ -227,10 +227,12 @@ fbcon_watch_stop() {
 
 fbcon_release() {
 	fbcon_watch_stop
-	# 桌面替我们挡着（它打开阅读器/播放器时 hold 的）：由它在 resume 之后 rebind。
-	# 这里抢先 rebind 会正好落在 master 空档里，命令行闪一下、HDMI 重锁存、
-	# 电视弹黄条 —— 也就是老版看门狗 8s 阈值抖出来的那个现象。
+	# 桌面替我们挡着（它打开阅读器/播放器时 hold 的）：由它收尾。
 	[ -e /tmp/desktop-fbcon.owner ] && { say "fbcon 由桌面接管（不在退出时 rebind）"; return 0; }
+	# 默认也不 rebind：bind 回去会把 CRTC 拽回 fbcon 自己的 1080p，
+	# 下一帧播放器/桌面再摆回 4K，HDMI 退锁两次 → 电视弹「信号信息」黄条。
+	# 命令行要得回来：echo 1 > /sys/class/vtconsole/vtcon1/bind 或 FBCON_REBIND=1。
+	[ "${FBCON_REBIND:-0}" = 1 ] || return 0
 	_b=$(vtcon_bind) || return 0
 	[ "$(cat "$_b" 2>/dev/null)" = 1 ] && return 0
 	echo 1 > "$_b" 2>/dev/null && say "fbcon 已重新绑定（命令行恢复）"
