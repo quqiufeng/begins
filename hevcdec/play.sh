@@ -518,7 +518,14 @@ do_play() {
 			ac3|eac3|truehd|mlp|dts|dca)
 				[ "$DRC" = 1 ] && AFI="-drc_scale 1" || AFI="-drc_scale 0" ;;
 			esac
-			AUDIO_SPAWN="ffmpeg -hide_banner -loglevel warning -nostdin -y -re -ss {SS} $DA $AFI $HTTP_OPT $IN_FMT -i $SRC -vn -map 0:a:0 $AFA -f s16le -ar 48000 -ac 2 $AFIFO"
+			# -noaccurate_seek 必加：视频那条走 -c:v copy，输出裸 h264 没有时间戳，
+			# ffmpeg 的"丢弃 -ss 之前的包"那一步失效 → 画面实际从**前一个关键帧**
+			# 开始（实测 -ss 22 落到 20.000s，5s GOP 就偏 2s）。音频这条要是不加，
+			# 它按精确 seek 从 22.000s 起播，于是声音比画面超前 δ（= 一个 GOP），
+			# 播放器又把两边的零点和锚点都归零，自己永远纠不回来 —— 用户听到的
+			# 就是"快进后音画不同步"。加了这个两边一起落到关键帧，同步就是死的；
+			# 代价是跳转落点最多早一个 GOP（显示器上仍然报目标位置）。
+			AUDIO_SPAWN="ffmpeg -hide_banner -loglevel warning -nostdin -y -re -noaccurate_seek -ss {SS} $DA $AFI $HTTP_OPT $IN_FMT -i $SRC -vn -map 0:a:0 $AFA -f s16le -ar 48000 -ac 2 $AFIFO"
 		else
 			say "片源没有音轨，只放画面"
 			# 电视上看不见终端：屏幕上也得说一句，否则"按音量键没反应"，
