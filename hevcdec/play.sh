@@ -68,6 +68,14 @@ dec() { printf '%s' "$1" | base64 -d 2>/dev/null; }
 _SDIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
 ENVF=${PLAY_ENV:-}          # 显式指定 .env 时优先（PLAY_ENV=/path/.env play.sh ...）
 
+# 输出模式：auto 是「跟随屏幕当前模式」，而 x98h 的 HDMI 会把 EDID 里
+# 2560x1440@60（312MHz）当成当前模式报上来，sun4i-hdmi 直接判
+# "User-defined mode not supported"，atomic commit 拿 -ERANGE；
+# 探针能出图不代表 CRTC 认这个模式。所以这里钉死 1080p，要别的用
+# VOUT_MODE=1280x720 / max 之类的覆盖。
+VOUT_MODE=${VOUT_MODE:-1920x1080}
+export VOUT_MODE
+
 env_find() {                # .env 查找顺序：指定的 → cwd 向上 → 脚本目录向上 → ~/.env
 	[ -n "$ENVF" ] && return 0
 	_d=$(pwd)
@@ -186,6 +194,8 @@ EOF
 
 die() { echo "play.sh: $*" >&2; exit 1; }
 say() { echo "play.sh: $*"; }
+# 调用留痕：seek 是整链重开，出问题时要能看清「谁、带什么参数、起了几次」
+[ -n "${PLAY_TRACE:-}" ] && echo "$(date +%T.%N | cut -c1-12) pid=$$ ppid=$PPID args=$*" >>"$PLAY_TRACE"
 
 # ── fbcon 让位 ───────────────────────────────────────────────
 # seek/fwd 不是原地跳，而是整条链重开：旧进程退出 → DRM master 释放 →
@@ -275,6 +285,33 @@ while :; do
 	[ "$n" -ge 3 ] && { echo 1 > "$bind"; rm -f "$own"; exit 0; }
 done' </dev/null >/dev/null 2>&1 &
 	echo $! > "$_wd"
+	return 0
+}
+
+# ── 让出 DRM master ──────────────────────────────────────────
+# 桌面（desktop.service，SDL_VIDEODRIVER=kmsdrm）活着时握着 DRM master，
+# 播放器的 atomic 提交一律 -EBUSY：日志只一句「拿不到 DRM master」，
+# 屏幕一帧不上，ffmpeg 把管道写满然后 Broken pipe 收工（2026-11-24 实测）。
+# 桌面是被 play.sh 的调用者点「播放」叫起来的，必须先停它再起播放器；
+# desktop.service 是 KillMode=process，停主进程不会连带杀掉这条播放管道。
+DRM_YIELD_STAMP=/tmp/play.desktop.stopped
+drm_yield() {
+	command -v systemctl >/dev/null 2>&1 || return 0
+	systemctl is-active --quiet desktop 2>/dev/null || return 0
+	if systemctl stop desktop 2>/dev/null; then
+		: > "$DRM_YIELD_STAMP"
+		say "桌面已暂停：DRM master 让给播放器（播完自动回来）"
+		sleep 0.3       # 等它真正 drop master，不然还是 -EBUSY
+	fi
+	return 0
+}
+
+drm_restore() {
+	[ -e "$DRM_YIELD_STAMP" ] || return 0
+	rm -f "$DRM_YIELD_STAMP"
+	command -v systemctl >/dev/null 2>&1 || return 0
+	systemctl is-active --quiet desktop 2>/dev/null && return 0
+	systemctl start desktop 2>/dev/null && say "桌面已恢复"
 	return 0
 }
 
@@ -438,6 +475,71 @@ do_play() {
 	# argv 以孤零零的 `-f` 收尾 → ffmpeg 报 "Missing argument for option 'f'"
 	# 秒退 → 播放器读到空流 → 黑屏。上限已提到 SPAWN_MAX=128（v4l2hevc.c）。
 	# 所以这里不再提前喊"黑屏"，真黑了看 /tmp/play.log 的 ffmpeg 报错。
+	# ── RAW 上屏链路：解码交给 ffmpeg，播放器只上屏 ───────────────────────
+	# 为什么不让播放器自己解：cedrus 的 OUTPUT 队列 supports_requests=true
+	# （cedrus_video.c:603），每个 buffer 必须挂 request_fd，还得自己填
+	# SPS/PPS/SLICE_PARAMS/DECODE_PARAMS（H.264/HEVC stateless 控制）——那是
+	# ffmpeg v4l2request 的活。播放器自己 S_FMT 只有单平面 ops，改 fourcc 到
+	# *_SLICE 也没用（API 层就不对，实测 EINVAL）。所以改成：ffmpeg 硬解
+	# （逐帧 md5 与软解完全一致，1080p 出 40fps）→ NV12 过管道 → 播放器
+	# RAWIN=WxH 只做 GL/DRM 上屏。音频、遥控、OSD 链路一律不变。
+	# RAWMODE=0 可退回老的"播放器自己解"链路。
+	RAWMODE=${RAWMODE:-1}
+	[ "$NAKED" = 1 ] && RAWMODE=0
+	if [ "$RAWMODE" = 1 ] && { [ -z "$VW" ] || [ -z "$VH" ]; }; then
+		say "RAW 上屏要分辨率，ffprobe 没报出来：退回播放器自解"
+		RAWMODE=0
+	fi
+	VSCALE=""
+	if [ "$RAWMODE" = 1 ]; then
+		# NV12 是 2x2 采样，长宽都得偶数：片源标 1919x803 之类 ffmpeg 会拒
+		if [ "$((VW % 2))" != 0 ] || [ "$((VH % 2))" != 0 ]; then
+			VW=$((VW - VW % 2)); VH=$((VH - VH % 2))
+			VSCALE="-vf scale=$VW:$VH"
+		fi
+		RAWIN="${VW}x${VH}"
+		export RAWIN
+		if [ -n "$FPS" ]; then RAWFPS=$FPS; export RAWFPS; fi
+		OPIPE=1	# 只有管道模式能把 ffmpeg 的裸帧接到播放器 stdin
+		say "上屏：RAW $RAWIN（ffmpeg 硬解 → NV12 → 播放器只上屏）"
+	fi
+	export RAWMODE VSCALE
+
+	# ── 降频播放（4K 片源）────────────────────────────────────────────
+	# cedrus 这条 4K HEVC 10bit 路径实测只有 ~11 fps（VE 600MHz 顶格，
+	# 1080p 33 fps、像素量正好 3 倍），而片源要 23.98 —— 按原速喂必然
+	# 越放越落后，最后就是"卡住/声画错位"。用户口径：4K 就降频播放。
+	# 做法：画面去掉 -re（按解码速度自由推进，播放器靠音频钟配速压住），
+	# 声音保留 -re 但用 atempo 同比例放慢 → 两边合成一个慢速时钟，
+	# 平滑、同步，代价是整体 0.32x（2h 片子约 6h，PLAY_RATE 可调）。
+	# PLAY_RATE=1 可强行原速（回到越放越落后），PLAY_RATE=0.6 可自定。
+	RATE=${PLAY_RATE:-}
+	case "$RATE" in
+	''|*[!0-9.]*) RATE="" ;;
+	esac
+	if [ -z "$RATE" ]; then
+		case "${VW:-0}" in
+		''|0|*[!0-9]*) RATE=1 ;;
+		# 0.32 是实测值：4K 单帧解码 0.42x，但叠加 GL 放大到 1440p 后整条
+		# 链路只有 ~0.32x；定 0.45 会变成"画面追不上被放慢的音频"，越放越落后。
+		*) if [ "$VW" -gt 1920 ]; then RATE=0.32; else RATE=1; fi ;;
+		esac
+	fi
+	RE="-re"; ATEMPO=""
+	if [ "$RATE" != 1 ]; then
+		RE=""
+		# atempo 单次只吃 0.5~2.0，低于 0.5 要串两级
+		if [ "$(echo "$RATE" | awk '{print ($1 < 0.5) ? 1 : 0}')" = 1 ]; then
+			ATEMPO="atempo=0.5,atempo=$(echo "$RATE" | awk '{printf "%.4f", $1/0.5}')"
+		else
+			ATEMPO="atempo=$(echo "$RATE" | awk '{printf "%.4f", $1}')"
+		fi
+		say "降频播放：${VW}x${VH} 硬解跟不上，整体 ${RATE}x（画面不节流 + 声音 atempo 放慢）"
+		PLAY_OSD="${PLAY_OSD:+$PLAY_OSD  ·  }降频 ${RATE}x"
+		export PLAY_OSD
+	fi
+	export RE ATEMPO
+
 	# 裸流没有时间戳，不能 seek：宁可拒绝，也别让人以为"跳过去了"
 	if [ "$NAKED" = 1 ] && [ "$SS" != "0" ] && [ "$SS" != "0.0" ]; then
 		die "裸流（$SRC）不能从 $SS 秒起播，没有时间戳可 seek"
@@ -466,7 +568,12 @@ do_play() {
 	fbcon_hold          # 必须在 cleanup_old 之前：老实例退出那一刻就要没人来抢屏
 	fbcon_watch
 	cleanup_old
+	drm_yield           # 桌面握着 DRM master 时先让它撒手，否则一帧不上屏
 	: > "$LOG"
+	# 每一次起播都是新的一场：上一场残留的排队量（/tmp/play.seek.pend）必须
+	# 清掉。实测残留 240s 被并进来 → 目标 277s 超过片长 → ffmpeg "Output file
+	# is empty" → 快进=直接黑屏停机，看着像"快进不管用"。
+	rm -f "$PEND" /tmp/play.seek.stamp 2>/dev/null
 
 	# DUR=0 意为「放到结尾」：绝不能展开成 -t 0。
 	# ffmpeg 的 -t 0 会在 1s 内灌完 14MB 就退出（-re 都失效），
@@ -505,11 +612,16 @@ do_play() {
 			# 增益链：volume 补偿源本身小的电平，alimiter 只压过冲的峰。
 			# level=0 关掉 alimiter 的自动抬电平（那会变成整体归一化，
 			# 对白和爆炸的响度关系就乱了）。
-			AFA=""
+			# 降频播放时 atempo 也挂在这个链上（同一条 -af），顺序放在末尾：
+			# 先按源电平补偿，再压限幅，最后放慢。
+			AFILT=""
 			case "$AGAIN" in
 			""|0|0.0|-*) ;;
-			*) AFA="-af volume=${AGAIN}dB,alimiter=limit=0.97:level=0:attack=5:release=50" ;;
+			*) AFILT="volume=${AGAIN}dB,alimiter=limit=0.97:level=0:attack=5:release=50" ;;
 			esac
+			[ -n "${ATEMPO:-}" ] && AFILT="${AFILT:+$AFILT,}$ATEMPO"
+			AFA=""
+			[ -n "$AFILT" ] && AFA="-af $AFILT"
 			# -drc_scale 是**输入**选项（作用在解码器上），必须排在 -i 前面：
 			# 放到 -i 后面会被当成输出选项，ffmpeg 直接报参数错退出，
 			# 表现是音频子进程一起就 defunct、整片静音。
@@ -630,14 +742,21 @@ exit $rc'
 		set -- 'set -uf
 if [ "$NAKED" = 1 ]; then
 	cat "$SRC"
+elif [ "${RAWMODE:-0}" = 1 ]; then
+	ffmpeg -hide_banner -loglevel warning -nostdin -y ${RE:--re} \
+		${SS:+-ss "$SS"} ${DA:-} ${HTTP_OPT:-} ${IN_FMT:-} \
+		-hwaccel v4l2request -hwaccel_device /dev/media0 \
+		-i "$SRC" -map 0:v:0 ${VSCALE:-} \
+		-f rawvideo -pix_fmt nv12 - 2>>"$LOG"
 else
-	ffmpeg -hide_banner -loglevel warning -nostdin -y -re \
+	ffmpeg -hide_banner -loglevel warning -nostdin -y ${RE:--re} \
 		${SS:+-ss "$SS"} $DA $HTTP_OPT $IN_FMT \
 		-i "$SRC" -map 0:v:0 -c:v copy -f "$VF" - $AF 2>>"$LOG"
 fi | PLAY=1 NOWRITE=1 RENDER="$RENDER" SCALE="$SCALE" PLAY_SOCK="$SOCK" \
 	"$BIN" - $VWH >>"$LOG" 2>&1'
 	fi
 
+	say "起播参数：SRC=$SRC SS=$SS DUR=$DUR RAWMODE=${RAWMODE:-0} PIPE=${OPIPE:-0}"
 	# </dev/null：不然 ssh 远端起播时子进程握着 stdin，ssh 永远等不到 EOF
 	# 外层 sh 也要重定向：否则它握着调用者的 stdout，ssh 远端起播会一直等 EOF
 	setsid sh -c "$1" >>"$LOG" 2>&1 </dev/null &
@@ -646,6 +765,21 @@ fi | PLAY=1 NOWRITE=1 RENDER="$RENDER" SCALE="$SCALE" PLAY_SOCK="$SOCK" \
 	# 声音不再单起进程：播放器内建 aout 直接从 $AFIFO 读 PCM，
 	# 遥控器控制也走它自己的 $SOCK（play.sh 用 `$BIN -c ...` 说话）。
 	APID=""
+	# RAW 链路（RAWMODE=1）：视频解码在脚本这条 ffmpeg 里，播放器没有 SPAWN
+	# 模板、也就不 fork 音频那条（AUDIO_SPAWN 只在 g_spawn_mode 分支里读）。
+	# 结果就是 aout 起来了却没人写 fifo → 全程无声。所以这里脚本自己起。
+	if [ "${RAWMODE:-0}" = 1 ] && [ -n "${AUDIO_SPAWN:-}" ]; then
+		# URL 里有 `$$`（WebDAV 密码），绝不能让 URL 文本参与 sh -c 的
+		# 二次解析：实测被展开成 PID → 401 Unauthorized。所以把命令拆成
+		# 「-i 之前」「URL」「URL 之后」三段，URL 只经 $ASRC 变量传进去。
+		_apre=${AUDIO_SPAWN%%-i *}
+		_apost=${AUDIO_SPAWN#*-i }
+		_apost=${_apost#* }
+		_acmd=$(printf '%s' "$_apre" | sed "s/{SS}/$SS/")
+		_acmd="$_acmd -i \"\$ASRC\" $_apost"
+		ASRC=$SRC setsid sh -c "$_acmd" >>"$LOG" 2>&1 </dev/null &
+		APID=$!
+	fi
 	if [ "$AUDIO" = 1 ] && [ -n "$AFIFO_USE" ]; then
 		# 控制口没起来就别假装能遥控：音量/暂停/位置全指着它
 		_w=0
@@ -664,11 +798,24 @@ fi | PLAY=1 NOWRITE=1 RENDER="$RENDER" SCALE="$SCALE" PLAY_SOCK="$SOCK" \
 	# SRC/SOCK/AUDIO 都要写进 state：遥控器 seek 要整条链重开，
 	# 重启参数只能从 state 里取（播放进程自己不记得是从哪部片子来的）。
 	umask 077	# state 里存着带凭据的源地址（SRCB64），别人别读
+	_enc=$(enc "$SRC")
+	_tot=$(sed -n 's/^TOT=//p' "$STATE" 2>/dev/null | tail -1)
+	_osrc=$(sed -n 's/^SRCB64=//p' "$STATE" 2>/dev/null | tail -1)
+	case "${_tot:-}" in ''|*[!0-9]*) _tot=0 ;; esac
+	if [ "$_tot" -le 0 ] || [ "${_osrc:-}" != "$_enc" ]; then
+		_tot=$(probe_dur)
+	fi
+	# 摸不到时长（管道/流）就退回「起播点 + 本次剩余」，seek 会夹到老位置，
+	# 但至少不会把 T 夹成 0。
+	if [ "$_tot" -le 0 ] && [ "${DUR:-0}" -gt 0 ]; then _tot=$((SS + DUR)); fi
 	{
 		printf 'VPID=%s\nAPID=%s\nSS=%s\nDUR=%s\nBIN=%s\n' "$VPID" "$APID" "$SS" "$DUR" "$BIN"
 		printf 'LOGF=%s\nSOCK=%s\nAUDIO=%s\nRENDER=%s\nSCALE=%s\nFPS=%s\n' \
 			"$LOG" "$SOCK" "$AUDIO" "$RENDER" "$SCALE" "${FPS:-}"
-		printf 'SRCB64=%s\n' "$(enc "$SRC")"
+		printf 'SRCB64=%s\n' "$_enc"
+		# TOT 必须由**上一次**的 state 判断：同一个片源沿用它，换片才重算。
+		# 顺序很关键——$(enc) 已经算过一次，这里复用同一个值比较。
+		printf 'TOT=%s\n' "$_tot"
 	} > "$STATE"
 
 	if [ "$DUR" = "0" ] || [ -z "$DUR" ]; then
@@ -682,8 +829,11 @@ fi | PLAY=1 NOWRITE=1 RENDER="$RENDER" SCALE="$SCALE" PLAY_SOCK="$SOCK" \
 	#   RENDER: mode=gles tonemap=… src= ← 首帧配置完打
 	# PLAY: renderer= 是播完才出的收尾统计，拿它当判据必然误报（老版本的
 	# PLAY: plane= 更是早就不打了）。三者都认，只为兼容旧二进制。
-	if grep -qE '^RENDER: [A-Za-z0-9_]+ \(caps|^RENDER: mode=|^PLAY: (plane=|renderer=|submit=)' "$LOG" 2>/dev/null; then
+	if grep -qE '^RENDER: [A-Za-z0-9_]+ \(caps|^RENDER: mode=|^RAWIN: 首帧|^PLAY: (plane=|renderer=|submit=)' "$LOG" 2>/dev/null; then
 		grep -m2 -E '^RENDER: ([A-Za-z0-9_]+ \(caps|mode=)' "$LOG" | sed 's/^RENDER: /  /'
+		# RAW 链路没有 RENDER: 握手（解码在 ffmpeg 那边），判据是这两行
+		grep -m1 -E '^RAWIN: [0-9]+x[0-9]+' "$LOG" | sed 's/^RAWIN: /  /'
+		grep -m1 -E '^RAWIN: 首帧上屏' "$LOG" | sed 's/^RAWIN: /  /'
 		grep -m1 -E '^PLAY: ' "$LOG" | sed 's/^PLAY: /  /'
 	else
 		say "警告：日志里没有 RENDER: <后端> (caps …) 行，渲染器没起来，可能没上屏"
@@ -698,9 +848,12 @@ fi | PLAY=1 NOWRITE=1 RENDER="$RENDER" SCALE="$SCALE" PLAY_SOCK="$SOCK" \
 # 还容易和 pctl 的暂停计时打架（两处各记一份暂停时长，时间轴就漂）。
 # pctl 的 set_paused 会顺手 aout_set_paused，音画一起停，位置也停在该停的
 # 地方。没有控制口（老二进制）才退回冻进程组。
+# PCTL_NODELEGATE=1：告诉播放器"这条命令是 play.sh 发的，别再往 play.sh 转"。
+# 不带它会死循环：pctl seek → 播放器 run_play_sh → play.sh key fwd:30 →
+# seek_inplace 又 pctl seek … 实测按一下 ▶ 能刷几十行"seek 合并"，位置乱跳。
 pctl() {	# pctl <命令...>
 	[ -S "${SOCK:-/nonexist}" ] || return 1
-	PCTL_ECHO=1 PLAY_SOCK="$SOCK" "$BIN" -c "$@" 2>/dev/null
+	PCTL_ECHO=1 PCTL_NODELEGATE=1 PLAY_SOCK="$SOCK" "$BIN" -c "$@" 2>/dev/null
 }
 
 # 当前是不是暂停：优先问播放器（它自己记着 pause 状态），
@@ -713,10 +866,24 @@ is_paused() {
 	stopped "${VPID:-0}" 2>/dev/null
 }
 
+# seek 重开链路后控制口要 1~2s 才起来：调用方那句 `sleep 0.5; do_pause`
+# 常常撞在"socket 还没 listen"上，安静地什么都没做（症状：暂停中快进，
+# 回来是播着的）。这里自己等，最多 4s。
+wait_sock() {
+	_w=0
+	while [ "$_w" -lt 40 ]; do
+		[ -S "${SOCK:-/nonexist}" ] && return 0
+		alive "${VPID:-0}" || return 1
+		_w=$((_w + 1)); sleep 0.1
+	done
+	return 1
+}
+
 do_pause() {
 	load_state || die "没有在放的片子"
 	alive "${VPID:-}" || die "播放进程已退出"
 	is_paused && { say "已经是暂停状态"; return 0; }
+	wait_sock >/dev/null 2>&1 || true
 	if pctl pause >/dev/null; then
 		say "已暂停"
 		return 0
@@ -743,6 +910,7 @@ do_stop() {
 	fi
 	rm -f "$STATE"
 	fbcon_release        # 停止后把命令行还给人
+	drm_restore          # 桌面该回来了
 	say "已停止"
 }
 
@@ -759,7 +927,9 @@ pos_of() {
 	case "${_tm:-}" in
 	'') ;;
 	*) awk -v m="$_tm" -v o="${SS:-0}" -v d="${DUR:-0}" 'BEGIN{
-	       p = int(m / 1000)
+	       # pos_ms 是**本次实例**的时间轴（RAW 路径时钟原点没挪到 -SS），
+	       # 不加 SS 的话 43s 起播放到 49s 会报成 6s，遥控器后退就跳回 0。
+	       p = int(m / 1000) + o
 	       if (d > 0 && p > o + d) p = o + d
 	       printf "%d", p }'; return 0 ;;
 	esac
@@ -824,11 +994,25 @@ fmt_pos() {
 	fi
 }
 
+# 连发不再"丢弃"，改排队：窗口内的偏移量累加到 /tmp/play.seek.pend，
+# 下一次真正重开链路时并进去（按住 ▶ 三下 = 一次 +90s，不是只有第一下生效、
+# 后面全被丢掉）。$1 是要累加的秒数（seekto 绝对跳不排队，传空）。
+PEND=/tmp/play.seek.pend
 seek_guard() {
 	_s=/tmp/play.seek.stamp
 	_n=$(date +%s); _p=$(cat "$_s" 2>/dev/null || echo 0)
 	case "$_p" in ''|*[!0-9]*) _p=0 ;; esac
 	if [ $((_n - _p)) -lt 3 ]; then
+		_d=${1:-}
+		case "$_d" in
+		''|*[!0-9-]*|'-') ;;
+		*)
+			_q=$(cat "$PEND" 2>/dev/null || echo 0)
+			case "$_q" in ''|*[!0-9-]*) _q=0 ;; esac
+			echo $((_q + _d)) > "$PEND"
+			say "快进/快退排队 +${_d}s（距上次 $((_n - _p))s，累计 $(cat "$PEND")s）"
+			return 1 ;;
+		esac
 		say "seek 合并（距上次 $((_n - _p))s，丢弃连发）"
 		return 1
 	fi
@@ -836,13 +1020,53 @@ seek_guard() {
 	return 0
 }
 
+# 取走排队量（并进这次的起播秒数）
+# 时效：只有 10s 内的排队算"同一次连按"。上一个进程被杀、或隔了很久再按，
+# 残留的字数不能当成本次的偏移（实测残留 240s 把目标顶到片长之外 → 黑屏）。
+take_pend() {
+	_q=$(cat "$PEND" 2>/dev/null || echo 0)
+	case "$_q" in ''|*[!0-9-]*) _q=0 ;; esac
+	if [ "$_q" != 0 ]; then
+		_t=$(stat -c %Y "$PEND" 2>/dev/null || echo 0)
+		case "$_t" in ''|*[!0-9]*) _t=0 ;; esac
+		[ $(( $(date +%s) - _t )) -gt 10 ] && _q=0
+	fi
+	rm -f "$PEND" 2>/dev/null
+	echo "$_q"
+}
+
+# 片长（秒）。DUR=0（调用方没给时长，比如直接从命令行起播）时用它兜底：
+# 目标秒数一旦超过片长，ffmpeg 只会吐 0 帧，现场表现就是"快进直接黑屏"。
+# 片源**总时长**（秒）。只读 state 里缓存好的 TOT：seek 每次都会重开整条链，
+# 每次都 `ffmpeg -i` 摸时长的话，NAS 上一按键就卡半秒。真正去问片源的是
+# probe_dur()，起播/换片时写一次进 state。
+dur_secs() {
+	_t=$(sed -n 's/^TOT=//p' "$STATE" 2>/dev/null | tail -1)
+	case "${_t:-}" in ''|*[!0-9]*) echo 0 ;; *) echo "$_t" ;; esac
+}
+
+# 直接从 `ffmpeg -i` 的 stderr 抠 "Duration: h:mm:ss"：盒上的 ffprobe 是自己
+# 写的 shim（只认 codec,w,h / r_frame_rate），不给 duration。
+probe_dur() {
+	[ -n "${SRC:-}" ] || { echo 0; return 0; }
+	# shellcheck disable=SC2086
+	_d=$(ffmpeg -hide_banner -nostdin ${IN_FMT:-} ${HTTP_OPT:-} -i "$SRC" 2>&1 \
+		| sed -n 's/.*Duration: *\([0-9][0-9]*\):\([0-9][0-9]*\):\([0-9][0-9]*\).*/\1 \2 \3/p' \
+		| head -n 1)
+	case "$_d" in '') echo 0; return 0 ;; esac
+	# shellcheck disable=SC2086
+	echo "$_d" | awk '{printf "%d", $1*3600 + $2*60 + $3}'
+}
+
 # 就地跳（design §5.4）：spawn 模式下 ffmpeg 是播放器的子进程，播放器自己
 # 能 kill 它、带新 -ss 重开、顺手重建 V4L2 会话 —— DRM/GL 一路不放手，屏幕
 # 不黑、buffer 不重建。控制口直接接住就别重开整条链（返回 0 = 已接管）。
 # 接不住（非 spawn 模式、老二进制、socket 不通）返回 1，调用方退回整链重开。
 seek_inplace() {
-	_r=$(pctl "$1" "$2" 2>/dev/null) || return 1
-	case "$_r" in
+	# 变量名必须跟调用方的 _r（剩余时长）分开：同一个 _r 会把 pctl 的 JSON
+	# 当成秒数传给新实例（-t '{"ok":1}' → 0 帧黑屏）。
+	_si=$(pctl "$1" "$2" 2>/dev/null) || return 1
+	case "$_si" in
 	*'"seek":"abs"'*|*'"seek":"inplace"'*) return 0 ;;
 	esac
 	return 1
@@ -868,6 +1092,8 @@ vol_step() {
 do_key() {
 	ACT=${1:-}
 	load_state || { say "遥控器：没有在放的片子"; return 1; }
+	# state 里只存 base64 的源地址：dur_secs 要用 $SRC 问 ffprobe，先解出来
+	SRC=$(dec "${SRCB64:-}")
 	case "$ACT" in
 	toggle)
 		[ -n "${VPID:-}" ] && alive "$VPID" || { say "遥控器：播放进程已退出"; return 1; }
@@ -890,16 +1116,20 @@ do_key() {
 		case "$T" in ''|*[!0-9]*) say "seekto 参数不对：$ACT"; return 1 ;; esac
 		[ "$T" -lt 0 ] && T=0
 		P=$(pos_of); [ -n "$P" ] || P=0
+		_du=$(dur_secs)
 		_r=0
-		if [ "${DUR:-0}" -gt 0 ]; then
-			[ "$T" -ge "$DUR" ] && T=$((DUR - 1))
-			_r=$((DUR - (T - SS))); [ "$_r" -le 0 ] && _r=$DUR
+		if [ "$_du" -gt 0 ]; then
+			# 夹紧到片长以内（-3s 留收尾余量）：超片长 ffmpeg 吐 0 帧 = 黑屏
+			[ "$T" -gt $((_du - 3)) ] && T=$((_du - 3))
+			_r=$((_du - T)); [ "$_r" -le 0 ] && _r=$_du
 		fi
 		if seek_inplace seekto "$T"; then
+			rm -f "$PEND" 2>/dev/null
 			say "跳到 ${T}s（绝对，原 ${P}s，就地跳，屏幕不黑）"
 			return 0
 		fi
 		seek_guard || return 0
+		rm -f "$PEND" 2>/dev/null	# 绝对跳：之前排队的相对量作废
 		_WAS=0; is_paused && _WAS=1
 		say "跳到 ${T}s（绝对，原 ${P}s）"
 		SRC=$(dec "${SRCB64:-}")
@@ -921,19 +1151,37 @@ do_key() {
 		esac
 		P=$(pos_of); [ -n "$P" ] || P=0
 		T=$((P + D)); [ "$T" -lt 0 ] && T=0
-		# 已播时长：有 DUR 就只放剩下的，别让"±10s"变成"循环到结尾"
-		_r=0
-		if [ "${DUR:-0}" -gt 0 ]; then
-			_r=$((DUR - (T - SS))); [ "$_r" -le 0 ] && _r=$DUR
-		fi
+		# 已播时长：有片长就只放剩下的，别让"±10s"变成"循环到结尾"
+		_du=$(dur_secs)
+		if [ "$_du" -gt 0 ] && [ "$T" -gt $((_du - 3)) ]; then T=$((_du - 3)); fi
 		# 偏移量交给播放器算：它有连续 seek 的基准链（末次目标），
 		# 这里用 pos_of() 的旧位置起算会连按跳错。
 		if seek_inplace seek "$D"; then
+			rm -f "$PEND" 2>/dev/null
 			say "跳 ${D}s（就地跳，屏幕不黑）"
 			return 0
 		fi
-		seek_guard || return 0
+		seek_guard "$D" || return 0
 		_WAS=0; is_paused && _WAS=1
+		# 窗口内被排队的连发量并进这次的目标：按住 ▶ 三下 = 一次 +3 档，
+		# 而不是只有第一下生效、后面全丢（用户视角就是"快进不好使"）。
+		_PD=$(take_pend)
+		if [ "$_PD" != 0 ]; then
+			T=$((T + _PD)); [ "$T" -lt 0 ] && T=0
+			if [ "$_du" -gt 0 ] && [ "$T" -gt $((_du - 3)) ]; then T=$((_du - 3)); fi
+			say "连发并入 ${_PD}s"
+		fi
+		# 剩余时长必须在 seek_inplace/take_pend 之后算：那两个函数会用同名
+		# 临时变量，先算会被覆盖成 pctl 的 JSON。
+		_r=0
+		if [ "$_du" -gt 0 ]; then
+			# T 现在是**绝对**位置，剩余直接 _du - T；再减 SS 会把
+			# 「已跳过的那段」又算回去 → -t 越按越大（203 > 片长 150）。
+			_r=$((_du - T)); [ "$_r" -le 0 ] && _r=$_du
+		fi
+		case "$_r" in ''|*[!0-9]*) _r=0 ;; esac
+		# 排查用：seek 的绝对位置/总时长/本次剩余，一行看全（PLAYDEBUG=1 才打）
+		[ -n "${PLAYDEBUG:-}" ] && say "SEEKDBG P=$P D=$D T=$T du=$_du SS=$SS oldDUR=$DUR r=$_r PD=$_PD"
 		say "跳到 ${T}s（原 ${P}s，偏移 $D）"
 		SRC=$(dec "${SRCB64:-}")
 		[ -n "$SRC" ] || { say "state 里没有片源，无法重开"; return 1; }
@@ -998,6 +1246,15 @@ do_play "$SRC" || exit 1
 [ "$DRYRUN" = 1 ] && exit 0     # -n 只看解析结果，没有进程要等
 
 if [ "$BACKGROUND" = 1 ]; then
+	# 自然播完（EOF）没人调 do_stop：桌面就永远回不来（黑屏，遥控只对
+	# 已经不存在的播放器发键）。留一条看护进程等播放器咽气再收尾。
+	if [ -e "$DRM_YIELD_STAMP" ]; then
+		setsid sh -c '
+			while [ -r "/proc/$1/stat" ]; do sleep 1; done
+			rm -f "$2"
+			systemctl is-active --quiet desktop || systemctl start desktop
+		' _ "$VPID" "$DRM_YIELD_STAMP" </dev/null >/dev/null 2>&1 &
+	fi
 	say "后台运行，PID $VPID（./play.sh status 查看，stop 停止）"
 	exit 0
 fi

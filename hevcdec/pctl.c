@@ -312,6 +312,17 @@ static int handle_line(int fd, char *line)
 				return 0;
 			}
 		}
+		/* 谁调的这一支很关键：遥控器/外部 -c 进来的才该往 play.sh 转；
+		 * 如果这条 seek 本身就是 play.sh 转下来的（play.sh 的 pctl() 会带
+		 * PCTL_NODELEGATE=1），再转回去就是死循环 ——
+		 *   pctl seek → play.sh key fwd:30 → pctl seek → play.sh key fwd:30 …
+		 * 表现：按一下 ▶ 日志刷几十行"seek 合并"，位置乱跳、最后落回原地。
+		 * 回 "seek":"no" 让 play.sh 知道"就地跳做不到，你自己重开链路"。
+		 */
+		if (getenv("PCTL_NODELEGATE")) {
+			reply(fd, "{\"ok\":1,\"seek\":\"no\"}\n");
+			return 0;
+		}
 		run_play_sh(act);
 		reply(fd, "{\"ok\":1}\n");
 		return 0;
