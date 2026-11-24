@@ -207,6 +207,17 @@ local function resolve(force)
 end
 
 -- —— 动作执行 ——
+-- luajit 必须是绝对路径：systemd 的 PATH 里没有 /opt/reader/bin，裸 `luajit`
+-- 会 sh: luajit: not found → rc=127 → 每个动作都 FAILED（表现为遥控器完全没反应）。
+local LUAJIT = os.getenv("LUAJIT_EXE")
+if not LUAJIT or LUAJIT == "" then
+	for _, c in ipairs({ "/opt/reader/bin/luajit", "/usr/local/bin/luajit", "/usr/bin/luajit" }) do
+		local fh = io.open(c, "rb")
+		if fh then fh:close(); LUAJIT = c; break end
+	end
+end
+LUAJIT = LUAJIT or "luajit"
+
 local function run_action(app, action, key)
 	if CFG.dispatch == "exec" then
 		-- 真·外部进程：按键 → fork 一次 luajit -e 跑该 app 的固定脚本
@@ -220,11 +231,11 @@ local function run_action(app, action, key)
 			-- 传「动作名」而不是键名：键→动作的映射只该有一份（apps/<app>.lua 的
 			-- M.map）。以前传键名，keys/<app>.lua 表里漏一个键（比如 BACK=158）
 			-- 就被当成未知动作悄悄空转，遥控器按了没反应。
-			cmd = ("timeout 6 luajit -e 'dofile(%q)' %q >/dev/null 2>&1")
-				:format(app.keysfile, action)
+			cmd = ("timeout 6 %s -e 'dofile(%q)' %q >/dev/null 2>&1")
+				:format(LUAJIT, app.keysfile, action)
 		else
-			cmd = ("timeout 6 luajit -e 'dofile(%q)' %s %q >/dev/null 2>&1")
-				:format(ROOT .. "/act.lua", app.name, action)
+			cmd = ("timeout 6 %s -e 'dofile(%q)' %s %q >/dev/null 2>&1")
+				:format(LUAJIT, ROOT .. "/act.lua", app.name, action)
 		end
 		local rc = os.execute(cmd)
 

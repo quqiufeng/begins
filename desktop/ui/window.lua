@@ -23,7 +23,7 @@ function M:open()
 		if not ok then sdl.quit(); return nil, e end
 	end
 	-- kmsdrm 上不要独占键盘（keybd 才是遥控的主人），只当普通输入源
-	if sdl.video_driver() == "KMSDRM" then sdl.set_hint("SDL_HINT_KMSDRM_REQUIRE_DRM_MASTER", "0") end
+	if sdl.video_driver() == "KMSDRM" then sdl.set_hint("SDL_HINT_KMSDRM_REQUIRE_DRM_MASTER", "1") end
 	local win = sdl.create_window(cfg.title, cfg.width, cfg.height, {
 		fullscreen = cfg.fullscreen, resizable = not cfg.fullscreen,
 	})

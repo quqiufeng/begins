@@ -164,18 +164,13 @@ local function open_current()
 	if auto then auto.busy = false end
 
 	if res == "into" then
-		win:suspend()
-		local ok, e2 = win:resume()
-
-		if not ok then
-			logf("resume 失败：" .. tostring(e2))
-			running = false
-			return
-		end
-		-- 外部 app 把 KMS 抢走过，纹理全废了，清缓存重画
-		ico:destroy()
-		g:clear_thumbs(false)  -- KMS 被抢过，纹理已失效：只丢引用，不销毁
-		pv:clear_tex()
+		-- 进目录只是 fs:enter()，全程没碰 KMS（launcher:open 对 item.dir 直接 return，
+		-- 根本不跑外部命令），所以【绝对不能】suspend/resume。
+		-- 老代码在这里 win:suspend()+resume()：suspend 会 SDL_DestroyWindow +
+		-- quit_video，把 DRM master 放掉，fbcon 立刻合法接管、把控制台画上屏；
+		-- resume 再重建窗口抢回 master。窗口期内屏幕上是命令行，而 resume 在
+		-- KMSDRM 上偶发抢不到 master 就返回 false → running=false → 桌面退出，
+		-- 屏幕永久停在 shell 提示符（用户报的"进目录再返回就变命令行"）。
 		layout()
 		dirty = true
 		toast(("进入 %s"):format(fs:display_name()))
@@ -270,12 +265,15 @@ local function on_key(name)
 	elseif name == "PAGEDOWN" or name == "CHANNELDOWN" then g:page(fs, 1)
 	elseif name == "HOME" then g:home(fs)
 	elseif name == "MENU" then
-		-- 刷新就只是刷新。以前这里顺手 theme.random()，结果每刷一次
-		-- 桌面颜色就换一套（进新目录、退出播放器回来都会走这条路），
-		-- 看着像"主题自己乱变"。配色只由 T 键改，并且会落盘记住。
+		-- 遥控器 ☰ 键（keybd 派 nav.menu）：刷新 + 换一套配色，和底部提示
+		-- "MENU 刷新·换色" 一致。遥控器上没有 T 键，以前这里只刷新，
+		-- 于是"按 MENU 换主题"永远换不了。
+		-- 内部路径（进目录 / 退出播放器回来）只调 rescan()，不走这里，
+		-- 所以不会再出现"颜色自己乱变"。
 		rescan()
-		toast("已刷新", 1.5, theme.text_dim)
-		logf("MENU 刷新")
+		local n = theme.cycle(1)
+		toast(("配色：%s"):format(theme.label or n), 2)
+		logf("MENU 刷新 + 配色 → " .. tostring(n))
 	elseif name == "END" then g:endk(fs)
 	elseif name == "OK" or name == "ENTER" or name == "RETURN" or name == "SPACE" then
 		open_current()
