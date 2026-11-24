@@ -48,7 +48,7 @@ $(BIN): $(PLAY_SRC) $(PLAY_HDR)
 else
 # aarch64：两个后端都在同一个二进制里，运行期 RENDER= 选
 $(BIN): $(PLAY_SRC) glout.c $(PLAY_HDR) $(GL_LIBS)
-	$(CC) $(GL_CFLAGS) -DUSE_DRM -DAOUT_EMBED -DHAVE_GLOUT -DGLOUT_NO_MAIN -pthread -o $@ \
+	$(CC) $(GL_CFLAGS) -rdynamic -DUSE_DRM -DAOUT_EMBED -DHAVE_GLOUT -DGLOUT_NO_MAIN -pthread -o $@ \
 	  $(PLAY_SRC) glout.c \
 	  -idirafter /usr/include -idirafter /usr/include/libdrm -lm $(GL_LIBS)
 endif

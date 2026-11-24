@@ -21,6 +21,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <execinfo.h>
 #include <time.h>
 #include <linux/videodev2.h>
 
@@ -72,8 +73,8 @@ static size_t rbsp_un(unsigned char *dst, size_t cap,
 #define NBUF_CAP() (getenv("CAPBUF") ? atoi(getenv("CAPBUF")) : 20)
 #define NBUF_OUT 32
 #define OUT_DEPTH() (getenv("NBUF_OUT") ? atoi(getenv("NBUF_OUT")) : 8)
-#define CAP_T V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE
-#define OUT_T V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE
+#define CAP_T V4L2_BUF_TYPE_VIDEO_CAPTURE
+#define OUT_T V4L2_BUF_TYPE_VIDEO_OUTPUT
 
 static volatile sig_atomic_t g_reinit;	/* 定义在下方，xioctl 要先看到 */
 /* 驱动 abort 会话（POLLERR）后的连续自愈次数。meson-vdec 偶发
@@ -292,7 +293,8 @@ static struct capbuf capbuf[NBUF_CAP_MAX];
 static int cap_busy[NBUF_CAP_MAX];
 static unsigned cap_count;
 static unsigned cap_memory = V4L2_MEMORY_MMAP;
-static unsigned cap_psize[2];	/* DMABUF 模式下每 plane 的字节数 */
+static unsigned cap_psize[2];	/* [0]=整块 NV12 字节数（单平面） */
+static unsigned cap_bpl, cap_ysize;	/* Y 面行宽 / Y 面字节数（UV 偏移） */
 
 static struct { void *mem; size_t len; } outbuf[NBUF_OUT];
 static int out_free[NBUF_OUT], out_nfree, n_out;
@@ -505,10 +507,10 @@ static int g_v4l_cs = -1, g_v4l_xf = -1, g_v4l_enc = -1, g_v4l_q = -1;
 
 static void v4l_color_read(const struct v4l2_format *f)
 {
-	g_v4l_cs = (int)f->fmt.pix_mp.colorspace;
-	g_v4l_xf = (int)f->fmt.pix_mp.xfer_func;
-	g_v4l_enc = (int)f->fmt.pix_mp.ycbcr_enc;
-	g_v4l_q = (int)f->fmt.pix_mp.quantization;
+	g_v4l_cs = (int)f->fmt.pix.colorspace;
+	g_v4l_xf = (int)f->fmt.pix.xfer_func;
+	g_v4l_enc = (int)f->fmt.pix.ycbcr_enc;
+	g_v4l_q = (int)f->fmt.pix.quantization;
 }
 
 /* V4L2 枚举 → 码流枚举。对不上（没写/是 DEFAULT）返 0 = 不参与比较。
@@ -713,23 +715,24 @@ static int s_fmt_cap(unsigned w, unsigned h)
 
 	f.type = CAP_T;
 
-	f.fmt.pix_mp.width = w;
-	f.fmt.pix_mp.height = h;
-	f.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12M;
-	f.fmt.pix_mp.num_planes = 2;
-	f.fmt.pix_mp.field = V4L2_FIELD_NONE;
-	f.fmt.pix_mp.plane_fmt[0].sizeimage = w * h;
-	f.fmt.pix_mp.plane_fmt[1].sizeimage = w * h / 2;
-	f.fmt.pix_mp.plane_fmt[1].bytesperline = w / 2;
+	/* cedrus 的 capture 队列只注册单平面 NV12（cedrus_video.c 没有任何
+	 * _mplane ops）；填 NV12M/MPLANE 会 S_FMT EINVAL。bytesperline/sizeimage
+	 * 都留 0 让驱动按对齐规则自己算，之后一律以 G_FMT 回填的值为准。 */
+	f.fmt.pix.width = w;
+	f.fmt.pix.height = h;
+	f.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+	f.fmt.pix.field = V4L2_FIELD_NONE;
+	f.fmt.pix.bytesperline = 0;
+	f.fmt.pix.sizeimage = 0;
 	if (xioctl(fd, VIDIOC_S_FMT, &f) < 0) {
 		printf("S_FMT CAP %ux%u 失败: %s\n", w, h, strerror(errno));
 		return -errno;
 	}
-	g_w = f.fmt.pix_mp.width;
-	g_h = f.fmt.pix_mp.height;
+	g_w = f.fmt.pix.width;
+	g_h = f.fmt.pix.height;
 	v4l_color_read(&f);
-	printf("S_FMT CAP : %ux%u pf=%08x sizeimage=%u\n", g_w, g_h,
-	       f.fmt.pix_mp.pixelformat, f.fmt.pix_mp.plane_fmt[0].sizeimage);
+	printf("S_FMT CAP : %ux%u pf=%08x bpl=%u sizeimage=%u\n", g_w, g_h,
+	       f.fmt.pix.pixelformat, f.fmt.pix.bytesperline, f.fmt.pix.sizeimage);
 	return 0;
 }
 
@@ -739,8 +742,8 @@ static void g_fmt_cap(void)
 
 	f.type = CAP_T;
 	if (xioctl(fd, VIDIOC_G_FMT, &f) < 0) return;
-	g_w = f.fmt.pix_mp.width;
-	g_h = f.fmt.pix_mp.height;
+	g_w = f.fmt.pix.width;
+	g_h = f.fmt.pix.height;
 	v4l_color_read(&f);
 	/* §4.3.6 要实测的一行：meson vdec 到底填不填这四个字段？
 	 * 只打印，不参与计算（真值一律取 VUI）。 */
@@ -755,12 +758,16 @@ static void cap_release(void)
 	unsigned i;
 	int p;
 
-	for (i = 0; i < cap_count; i++)
-		for (p = 0; p < VIDEO_MAX_PLANES; p++)
-			if (capbuf[i].mem[p]) {
-				munmap(capbuf[i].mem[p], capbuf[i].len[p]);
-				capbuf[i].mem[p] = NULL;
-			}
+	for (i = 0; i < cap_count; i++) {
+		/* 单平面：mem[1] 只是 mem[0]+Y 面的别名，munmap 只能对基址做一次 */
+		if (capbuf[i].mem[0])
+			munmap(capbuf[i].mem[0], capbuf[i].len[0] + cap_ysize);
+		for (p = 0; p < VIDEO_MAX_PLANES; p++) {
+			capbuf[i].mem[p] = NULL;
+			capbuf[i].len[p] = 0;
+			capbuf[i].mem2[p] = NULL;
+		}
+	}
 	cap_count = 0;
 	rb.type = CAP_T;
 	rb.memory = cap_memory;
@@ -777,12 +784,13 @@ static void close_cap_dmabufs(void)
 	unsigned i;
 	int p;
 
-	for (i = 0; i < cap_count; i++)
+	for (i = 0; i < cap_count; i++) {
+		/* 单平面：dmabuf[1] 与 dmabuf[0] 是同一个 fd，只能关一次 */
+		if (capbuf[i].dmabuf[0] >= 0)
+			close(capbuf[i].dmabuf[0]);
 		for (p = 0; p < 2; p++)
-			if (capbuf[i].dmabuf[p] >= 0) {
-				close(capbuf[i].dmabuf[p]);
-				capbuf[i].dmabuf[p] = -1;
-			}
+			capbuf[i].dmabuf[p] = -1;
+	}
 }
 
 /* ---- 采集缓冲的来源 ------------------------------------------------
@@ -799,23 +807,37 @@ static void close_cap_dmabufs(void)
 
 /* sizeimage 一律用驱动 G_FMT 之后填的值：自算的 w*h 比它少一截对齐
  * 余量（1080p 少 24576 字节），拿去 QBUF 直接 EINVAL。 */
-static int cap_heap_planes(void)
+/* 单平面 NV12 的几何：一块 buffer，Y 在前、UV 紧跟其后。
+ * UV 起址由驱动按它自己的行/高对齐排版（cedrus: bpl=ALIGN(w,16)、
+ * h=ALIGN(h,16)），所以只能从 sizeimage 反推，不能拿 bpl*h 硬算 ——
+ * 1080p 上差 8 行 = 15360 字节，UV 整体错位、画面变花屏。
+ * sizeimage = Y + UV = Y*3/2  =>  Y = sizeimage*2/3，再按 bpl 取整。
+ */
+static int cap_geom(void)
 {
 	struct v4l2_format f = {0};
+	unsigned long long ysz;
 
 	f.type = CAP_T;
 	if (xioctl(fd, VIDIOC_G_FMT, &f) < 0) {
 		printf("G_FMT CAP 失败: %s\n", strerror(errno));
 		return -errno;
 	}
-	cap_psize[0] = f.fmt.pix_mp.plane_fmt[0].sizeimage;
-	cap_psize[1] = f.fmt.pix_mp.plane_fmt[1].sizeimage;
-	if (!cap_psize[0] || !cap_psize[1]) {
-		printf("G_FMT CAP sizeimage 没填(%u/%u)，没法按 dmabuf 分配\n",
-		       cap_psize[0], cap_psize[1]);
+	cap_psize[0] = f.fmt.pix.sizeimage;
+	cap_psize[1] = 0;
+	cap_bpl = f.fmt.pix.bytesperline ? f.fmt.pix.bytesperline : f.fmt.pix.width;
+	cap_ysize = 0;
+	if (cap_psize[0] && cap_bpl)
+		cap_ysize = (unsigned)((ysz = (unsigned long long)cap_psize[0] * 2 / 3)
+				       / cap_bpl * cap_bpl);
+	if (!cap_bpl || !cap_ysize || cap_ysize >= cap_psize[0]) {
+		printf("G_FMT CAP 几何不可用(bpl=%u sizeimage=%u Y=%u)\n",
+		       cap_bpl, cap_psize[0], cap_ysize);
 		return -EINVAL;
 	}
-	printf("dmabuf cap plane: Y=%u C=%u\n", cap_psize[0], cap_psize[1]);
+	printf("cap geom: %ux%u bpl=%u sizeimage=%u Y=%u C=%u\n",
+	       f.fmt.pix.width, f.fmt.pix.height, cap_bpl, cap_psize[0],
+	       cap_ysize, cap_psize[0] - cap_ysize);
 	return 0;
 }
 
@@ -876,47 +898,48 @@ static int cap_setup(void)
 		for (p = 0; p < 2; p++)
 			capbuf[i].dmabuf[p] = -1;
 
-	if (cap_memory == V4L2_MEMORY_DMABUF) {
-		r = cap_heap_planes();
-		if (r)
-			goto fail;
+	r = cap_geom();
+	if (r)
+		goto fail;
+	if (cap_memory == V4L2_MEMORY_DMABUF && !cap_psize[0]) {
+		printf("G_FMT CAP sizeimage 没填，没法按 dmabuf 分配\n");
+		r = -EINVAL;
+		goto fail;
 	}
 
 	for (i = 0; i < cap_count; i++) {
 		struct v4l2_buffer b = {0};
-		struct v4l2_plane pl[2] = {{0}};
 
 		b.type = CAP_T;
 		b.memory = cap_memory;
 		b.index = i;
-		b.length = 2;
-		b.m.planes = pl;
 
 		if (cap_memory == V4L2_MEMORY_DMABUF) {
-			for (p = 0; p < 2; p++) {
-				int hfd = dma_heap_alloc(cap_psize[p]);
+			int hfd = dma_heap_alloc(cap_psize[0]);
 
-				if (hfd < 0) {
-					printf("dma_heap cap[%u/%d] 失败: %s\n",
-					       i, p, strerror(errno));
-					r = -errno;
-					goto fail;
-				}
-				capbuf[i].dmabuf[p] = hfd;
-				capbuf[i].len[p] = cap_psize[p];
-				pl[p].m.fd = hfd;
-				pl[p].length = cap_psize[p];
-				capbuf[i].mem[p] = mmap(NULL, cap_psize[p],
-							PROT_READ | PROT_WRITE,
-							MAP_SHARED, hfd, 0);
-				if (capbuf[i].mem[p] == MAP_FAILED) {
-					capbuf[i].mem[p] = NULL;
-					printf("mmap cap[%u/%d] 失败: %s\n",
-					       i, p, strerror(errno));
-					r = -errno;
-					goto fail;
-				}
+			if (hfd < 0) {
+				printf("dma_heap cap[%u] 失败: %s\n", i,
+				       strerror(errno));
+				r = -errno;
+				goto fail;
 			}
+			capbuf[i].dmabuf[0] = hfd;
+			capbuf[i].dmabuf[1] = hfd;	/* 同一块，UV 靠偏移 */
+			capbuf[i].len[0] = cap_psize[0];
+			capbuf[i].len[1] = cap_psize[0] - cap_ysize;
+			capbuf[i].mem[0] = mmap(NULL, cap_psize[0],
+						PROT_READ | PROT_WRITE,
+						MAP_SHARED, hfd, 0);
+			if (capbuf[i].mem[0] == MAP_FAILED) {
+				capbuf[i].mem[0] = NULL;
+				printf("mmap cap[%u] 失败: %s\n", i,
+				       strerror(errno));
+				r = -errno;
+				goto fail;
+			}
+			capbuf[i].mem[1] = (unsigned char *)capbuf[i].mem[0] + cap_ysize;
+			b.m.fd = hfd;
+			b.length = cap_psize[0];
 		} else {
 			if (xioctl(fd, VIDIOC_QUERYBUF, &b) < 0) {
 				printf("QUERYBUF cap[%u] 失败: %s\n", i,
@@ -924,45 +947,43 @@ static int cap_setup(void)
 				r = -errno;
 				goto fail;
 			}
-			for (p = 0; p < 2; p++) {
-				capbuf[i].len[p] = pl[p].length;
-				if (getenv("NOMAP")) {	/* 零拷贝：只导出 */
-					capbuf[i].mem[p] = NULL;
-					continue;
-				}
-				capbuf[i].mem[p] = mmap(NULL, pl[p].length,
+			capbuf[i].len[0] = b.length;
+			capbuf[i].len[1] = b.length - cap_ysize;
+			if (getenv("NOMAP")) {	/* 零拷贝：只导出 */
+				capbuf[i].mem[0] = NULL;
+				capbuf[i].mem[1] = NULL;
+			} else {
+				capbuf[i].mem[0] = mmap(NULL, b.length,
 							PROT_READ | PROT_WRITE,
-							MAP_SHARED, fd,
-							pl[p].m.mem_offset);
-				if (capbuf[i].mem[p] == MAP_FAILED) {
-					capbuf[i].mem[p] = NULL;
+							MAP_SHARED, fd, b.m.offset);
+				if (capbuf[i].mem[0] == MAP_FAILED) {
+					capbuf[i].mem[0] = NULL;
 					printf("mmap cap[%u] 失败: %s\n", i,
 					       strerror(errno));
 					r = -errno;
 					goto fail;
 				}
+				capbuf[i].mem[1] = (unsigned char *)capbuf[i].mem[0]
+						   + cap_ysize;
 			}
 			if (getenv("EXPBUF") || getenv("PLAY")) {
-				for (p = 0; p < 2; p++) {
-					struct v4l2_exportbuffer eb = {0};
+				struct v4l2_exportbuffer eb = {0};
 
-					eb.type = CAP_T;
-					eb.index = i;
-					eb.plane = p;
-					eb.flags = O_CLOEXEC;
-					if (xioctl(fd, VIDIOC_EXPBUF,
-						   &eb) < 0) {
-						printf("EXPBUF cap[%u/%d] 失败: %s\n",
-						       i, p, strerror(errno));
-						r = -errno;
-						goto fail;
-					}
-					capbuf[i].dmabuf[p] = eb.fd;
+				eb.type = CAP_T;
+				eb.index = i;
+				eb.plane = 0;
+				eb.flags = O_CLOEXEC;
+				if (xioctl(fd, VIDIOC_EXPBUF, &eb) < 0) {
+					printf("EXPBUF cap[%u] 失败: %s\n", i,
+					       strerror(errno));
+					r = -errno;
+					goto fail;
 				}
+				capbuf[i].dmabuf[0] = eb.fd;
+				capbuf[i].dmabuf[1] = eb.fd;
 				if (i == 0)
-					printf("dmabuf: buf0 Y=%d C=%d\n",
-					       capbuf[0].dmabuf[0],
-					       capbuf[0].dmabuf[1]);
+					printf("dmabuf: buf0 fd=%d（NV12 单块，UV@%u）\n",
+					       capbuf[0].dmabuf[0], cap_ysize);
 			}
 		}
 		if (xioctl(fd, VIDIOC_QBUF, &b) < 0) {
@@ -1014,21 +1035,18 @@ static int out_setup(void)
 	printf("out buffers=%u\n", rb.count);
 	for (i = 0; i < (int)rb.count; i++) {
 		struct v4l2_buffer b = {0};
-		struct v4l2_plane pl[1] = {{0}};
 
 		b.type = OUT_T;
 		b.memory = V4L2_MEMORY_MMAP;
 		b.index = i;
-		b.length = 1;
-		b.m.planes = pl;
 		if (xioctl(fd, VIDIOC_QUERYBUF, &b) < 0) {
 			printf("QUERYBUF out[%d] 失败: %s\n", i, strerror(errno));
 			r = -errno;
 			goto fail;
 		}
-		outbuf[i].len = pl[0].length;
+		outbuf[i].len = b.length;
 		outbuf[i].mem = mmap(NULL, outbuf[i].len, PROT_READ | PROT_WRITE,
-				     MAP_SHARED, fd, pl[0].m.mem_offset);
+				     MAP_SHARED, fd, b.m.offset);
 		if (outbuf[i].mem == MAP_FAILED) {
 			outbuf[i].mem = NULL;
 			printf("mmap out[%d] 失败: %s\n", i, strerror(errno));
@@ -1087,19 +1105,14 @@ static void qbuf_au(const unsigned char *data, size_t len, int key)
 {
 	int oi = out_free[--out_nfree];
 	struct v4l2_buffer b = {0};
-	struct v4l2_plane pl[1] = {{0}};
 
 	if (len > outbuf[oi].len)
 		die("AU 大于 OUTPUT 缓冲（调大 MAXAU）");
 	memcpy(outbuf[oi].mem, data, len);
-	pl[0].bytesused = len;
-	pl[0].data_offset = 0;
-	pl[0].length = outbuf[oi].len;
 	b.type = OUT_T;
 	b.memory = V4L2_MEMORY_MMAP;
 	b.index = oi;
-	b.length = 1;
-	b.m.planes = pl;
+	b.length = outbuf[oi].len;
 	b.bytesused = len;
 	b.field = V4L2_FIELD_NONE;
 	b.flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
@@ -1238,7 +1251,7 @@ static void dump_frame(unsigned idx, struct v4l2_plane *pl)
 		for (i = 0; i < n; i += 97)
 			sum += y[i];
 		printf("  bytes=%u/%u ysum=%lu\n", pl[0].bytesused,
-		       pl[1].bytesused, sum);
+		       (unsigned)(capbuf[idx].len[0] - cap_ysize), sum);
 	}
 }
 
@@ -3121,7 +3134,6 @@ static void render_dump_state(const struct render_stats *rs)
 static void cap_recycle(int idx)
 {
 	struct v4l2_buffer b = {0};
-	struct v4l2_plane pl[2] = {{0}};
 
 	if (idx < 0 || idx >= NBUF_CAP_MAX)
 		return;
@@ -3137,17 +3149,13 @@ static void cap_recycle(int idx)
 	b.type = CAP_T;
 	b.memory = cap_memory;
 	b.index = idx;
-	b.length = 2;
-	b.m.planes = pl;
 	if (cap_memory == V4L2_MEMORY_DMABUF) {
 		/* DMABUF 的 QBUF 每次都要重报 fd 与长度：不带的话驱动回
 		 * EINVAL，而这里的 EINVAL 是被当成"重复回收"忽略掉的，
 		 * 于是 buffer 永远回不了队 —— 表现是放十几帧后 STALL
 		 * （inflight 只增不减）→ 重建会话。 */
-		pl[0].m.fd = capbuf[idx].dmabuf[0];
-		pl[0].length = capbuf[idx].len[0];
-		pl[1].m.fd = capbuf[idx].dmabuf[1];
-		pl[1].length = capbuf[idx].len[1];
+		b.m.fd = capbuf[idx].dmabuf[0];
+		b.length = capbuf[idx].len[0];
 	}
 	if (ioctl(fd, VIDIOC_QBUF, &b) < 0 && errno != EINVAL)
 		perror("QBUF recycle(renderer)");
@@ -3209,20 +3217,24 @@ static int out_fmt_setup(unsigned w, unsigned h)
 	size_t max = getenv("MAXAU") ? atol(getenv("MAXAU")) : (6u << 20);
 
 	f.type = OUT_T;
-	f.fmt.pix_mp.pixelformat = g_h264 ? V4L2_PIX_FMT_H264
-					 : V4L2_PIX_FMT_HEVC;
-	f.fmt.pix_mp.num_planes = 1;
-	f.fmt.pix_mp.width = w;
-	f.fmt.pix_mp.height = h;
-	f.fmt.pix_mp.field = V4L2_FIELD_NONE;
-	f.fmt.pix_mp.plane_fmt[0].sizeimage = (max + 8191) & ~4095UL;
+	/* cedrus(stateless) 的 OUTPUT 队列只注册 *_SLICE 变体
+	 * （cedrus_video.c: H264_SLICE/HEVC_SLICE/MPEG2_SLICE/VP8_FRAME）。
+	 * 填非 slice 的 H264/HEVC 会 S_FMT EINVAL → 会话开不了、直接黑屏。
+	 * 2026-11-24 曼达洛人 S02E03 就栽在这。
+	 */
+	f.fmt.pix.pixelformat = g_h264 ? V4L2_PIX_FMT_H264_SLICE
+				       : V4L2_PIX_FMT_HEVC_SLICE;
+	f.fmt.pix.width = w;
+	f.fmt.pix.height = h;
+	f.fmt.pix.field = V4L2_FIELD_NONE;
+	f.fmt.pix.sizeimage = (max + 8191) & ~4095UL;
 	if (xioctl(fd, VIDIOC_S_FMT, &f) < 0) {
 		printf("S_FMT OUT 失败: %s\n", strerror(errno));
 		return -errno;
 	}
 	printf("S_FMT OUT : %ux%u sizeimage=%u (max AU %zu)\n",
-	       f.fmt.pix_mp.width, f.fmt.pix_mp.height,
-	       f.fmt.pix_mp.plane_fmt[0].sizeimage, max);
+	       f.fmt.pix.width, f.fmt.pix.height,
+	       f.fmt.pix.sizeimage, max);
 	return 0;
 }
 
@@ -3298,10 +3310,13 @@ static int vdec_open(unsigned w, unsigned h)
 	if (!r) r = s_fmt_cap(w, h);
 	if (!r) r = cap_setup();
 	if (!r) r = out_setup();
-	if (!r && xioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0) {
-		printf("SUBSCRIBE_EVENT 失败: %s\n", strerror(errno));
-		r = -errno;
-	}
+	/* SOURCE_CHANGE 只是"分辨率变了主动叫我"的加速通道，不是开流前提：
+	 * cedrus 的 subscribe_event 是 v4l2_ctrl_subscribe_event，只认 control
+	 * 类事件，订阅 SOURCE_CHANGE 必回 EINVAL。真分辨率由 ffprobe 的 w/h 打底、
+	 * 由驱动 G_FMT 回填，没有这个事件也照样起得来。失败只告警，绝不 ABORT。 */
+	if (!r && xioctl(fd, VIDIOC_SUBSCRIBE_EVENT, &sub) < 0)
+		printf("SUBSCRIBE_EVENT 不支持(%s)，按无事件模式继续\n",
+		       strerror(errno));
 	if (!r) r = start_stream();
 	if (r) {
 		printf("VDEC: 开流失败 (%s)，回落关闭会话\n", strerror(-r));
@@ -3792,10 +3807,203 @@ static void audio_boot(void)
 	audio_gate(1);
 }
 
+/* ── RAWIN：解码交给 ffmpeg，播放器只做上屏 ────────────────────────────
+ * cedrus 的 OUTPUT 队列 supports_requests = true（cedrus_video.c:603），
+ * 每个 buffer 必须带 request_fd，还得自己填 H.264/HEVC stateless 控制
+ * （SPS/PPS/SLICE_PARAMS/DECODE_PARAMS）—— 那是 ffmpeg v4l2request 的活。
+ * 所以改成：ffmpeg 硬解（逐帧 md5 已验证与软解一致）→ NV12 从 stdin 进来，
+ * 播放器只负责上屏；音频仍旧走 $AUDIO_FIFO，遥控仍旧走 pctl。
+ * 实测 1080p 硬解+下载 NV12 = 40fps（片源 23.976），1.67x 实时。
+ */
+extern int glout_init(unsigned sw, unsigned sh);
+extern int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
+		       unsigned sy, unsigned sc);
+extern void glout_set_fps(double fps);
+extern int glout_repaint(void);	/* 重画最后一帧（暂停时补 OSD 用） */
+
+static volatile sig_atomic_t g_raw_stop;
+static unsigned long g_raw_frames;
+static double g_raw_fps = 24.0;
+
+static void raw_sig(int s)
+{
+	(void)s;
+	g_raw_stop = 1;
+}
+
+static long raw_pos_ms(void)
+{
+	return g_raw_fps > 0 ? (long)(g_raw_frames * 1000.0 / g_raw_fps) : -1;
+}
+
+static int raw_au(void)
+{
+	return (int)g_raw_frames;
+}
+
+/* 读满 len 字节；EOF 或出错返回 -1（半帧也算失败，宁停不花屏） */
+static int read_full(int fd, void *buf, size_t len)
+{
+	unsigned char *p = buf;
+
+	while (len) {
+		ssize_t r = read(fd, p, len);
+
+		if (r == 0) return -1;
+		if (r < 0) {
+			if (errno == EINTR) {
+				if (g_raw_stop) return -1;
+				continue;
+			}
+			return -1;
+		}
+		p += r;
+		len -= (size_t)r;
+	}
+	return 0;
+}
+
+/* 逐行搬成一个 stride（源是 ffmpeg 的紧凑 NV12，pitch == w）。 */
+static void raw_copy_plane(unsigned char *dst, const unsigned char *src,
+			   unsigned w, unsigned rows, unsigned pitch)
+{
+	unsigned i;
+
+	if (pitch == w) {
+		memcpy(dst, src, (size_t)w * rows);
+		return;
+	}
+	for (i = 0; i < rows; i++)
+		memcpy(dst + (size_t)i * pitch, src + (size_t)i * w, w);
+}
+
+static int run_raw_sink(unsigned w, unsigned h, double fps)
+{
+	/* panfrost 只接受 16 对齐的 stride：EGL 导入 dma-buf 时 pitch 必须是 16
+	 * 的倍数，否则它退到 CPU 上传，而那条路上 Mesa 会在 404 这种宽度上崩
+	 * （tex_cpu_upload → glTexSubImage2D → gallium memcpy 段错误）。
+	 * 所以 dma-buf 按 ALIGN16(w) 分配，ffmpeg 的紧凑帧逐行搬进去。
+	 */
+	unsigned yp = (w + 63u) & ~63u;	/* panfrost 的 linear stride 要 64 对齐 */
+	size_t ysize = (size_t)yp * h, csize = ysize / 2;
+	size_t ytight = (size_t)w * h, ctight = ytight / 2;
+	unsigned long n = 0;
+	int fdy, fdc;
+	unsigned char *py, *pc, *ty, *tc;
+	double t0;
+
+	if (fps > 0) g_raw_fps = fps;
+	printf("RAWIN: %ux%u @%.3ffps  硬件解码（ffmpeg v4l2request）→ 只上屏\n",
+	       w, h, g_raw_fps);
+	signal(SIGTERM, raw_sig);
+	signal(SIGINT, raw_sig);
+	signal(SIGHUP, raw_sig);
+	signal(SIGPIPE, SIG_IGN);
+
+	glout_set_fps(g_raw_fps);	/* 必须在 init 之前：刷新率匹配靠它 */
+	if (glout_init(w, h) < 0) {
+		printf("RAWIN: 上屏初始化失败（DRM 被占？）\n");
+		return 1;
+	}
+	fdy = dma_heap_alloc(ysize);
+	fdc = dma_heap_alloc(csize);
+	if (fdy < 0 || fdc < 0) {
+		printf("RAWIN: dma_heap 分配失败\n");
+		return 1;
+	}
+	py = mmap(NULL, ysize, PROT_READ | PROT_WRITE, MAP_SHARED, fdy, 0);
+	pc = mmap(NULL, csize, PROT_READ | PROT_WRITE, MAP_SHARED, fdc, 0);
+	if (py == MAP_FAILED || pc == MAP_FAILED) {
+		printf("RAWIN: mmap 失败\n");
+		return 1;
+	}
+	ty = malloc(ytight);
+	tc = malloc(ctight);
+	if (!ty || !tc) {
+		printf("RAWIN: 中转缓冲分配失败\n");
+		return 1;
+	}
+	if (yp != w)
+		printf("RAWIN: stride %u → %u（64 对齐，GPU 直读）\n", w, yp);
+	audio_boot();		/* 音频照旧：ffmpeg 写 $AUDIO_FIFO，aout 读 */
+	pctl_start();
+	pctl_set_sources(raw_pos_ms, raw_au);
+
+	t0 = now_s();
+	for (;;) {
+		double due, now;
+
+		/* 暂停：遥控 OK / `-c pause` 都落在这里。
+		 * 以前这条 RAW 循环根本没有暂停分支 —— aout 被 pctl 停了，可
+		 * read + glout_frame 照旧跑，画面继续走、pos 继续涨，遥控器按
+		 * 暂停就跟没按一样。
+		 * 暂停时不读 stdin：上游 ffmpeg 是 -re 供流，管道一满自己就停，
+		 * 不需要 SIGSTOP 整个进程组（那套"冻住过"的时钟补偿也就免了）。
+		 * 屏幕保留最后一帧，OSD 的"|| 暂停 / > 播放"靠 glout_repaint
+		 * 补画 —— 不补的话冻住的那一帧会把提示条永远挂在屏上。
+		 */
+		if (pctl_paused()) {
+			if (osd_poll_dirty())
+				glout_repaint();
+			usleep(20000);
+			continue;
+		}
+		if (read_full(0, ty, ytight) < 0 || read_full(0, tc, ctight) < 0)
+			break;	/* ffmpeg 收工 / 被停 */
+		raw_copy_plane(py, ty, w, h, yp);
+		raw_copy_plane(pc, tc, w, h / 2, yp);
+		n++;
+		g_raw_frames = n;
+		if (glout_frame(fdy, fdc, w, h, yp, yp) < 0) {
+			printf("RAWIN: 上屏失败\n");
+			break;
+		}
+		if (n == 1) {
+			audio_gate(0);	/* 首帧上屏才开闸，声音不抢在画面之前 */
+			printf("RAWIN: 首帧上屏\n");
+		}
+		/* 节拍：睡到 t0 + n/fps。glout_frame 本身只等一个 vblank，
+		 * 不节拍的话 40fps 的解码速度会把 23.976 的片子放成 1.67 倍速。
+		 */
+		due = t0 + n / g_raw_fps;
+		now = now_s();
+		if (due > now) {
+			struct timespec ts;
+			double d = due - now;
+
+			ts.tv_sec = (time_t)d;
+			ts.tv_nsec = (long)((d - (double)ts.tv_sec) * 1e9);
+			nanosleep(&ts, NULL);
+		} else if (now - due > 0.5) {
+			t0 = now - n / g_raw_fps;	/* 落后太多就重新锚 */
+		}
+		if (g_raw_stop || pctl_want_exit()) break;
+	}
+	printf("RAWIN: 结束 %lu 帧 %s\n", n, g_raw_stop ? "（被停）" : "（流结束）");
+	return 0;
+}
+
+/* 崩溃现场：SIGSEGV/ABRT 时把栈打出来（配 -rdynamic 才有函数名）。
+ * 只在有 backtrace_symbols_fd 的 glibc 上编，不参与正常路径。 */
+static void crash_bt(int sig)
+{
+	void *bt[40];
+	int n = backtrace(bt, 40);
+
+	backtrace_symbols_fd(bt, n, 2);
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
 int main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	setvbuf(stderr, NULL, _IONBF, 0);
+	if (getenv("CRASHBT")) {
+		signal(SIGSEGV, crash_bt);
+		signal(SIGABRT, crash_bt);
+		signal(SIGBUS, crash_bt);
+	}
 	/* 客户端模式：player -c status|vol +10|toggle|... 就是 play.sh 的控制入口
 	 * （以前这是 mpvctl 的活）。必须先于一切设备操作，不碰 /dev/video0。
 	 */
@@ -3818,6 +4026,20 @@ int main(int argc, char **argv)
 
 		if (r == 0) printf("%s\n", geo);
 		return r == 0 ? 0 : 1;
+	}
+
+	/* RAWIN=WxH + RAWFPS：ffmpeg 硬解出 NV12 从 stdin 灌进来，只上屏。
+	 * 放在 -c/-K/-M 之后：控制口和模式查询仍旧先走。
+	 */
+	if (getenv("RAWIN") && *getenv("RAWIN")) {
+		unsigned rw = 0, rh = 0;
+		double rfps = getenv("RAWFPS") ? atof(getenv("RAWFPS")) : 0.0;
+
+		if (sscanf(getenv("RAWIN"), "%ux%u", &rw, &rh) != 2 || !rw || !rh) {
+			printf("RAWIN: 要 WxH（拿到 \"%s\"）\n", getenv("RAWIN"));
+			return 2;
+		}
+		return run_raw_sink(rw, rh, rfps);
 	}
 
 	const char *path = argc > 1 ? argv[1] : "/tmp/test.265";
@@ -4486,13 +4708,14 @@ no_stall:;
 		/* capture frames */
 		for (;;) {
 			struct v4l2_buffer b = {0};
-			struct v4l2_plane pl[2] = {{0}};
+			/* 单平面没有 pl[]；下游用 pl[0].bytesused/data_offset，
+			 * 这里用一个本地影子填好，改动面最小。 */
+			struct v4l2_plane sh = {0};
+			struct v4l2_plane *pl = &sh;
 			int rendered = 0;
 
 			b.type = CAP_T;
 			b.memory = cap_memory;
-			b.length = 2;
-			b.m.planes = pl;
 			double t_rx;
 
 			{
@@ -4504,6 +4727,8 @@ no_stall:;
 				if (qr < 0)
 					break;
 			}
+			sh.bytesused = b.bytesused;
+			sh.data_offset = 0;	/* 单平面没有 data_offset */
 			t_rx = now_s();
 			t_frame0 = t_rx;
 			/* 先留一份"这是重建后的首帧"，再清标志：下面的开闸判定
@@ -4534,7 +4759,7 @@ no_stall:;
 			if (g_verbose)
 				fprintf(stderr, "plane len=%zu/%zu off=%u/%u\n",
 					capbuf[b.index].len[0], capbuf[b.index].len[1],
-					pl[0].data_offset, pl[1].data_offset);
+					pl[0].data_offset, 0);
 			if ((g_verbose || got == 0) && capbuf[b.index].mem[0])
 				dump_frame(b.index, pl);
 			/* §4.3.8 每次内容信号变化打一条完整 COLOR: 行。
@@ -4570,7 +4795,7 @@ no_stall:;
 				{
 				double ts = now_s();
 				rc = render_submit(rend, capbuf[b.index].dmabuf,
-						   capw, caph, capw, capw,
+						   capw, caph, cap_bpl, cap_bpl,
 						   (g_play_fps > 0 && render_has_pace(rend)) ?
 						   play_due(got) : 0,
 						   &capbuf[b.index]);
@@ -4695,12 +4920,9 @@ no_stall:;
 		/* recycle output buffers */
 		for (;;) {
 			struct v4l2_buffer b = {0};
-			struct v4l2_plane pl[1] = {{0}};
 
 			b.type = OUT_T;
 			b.memory = V4L2_MEMORY_MMAP;
-			b.length = 1;
-			b.m.planes = pl;
 			if (xioctl(fd, VIDIOC_DQBUF, &b) < 0)
 				break;
 			out_free[out_nfree++] = b.index;

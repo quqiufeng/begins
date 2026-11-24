@@ -342,7 +342,12 @@ static struct fbc *fb_get(struct vout *v, int yfd, int cfd, unsigned w, unsigned
 	fb.pitches[0] = yp;
 	fb.pitches[1] = cp;
 	fb.offsets[0] = 0;
-	fb.offsets[1] = 0;
+	/* 两个 fd 各自是一个独立 GEM（UV 从自己那块起址算）→ 0；
+	 * 单平面单块 dma-buf（yfd == cfd，cedrus 的 NV12 就是这样）→
+	 * UV 必须落在 Y 面之后：offset = ypitch * ALIGN(h,16)。
+	 * h 传进来就是驱动 G_FMT 回的高度（本来就按 16 对齐），
+	 * 差这一下 UV 会整体前移 = 彩条花屏。 */
+	fb.offsets[1] = (yfd == cfd) ? (yp * ((h + 15) & ~15u)) : 0;
 	if (ioctl(v->dfd, DRM_IOCTL_MODE_ADDFB2, &fb) < 0) {
 		vdie("ADDFB2 NV12"); fb_release(v, e, 0); return NULL;
 	}

@@ -607,7 +607,9 @@ static struct {
 	 * 释放不掉，会话重建后新 dmabuf 分配/复用会 EBUSY
 	 * （表现为 FAIL glout_frame: Device or resource busy）。
 	 */
-	struct { int fy, fc; GLuint ty, tc; void *ey, *ec; } tc[40];
+	/* cpu=1：该对纹理走 CPU 上传（pitch 不满足 GPU 的 16 字节对齐，
+	 * EGLImage 导入被 Mali 拒），每帧都要重新 texSubImage2D。 */
+	struct { int fy, fc; GLuint ty, tc; void *ey, *ec; int cpu; } tc[40];
 	int ntc;
 	int first, flip_done, ready;
 	int inited, scaled, twopass;
@@ -1632,6 +1634,61 @@ static int glout_gl_init(void)
 	return 0;
 }
 
+/* ---- CPU 上传回退 ---------------------------------------------------
+ * panfrost 对线性 NV12 的 stride 要求 16 字节对齐；cedrus 的 bytesperline
+ * 是 ALIGN(w,16)，但 w 本身不是 16 的倍数时（如 404），驱动给的 bpl 就是
+ * 404，EGLImage 直接被拒（"rejecting image due to unsupported offset or
+ * stride alignment"、eglCreateImageKHR 回 0x3003）。这种片子只能 mmap
+ * 自己搬：GLES3 有 UNPACK_ROW_LENGTH，按真实 pitch 逐行上传即可，不用
+ * 中间 buffer 重排。代价是每帧一次 CPU→GPU 拷贝（小分辨率可忽略）。
+ */
+static int g_dbg = -1;
+#define DBG(...) do { if (g_dbg < 0) g_dbg = getenv("GLOUTDBG") ? 1 : 0; \
+	if (g_dbg) { printf(__VA_ARGS__); fflush(stdout); } } while (0)
+
+static GLuint tex_cpu_make(unsigned w, unsigned h, int chroma)
+{
+	GLuint t;
+
+	glGenTextures(1, &t);
+	glBindTexture(GL_TEXTURE_2D, t);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	if (chroma)
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, w, h, 0, GL_RG,
+			     GL_UNSIGNED_BYTE, NULL);
+	else
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, w, h, 0, GL_RED,
+			     GL_UNSIGNED_BYTE, NULL);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	return t;
+}
+
+/* chroma=1 时 w/h 是色度的（w/2, h/2），pitch 仍是字节/行（GR88 = 2 字节） */
+static int tex_cpu_upload(GLuint t, int fd, unsigned w, unsigned h,
+			  unsigned pitch, int chroma)
+{
+	size_t len = (size_t)pitch * h;
+	unsigned char *p;
+
+	p = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+	if (p == MAP_FAILED)
+		return -1;
+	glBindTexture(GL_TEXTURE_2D, t);
+	DBG("DBG: upload t=%u %ux%u pitch=%u c=%d\n", t, w, h, pitch, chroma);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, chroma ? pitch / 2 : pitch);
+	glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
+			chroma ? GL_RG : GL_RED, GL_UNSIGNED_BYTE, p);
+	glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+	munmap(p, len);
+	return 0;
+}
+
 /* dmabuf → EGLImage → 纹理 */
 static GLuint import_tex(int fd, unsigned w, unsigned h, unsigned pitch,
 			 uint32_t fourcc, void **oimg)
@@ -2130,12 +2187,31 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 			if (g.tc[i].fy == fd_y && g.tc[i].fc == fd_c) { k = i; break; }
 		if (k < 0) {
 			GLuint ty, tc;
+			void *iy = NULL, *ic = NULL;
+			int cpu = 0;
 
 			if (g.ntc >= (int)(sizeof(g.tc) / sizeof(g.tc[0]))) drop_tex();
-			void *iy = NULL, *ic = NULL;
+			if ((ypitch & 15u) || (cpitch & 15u)) {
+				/* panfrost 只认 16 对齐的 stride。RAW 通路 pitch=w，
+				 * 404 这种宽度必然被拒，改 CPU 上传（小分辨率无所谓）。 */
+				static int warned;
 
+				cpu = 1;
+				ty = tex_cpu_make(w, h, 0);
+				tc = tex_cpu_make(w / 2, h / 2, 1);
+				if (!warned++)
+					printf("GLOUT: pitch %u/%u 非 16 对齐（%ux%u），改 CPU 上传\n",
+					       ypitch, cpitch, w, h);
+				if (!ty || !tc) {
+					printf("GLOUT: CPU 纹理创建失败 ty=%u tc=%u\n", ty, tc);
+					glDeleteTextures(1, &ty);
+					glDeleteTextures(1, &tc);
+					return -1;
+				}
+			} else {
 			ty = import_tex(fd_y, w, h, ypitch, DRM_FORMAT_R8, &iy);
 			tc = import_tex(fd_c, w / 2, h / 2, cpitch, DRM_FORMAT_GR88, &ic);
+			}
 			if (!ty || !tc) {
 				printf("GLOUT: import_tex 返回空 ty=%u tc=%u (errno=%d %s)\n",
 				       ty, tc, errno, strerror(errno));
@@ -2161,9 +2237,20 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 			g.tc[k].tc = tc;
 			g.tc[k].ey = iy;
 			g.tc[k].ec = ic;
+			g.tc[k].cpu = cpu;
 		}
 		g.tex_y = g.tc[k].ty;
 		g.tex_c = g.tc[k].tc;
+		DBG("DBG: tex ok k=%d cpu=%d\n", k, g.tc[k].cpu);
+		/* CPU 纹理是副本：buffer 每帧内容都在变，必须逐帧重传 */
+		if (g.tc[k].cpu) {
+			if (tex_cpu_upload(g.tex_y, fd_y, w, h, ypitch, 0) < 0 ||
+			    tex_cpu_upload(g.tex_c, fd_c, w / 2, h / 2, cpitch, 1) < 0) {
+				printf("GLOUT: CPU 上传失败 (errno=%d %s)\n",
+				       errno, strerror(errno));
+				return -1;
+			}
+		}
 	}
 	tg1 = now_s();
 	if (g.twopass) {
@@ -2218,6 +2305,7 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 		glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 		gpu_done(t0);
 	}
+	DBG("DBG: draw done\n");
 	g.last_fy = fd_y;
 	g.last_fc = fd_c;
 	g.last_w = w;
@@ -2225,7 +2313,9 @@ int glout_frame(int fd_y, int fd_c, unsigned w, unsigned h,
 	g.last_yp = ypitch;
 	g.last_cp = cpitch;
 	g.have_last = 1;
+	DBG("DBG: osd begin\n");
 	osd_draw();
+	DBG("DBG: osd done\n");
 
 swap:
 	g.sub++;
@@ -2250,6 +2340,7 @@ swap:
 			g.drops++;
 			return -1;
 		}
+		DBG("DBG: swap ok\n");
 		dt = now_s() - ts;
 		g.tsum += dt;
 		g.s_swap += dt;
