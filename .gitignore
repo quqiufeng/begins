@@ -67,3 +67,7 @@ meson-vdec/logs/
 /tmp/
 # 视觉回归的比对产物（actual/diff 随用例跑出来）
 /logs/check-*.png
+
+# 调试期临时备份（*.bak-1124-1855 这类带时间戳的现场备份）
+*.bak-*
+.tmp-*/
