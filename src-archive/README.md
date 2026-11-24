@@ -7,6 +7,7 @@
 | `linux-7.2.12-hwreal-src-20261111.tar.zst` | 68.9 MB | `7.2.12-20261111-hwreal` | 本机装机内核的裁剪树，32195 文件，解包 510 MB |
 | `linux-7.2.12-sandy-dbg2-src-20261112.tar.zst` | 77.2 MB | `7.2.12-sandy-dbg2-20261111` | 小机箱追踪/调试内核，33007 文件，解包 516 MB |
 | `linux-7.2.12-trim-src-20261116.tar.zst` | 91.3 MB | `7.2.12-x96-trim` | 同上并含 10bit HEVC / STOP 死锁修复源码，**最新**，50438 条目 |
+| **`../src/linux-7.2.12/`** | **1.8 GB / 94847 文件** | **`7.2.12-x98`（H618 盒子）** | **活树，未打包**：H618/x98h 全套驱动改动所在树，见下方「来路（H618 树）」 |
 | `SHA256SUMS` | 323 B | — | 上面三份包的校验值 |
 
 ```bash
@@ -166,6 +167,45 @@ rm -rf include/config include/generated arch/x86/include/generated
 ```
 
 **正常构建不受影响**（`CONFIG_RUST` 关闭，`make -j6` 全程无错），只有 clean 系列会踩。
+
+## 来路（H618 树 — 活树，2026-11-25 未打包）
+
+给 H618 盒子（`x98h` / 192.168.1.123，Debian 7.2.12 内核 `7.2.12-x98`）改出来的源码树。
+**以活目录形式留在 `../src/linux-7.2.12/`（1.8 GB，94847 文件，`/src/` 已 gitignore）**，
+没有打成 tar.zst —— 由使用者自行归档。`/x98-build/linux-7.2.12` 是指向它的符号链接，
+`/x98-build/kbuild` 的出树构建（`O=`）因此仍可用。
+
+| 项 | 值 |
+|---|---|
+| 配置文件 | 树内 `.config`（268242 B，`CONFIG_LOCALVERSION="-x98"`）拷自 `/x98-build/kbuild/.config`；另附 `defconfig-h618-x98h`（78048 B，`make savedefconfig` 最小集） |
+| 目标架构 | `ARCH=arm64`，`CROSS_COMPILE=aarch64-linux-gnu-`；板级 dts `arch/arm64/boot/dts/allwinner/sun50i-h618-x98h-100mb.dts` |
+| 关键开关 | `ARCH_SUNXI=y`、`SND_SOC_SUNXI_AHUB/DAM/MACH=y`、`VIDEO_SUNXI_CEDRUS=m`、`DRM_DW_HDMI_I2S_AUDIO=y`、`SND_SOC_HDMI_CODEC=y`、`SND_SUN4I_I2S=m` |
+| 改动规模 | 49 个文件（`find -newermt 2026-11-23` 实测，另有 24 个 `*.orig` 现场备份保留在树里） |
+| 清场 | 已删 `.o`/`.ko`/`.*.cmd`/`*.mod*`/`modules.order`/`Module.symvers`/`sunxi-cedrus.mod.c`，实测残留 0 个；`*.orig` 故意保留（补丁前的原文件，方便 diff） |
+
+改动分四组：
+
+1. **显示**（13 个 DE33 drm 补丁，修 `-EBUSY`）
+   `drivers/gpu/drm/sun4i/`：`sun50i_planes.c/.h`（新增，DE33 planes）、`sun4i_drv.c`、
+   `sun4i_tcon.c/.h`、`sun8i_mixer.c/.h`、`sun8i_vi_layer.c`、`sun8i_tcon_top.c`、
+   `sun8i_csc.c/.h`、`sun8i_hdmi_phy.c`、`Makefile`；
+   `drivers/clk/sunxi-ng/{ccu-sun8i-de2.c,ccu-sun50i-h616.c}`；对应 8 个 devicetree binding 文档。
+2. **DT**（修 `tcon-top` 的 `-ENODATA/-61` 与 cedrus 申请 SRAM 失败）
+   `sun50i-h618-x98h-100mb.dts`：`tcon-top@6510000` 补 `CLK_TCON_TV1(0x78)`；
+   `sram-section@0` compatible 改成主线认识的 `allwinner,sun50i-h616-ve-sram`；
+   `ahub_dam_plat@5097000` clocks 改 4 项。`sun50i-h616.dtsi` 还原为上游原始
+   （厂商补丁注入的 `ahub1_mach` 引用了不存在的 `&hdmi`，会让 dtbs 全量编译失败），
+   `sun50i-h616-orangepi-zero.dtsi` 删 3 处 ahub。
+3. **HDMI 音频**（走厂商 `sunxi_v2/ahub`，主线 sun4i-codec 不覆盖 H618）
+   `sound/soc/sunxi_v2/` 全目录（15 个文件）+ `sound/soc/{Kconfig,Makefile,soc-core.c}`、
+   `include/sound/soc-dai.h`、`sound/soc/sunxi/sun4i-codec.c`。
+4. **硬解**（cedrus 加 H618 match）
+   `drivers/staging/media/sunxi/cedrus/cedrus.c`：`~L700` 增
+   `{ .compatible = "allwinner,sun50i-h616-video-engine", .data = &sun50i_h6_cedrus_variant }`。
+
+编译/部署/验证过程见仓库根 `x98h.md`（`d4c6e32`）。这份树与盒上内核的对应关系：
+`/boot/Image` md5 `754ea2ed3aabad8bc6ce12e392fe89b8`、dtb md5 `f490569a36ccec24e7afc860b55ca4f3`。
+
 
 ## 想自己复现
 
