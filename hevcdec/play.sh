@@ -43,6 +43,32 @@ LEAD=${LEAD:-}                # 留空=默认 6 帧
 DITHER=${TMDITHER:-}          # 0=关有序抖动
 SOCK=${SOCK:-/tmp/play.sock}  # 播放器自己的控制口（音量/静音/暂停/位置走这里）
 AFIFO=${AFIFO:-/tmp/play.afifo}  # ffmpeg 写 PCM 的管道，内建 aout 从这读
+
+# ── 解码器能力探测（多盒子通用，别写死）──────────────────────────────
+# 盒子差异：121 x96max = meson-vdec（只吃 MPLANE 多平面，系统 ffmpeg 无
+# v4l2request）→ 播放器自解；123 x98h = cedrus（只吃单平面，/opt/ffmpeg-hw
+# 有 v4l2request）→ ffmpeg 硬解 + RAW 上屏。平面模式由装哪个播放器二进制
+# 决定（每盒装对的版本），ffmpeg 硬解能力在这里探测决定要不要走 RAW。
+FFMPEG=${FFMPEG:-}
+if [ -z "$FFMPEG" ]; then
+	# 优先能硬解的 ffmpeg（v4l2request），否则退回系统 ffmpeg（只解封装/音频）
+	for _f in /opt/ffmpeg-hw/ffmpeg /usr/local/bin/ffmpeg /usr/bin/ffmpeg; do
+		[ -x "$_f" ] || continue
+		if "$_f" -hide_banner -hwaccels 2>/dev/null | grep -qw v4l2request; then
+			FFMPEG=$_f; break
+		fi
+	done
+	[ -z "$FFMPEG" ] && FFMPEG=$(command -v ffmpeg 2>/dev/null || echo ffmpeg)
+fi
+export FFMPEG
+# 硬解能力 = ffmpeg 支持 v4l2request 且有 request API 设备（/dev/media*）
+HW_DEC=0
+if "$FFMPEG" -hide_banner -hwaccels 2>/dev/null | grep -qw v4l2request; then
+	MEDIA_DEV=$(ls /dev/media* 2>/dev/null | head -1)
+	[ -n "$MEDIA_DEV" ] && HW_DEC=1
+fi
+MEDIA_DEV=${MEDIA_DEV:-/dev/media0}
+export HW_DEC MEDIA_DEV
 # ALSA 缓冲（帧数）：太大拖遥控反应，太小 4K+HDR 调色那几帧就把音频线程饿出
 # xrun（默认 8192/2048 = 170/42ms，实测一片下来几十次）。16k/4k≈340/85ms 稳得多。
 AUDIO_BUF=${AUDIO_BUF:-16384}
@@ -483,8 +509,10 @@ do_play() {
 	# *_SLICE 也没用（API 层就不对，实测 EINVAL）。所以改成：ffmpeg 硬解
 	# （逐帧 md5 与软解完全一致，1080p 出 40fps）→ NV12 过管道 → 播放器
 	# RAWIN=WxH 只做 GL/DRM 上屏。音频、遥控、OSD 链路一律不变。
-	# RAWMODE=0 可退回老的"播放器自己解"链路。
-	RAWMODE=${RAWMODE:-1}
+	# RAWMODE=0 生效的前提是 ffmpeg 真能硬解：能力探测（HW_DEC）说不行就退回
+	# 播放器自解——meson-vdec 盒子（x96max）就是这种，系统 ffmpeg 无 v4l2request。
+	RAWMODE=${RAWMODE:-$HW_DEC}
+	[ "$HW_DEC" = 0 ] && RAWMODE=0
 	[ "$NAKED" = 1 ] && RAWMODE=0
 	if [ "$RAWMODE" = 1 ] && { [ -z "$VW" ] || [ -z "$VH" ]; }; then
 		say "RAW 上屏要分辨率，ffprobe 没报出来：退回播放器自解"
@@ -639,7 +667,7 @@ do_play() {
 			# 播放器又把两边的零点和锚点都归零，自己永远纠不回来 —— 用户听到的
 			# 就是"快进后音画不同步"。加了这个两边一起落到关键帧，同步就是死的；
 			# 代价是跳转落点最多早一个 GOP（显示器上仍然报目标位置）。
-			AUDIO_SPAWN="ffmpeg -hide_banner -loglevel warning -nostdin -y -re -noaccurate_seek -ss {SS} $DA $AFI $HTTP_OPT $IN_FMT -i $SRC -vn -map 0:a:0 $AFA -f s16le -ar 48000 -ac 2 $AFIFO"
+			AUDIO_SPAWN="$FFMPEG -hide_banner -loglevel warning -nostdin -y -re -noaccurate_seek -ss {SS} $DA $AFI $HTTP_OPT $IN_FMT -i $SRC -vn -map 0:a:0 $AFA -f s16le -ar 48000 -ac 2 $AFIFO"
 		else
 			say "片源没有音轨，只放画面"
 			# 电视上看不见终端：屏幕上也得说一句，否则"按音量键没反应"，
@@ -706,7 +734,7 @@ do_play() {
 		*[[:space:]]*)
 			say "片源/fifo 路径含空格：退回管道模式（spawn 模板不分词）" ;;
 		*)
-			export SPAWN="ffmpeg -hide_banner -loglevel warning -nostdin -y -re -ss {SS} $DA $HTTP_OPT $IN_FMT -i $SRC -map 0:v:0 -c:v copy -f $VF -"
+			export SPAWN="$FFMPEG -hide_banner -loglevel warning -nostdin -y -re -ss {SS} $DA $HTTP_OPT $IN_FMT -i $SRC -map 0:v:0 -c:v copy -f $VF -"
 			export SS DUR
 			SPAWNED=1 ;;
 		esac
@@ -743,13 +771,13 @@ exit $rc'
 if [ "$NAKED" = 1 ]; then
 	cat "$SRC"
 elif [ "${RAWMODE:-0}" = 1 ]; then
-	ffmpeg -hide_banner -loglevel warning -nostdin -y ${RE:--re} \
+	"$FFMPEG" -hide_banner -loglevel warning -nostdin -y ${RE:--re} \
 		${SS:+-ss "$SS"} ${DA:-} ${HTTP_OPT:-} ${IN_FMT:-} \
-		-hwaccel v4l2request -hwaccel_device /dev/media0 \
+		-hwaccel v4l2request -hwaccel_device "$MEDIA_DEV" \
 		-i "$SRC" -map 0:v:0 ${VSCALE:-} \
 		-f rawvideo -pix_fmt nv12 - 2>>"$LOG"
 else
-	ffmpeg -hide_banner -loglevel warning -nostdin -y ${RE:--re} \
+	"$FFMPEG" -hide_banner -loglevel warning -nostdin -y ${RE:--re} \
 		${SS:+-ss "$SS"} $DA $HTTP_OPT $IN_FMT \
 		-i "$SRC" -map 0:v:0 -c:v copy -f "$VF" - $AF 2>>"$LOG"
 fi | PLAY=1 NOWRITE=1 RENDER="$RENDER" SCALE="$SCALE" PLAY_SOCK="$SOCK" \
@@ -1050,7 +1078,7 @@ dur_secs() {
 probe_dur() {
 	[ -n "${SRC:-}" ] || { echo 0; return 0; }
 	# shellcheck disable=SC2086
-	_d=$(ffmpeg -hide_banner -nostdin ${IN_FMT:-} ${HTTP_OPT:-} -i "$SRC" 2>&1 \
+	_d=$("$FFMPEG" -hide_banner -nostdin ${IN_FMT:-} ${HTTP_OPT:-} -i "$SRC" 2>&1 \
 		| sed -n 's/.*Duration: *\([0-9][0-9]*\):\([0-9][0-9]*\):\([0-9][0-9]*\).*/\1 \2 \3/p' \
 		| head -n 1)
 	case "$_d" in '') echo 0; return 0 ;; esac
