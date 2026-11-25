@@ -58,48 +58,10 @@ say() { echo "deploy: $*"; }
 
 cd "$DIR" || exit 1
 
-# ---------------------------------------------------------------- 1) 编译
-if [ "$BUILD" = 1 ]; then
-	command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 || {
-		say "缺交叉编译器 aarch64-linux-gnu-gcc（apt install gcc-aarch64-linux-gnu）"
-		say "只想推现有二进制就加 -n"
-		exit 1
-	}
-	say "编译播放器 → make CROSS=1"
-	make CROSS=1 || { say "播放器编译失败，已中止（盒子上什么都没动）"; exit 1; }
-	# 不编 aout：它不在 BINS 里（见文件头注释）。要单独测就手动 make CROSS=1 aout。
-	say "编译 rcinputd → make CROSS=1 rcd"
-	make CROSS=1 rcd || { say "rcinputd 编译失败，已中止（盒子上什么都没动）"; exit 1; }
-	if [ "$DESK" = 1 ]; then
-		# 桌面只有 kmsflip.so 是 C；产物固定落在 /tmp/kmsflip.so（见该脚本）。
-		say "编译桌面 LD_PRELOAD → desktop/tools/build-kmsflip.sh"
-		sh "$DESKTOP_D/tools/build-kmsflip.sh" ||
-			{ say "kmsflip.so 编译失败，已中止（盒子上什么都没动）"; exit 1; }
-	fi
-	if [ "$KEYB" = 1 ]; then
-		# 遥控器唯一的 C 产物：keybord/pctl.lua 用 FFI 直连播放器控制面。
-		say "编译遥控器 FFI → make CROSS=1 pctlffi"
-		make CROSS=1 pctlffi || { say "libpctl.so 编译失败，已中止（盒子上什么都没动）"; exit 1; }
-	fi
-else
-	say "跳过编译（-n），直接推现有产物"
-fi
-
-for f in $BINS $SCRIPTS; do
-	[ -f "$DIR/$f" ] || { say "缺文件 $f（先 make CROSS=1 && make CROSS=1 rcd）"; exit 1; }
-done
-if [ "$KEYB" = 1 ]; then
-	for f in $KEYB_ITEMS; do
-		[ -e "$KEYBORD_D/$f" ] || { say "缺遥控器条目 keybord/$f"; exit 1; }
-	done
-	[ -f "$PCTL_SO" ] || { say "缺 $PCTL_SO（make CROSS=1 pctlffi，或别加 -n）"; exit 1; }
-fi
-
-say "产物：$(cd "$DIR" && md5sum $BINS | awk '{printf "%s=%s ", substr($1,1,8), $2}')"
-
+# --------------------------------------------------- 0) 先探盒子要哪种平面
 # 播放器二进制没法一套通吃：V4L2 平面模式（CAP_T/OUT_T）是编译期常量，
 # meson(121) 只收 MPLANE，cedrus(123) 只收单平面，同一份源码编不出两种。
-# 所以按盒子实际驱动挑对应二进制 —— 别再像 11-25 那样把单平面推给 121，
+# 所以先探驱动再决定编不编/推哪个 —— 别再像 11-25 那样把单平面推给 121，
 # 盒子上直接 S_FMT OUT EINVAL、整条播放链断掉（docs/box-matrix.md §2/§4）。
 # 探测失败（老盒子没 sysfs 名字）时按 BOX 名兜底，仍不确定才认 PLANE 变量。
 MPLANE_BIN="$DIR/dist/hevcdec-20261119-1949-84d7124/v4l2hevc-aarch64"
@@ -120,6 +82,51 @@ else
 	PLAYER_SRC="$DIR/v4l2hevc-aarch64"
 fi
 say "盒子 $BOX 驱动=${BOX_DRV:-未知} → 平面=$BOX_PLANE，播放器 $(md5sum "$PLAYER_SRC" | cut -c1-8)"
+
+# ---------------------------------------------------------------- 1) 编译
+if [ "$BUILD" = 1 ]; then
+	command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 || {
+		say "缺交叉编译器 aarch64-linux-gnu-gcc（apt install gcc-aarch64-linux-gnu）"
+		say "只想推现有二进制就加 -n"
+		exit 1
+	}
+	say "编译 rcinputd → make CROSS=1 rcd"
+	make CROSS=1 rcd || { say "rcinputd 编译失败，已中止（盒子上什么都没动）"; exit 1; }
+	if [ "$BOX_PLANE" = single ]; then
+		say "编译播放器（单平面）→ make CROSS=1"
+		make CROSS=1 || { say "播放器编译失败，已中止（盒子上什么都没动）"; exit 1; }
+		# 不编 aout：它不在 BINS 里（见文件头注释）。要单独测就手动 make CROSS=1 aout。
+	else
+		say "盒子是 MPLANE → 不编本地单平面播放器，推熟好版 $(basename "$MPLANE_BIN")"
+	fi
+	if [ "$DESK" = 1 ]; then
+		# 桌面只有 kmsflip.so 是 C；产物固定落在 /tmp/kmsflip.so（见该脚本）。
+		say "编译桌面 LD_PRELOAD → desktop/tools/build-kmsflip.sh"
+		sh "$DESKTOP_D/tools/build-kmsflip.sh" ||
+			{ say "kmsflip.so 编译失败，已中止（盒子上什么都没动）"; exit 1; }
+	fi
+	if [ "$KEYB" = 1 ]; then
+		# 遥控器唯一的 C 产物：keybord/pctl.lua 用 FFI 直连播放器控制面。
+		say "编译遥控器 FFI → make CROSS=1 pctlffi"
+		make CROSS=1 pctlffi || { say "libpctl.so 编译失败，已中止（盒子上什么都没动）"; exit 1; }
+	fi
+else
+	say "跳过编译（-n），直接推现有产物"
+fi
+
+for f in $BINS $SCRIPTS; do
+	# mplane 盒子推的是熟好版播放器，本地单平面 v4l2hevc-aarch64 不必存在
+	[ "$f" = v4l2hevc-aarch64 ] && [ "$BOX_PLANE" = mplane ] && continue
+	[ -f "$DIR/$f" ] || { say "缺文件 $f（先 make CROSS=1 && make CROSS=1 rcd）"; exit 1; }
+done
+if [ "$KEYB" = 1 ]; then
+	for f in $KEYB_ITEMS; do
+		[ -e "$KEYBORD_D/$f" ] || { say "缺遥控器条目 keybord/$f"; exit 1; }
+	done
+	[ -f "$PCTL_SO" ] || { say "缺 $PCTL_SO（make CROSS=1 pctlffi，或别加 -n）"; exit 1; }
+fi
+
+say "产物：播放器=$(md5sum "$PLAYER_SRC" | cut -c1-8) $(cd "$DIR" && md5sum rcinputd-aarch64 | awk '{printf "rcinputd=%s", substr($1,1,8)}')"
 
 # ------------------------------------------------------- 2) 停守护 + 推文件
 # scp 是 open(O_WRONLY|O_TRUNC)，对着「正在执行的二进制」会 ETXTBSY（报 "Failure"）。
