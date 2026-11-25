@@ -97,6 +97,30 @@ fi
 
 say "产物：$(cd "$DIR" && md5sum $BINS | awk '{printf "%s=%s ", substr($1,1,8), $2}')"
 
+# 播放器二进制没法一套通吃：V4L2 平面模式（CAP_T/OUT_T）是编译期常量，
+# meson(121) 只收 MPLANE，cedrus(123) 只收单平面，同一份源码编不出两种。
+# 所以按盒子实际驱动挑对应二进制 —— 别再像 11-25 那样把单平面推给 121，
+# 盒子上直接 S_FMT OUT EINVAL、整条播放链断掉（docs/box-matrix.md §2/§4）。
+# 探测失败（老盒子没 sysfs 名字）时按 BOX 名兜底，仍不确定才认 PLANE 变量。
+MPLANE_BIN="$DIR/dist/hevcdec-20261119-1949-84d7124/v4l2hevc-aarch64"
+BOX_DRV=$(ssh "$BOX" 'cat /sys/class/video4linux/video0/name 2>/dev/null' 2>/dev/null)
+case "$BOX_DRV" in
+*meson*)		BOX_PLANE=mplane ;;
+*cedrus*|*sunxi*)	BOX_PLANE=single ;;
+*)	case "$BOX" in
+	x96*) BOX_PLANE=mplane ;;
+	*)    BOX_PLANE=single ;;
+	esac ;;
+esac
+[ -n "${PLANE:-}" ] && BOX_PLANE=$PLANE
+if [ "$BOX_PLANE" = mplane ]; then
+	[ -f "$MPLANE_BIN" ] || { say "缺 MPLANE 二进制 $MPLANE_BIN"; exit 1; }
+	PLAYER_SRC=$MPLANE_BIN
+else
+	PLAYER_SRC="$DIR/v4l2hevc-aarch64"
+fi
+say "盒子 $BOX 驱动=${BOX_DRV:-未知} → 平面=$BOX_PLANE，播放器 $(md5sum "$PLAYER_SRC" | cut -c1-8)"
+
 # ------------------------------------------------------- 2) 停守护 + 推文件
 # scp 是 open(O_WRONLY|O_TRUNC)，对着「正在执行的二进制」会 ETXTBSY（报 "Failure"）。
 # 两个对策，按被打扰的代价分：
@@ -116,7 +140,12 @@ exit 0'
 
 say "推文件 → $BOX:/root"
 scp -q $(
-	for f in $BINS $SCRIPTS; do printf '%s ' "$DIR/$f"; done
+	for f in $BINS $SCRIPTS; do
+		case "$f" in
+		v4l2hevc-aarch64) printf '%s ' "$PLAYER_SRC" ;;
+		*)                printf '%s ' "$DIR/$f" ;;
+		esac
+	done
 ) "$BOX:/root/" || exit 1
 
 # ------------------------------------------------ 3) 落权限 + 重启守护

@@ -213,8 +213,18 @@ static void cmd_status(int fd)
 
 static int handle_line(int fd, char *line)
 {
-	char *a = strtok(line, " \t\r\n");
-	char *b = strtok(NULL, " \t\r\n");
+	/* 首字节 0x01 = 这条命令是 play.sh 发的（"别再转回 play.sh"）。
+	 * 以前用 getenv("PCTL_NODELEGATE") 判断，可是这个环境变量设在
+	 * **客户端**（play.sh 的 pctl()）上，服务端是播放器进程、环境里
+	 * 根本没有它 → 判断永远为假 → seek 又被 run_play_sh 转回 play.sh
+	 * 一次，play.sh 自己也要重启一遍，一次快进变成 +20s（连按三次
+	 * 实测 +60s）。标记必须跟着命令走，不能靠进程环境。 */
+	int nodelegate = 0;
+	char *a, *b;
+
+	if ((unsigned char)line[0] == 1) { nodelegate = 1; line++; }
+	a = strtok(line, " \t\r\n");
+	b = strtok(NULL, " \t\r\n");
 
 	if (!a) return 0;
 	if (!strcmp(a, "status")) { cmd_status(fd); return 0; }
@@ -319,7 +329,7 @@ static int handle_line(int fd, char *line)
 		 * 表现：按一下 ▶ 日志刷几十行"seek 合并"，位置乱跳、最后落回原地。
 		 * 回 "seek":"no" 让 play.sh 知道"就地跳做不到，你自己重开链路"。
 		 */
-		if (getenv("PCTL_NODELEGATE")) {
+		if (nodelegate) {
 			reply(fd, "{\"ok\":1,\"seek\":\"no\"}\n");
 			return 0;
 		}
@@ -646,9 +656,16 @@ int pctl_client(int argc, char **argv)
 	}
 	if (!cmd[0]) return 2;
 	n = (int)strlen(cmd);
-	if (n < (int)sizeof cmd - 1) {
+	if (n < (int)sizeof cmd - 2) {
 		cmd[n] = '\n';
 		cmd[n + 1] = 0;
+	}
+	/* PCTL_NODELEGATE=1：告诉服务端"这条命令是 play.sh 发的，别再往
+	 * play.sh 转"（否则 seek 会乒乓一次、快进翻倍）。标记必须随命令
+	 * 传输：服务端是播放器进程，读不到客户端的进程环境。 */
+	if (getenv("PCTL_NODELEGATE")) {
+		memmove(cmd + 1, cmd, strlen(cmd) + 1);
+		cmd[0] = 1;
 	}
 
 	fd = socket(AF_UNIX, SOCK_STREAM, 0);
