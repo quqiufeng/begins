@@ -94,12 +94,14 @@ dec() { printf '%s' "$1" | base64 -d 2>/dev/null; }
 _SDIR=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
 ENVF=${PLAY_ENV:-}          # 显式指定 .env 时优先（PLAY_ENV=/path/.env play.sh ...）
 
-# 输出模式：auto 是「跟随屏幕当前模式」，而 x98h 的 HDMI 会把 EDID 里
-# 2560x1440@60（312MHz）当成当前模式报上来，sun4i-hdmi 直接判
-# "User-defined mode not supported"，atomic commit 拿 -ERANGE；
-# 探针能出图不代表 CRTC 认这个模式。所以这里钉死 1080p，要别的用
-# VOUT_MODE=1280x720 / max 之类的覆盖。
-VOUT_MODE=${VOUT_MODE:-1920x1080}
+# 输出模式：默认 preferred = 连接器 EDID 里的首选模式（121 上是
+# 3840x2160@60）。以前钉死 1920x1080 是因为 auto（跟随屏幕当前模式）会
+# 拿到 sun4i-hdmi 不认的 user-defined 2560x1440@60，atomic commit 拿
+# -ERANGE 直接黑屏 —— 但那个坑只在「当前模式」这条路上，preferred 拿的是
+# EDID 模式表第一项，驱动必然认（它来自模式表本身）。钉死 1080p 的代价是
+# 桌面明明是 4K，一放电影就掉 1080p。
+# 要别的用 VOUT_MODE=1920x1080 / 1280x720 / max / auto 覆盖。
+VOUT_MODE=${VOUT_MODE:-preferred}
 export VOUT_MODE
 
 env_find() {                # .env 查找顺序：指定的 → cwd 向上 → 脚本目录向上 → ~/.env
@@ -784,7 +786,19 @@ fi | PLAY=1 NOWRITE=1 RENDER="$RENDER" SCALE="$SCALE" PLAY_SOCK="$SOCK" \
 	"$BIN" - $VWH >>"$LOG" 2>&1'
 	fi
 
-	say "起播参数：SRC=$SRC SS=$SS DUR=$DUR RAWMODE=${RAWMODE:-0} PIPE=${OPIPE:-0}"
+	# 输出模式兜底：preferred/auto 读不到 EDID 或模式表为空时，播放器会
+	# 直接 fail（黑屏），比糊更难查。起播前问一遍，问不出就退回 1080p。
+	case "${VOUT_MODE:-}" in
+	preferred|auto|"")
+		_pm=$("$BIN" -M 2>/dev/null | tail -1)
+		case "$_pm" in
+		[0-9]*x[0-9]*) : ;;
+		*) say "VOUT_MODE=$VOUT_MODE 协商不出模式（${_pm:-空}）→ 退回 1920x1080"
+		   VOUT_MODE=1920x1080; export VOUT_MODE ;;
+		esac ;;
+	esac
+
+	say "起播参数：SRC=$SRC SS=$SS DUR=$DUR RAWMODE=${RAWMODE:-0} PIPE=${OPIPE:-0} VOUT_MODE=$VOUT_MODE"
 	# </dev/null：不然 ssh 远端起播时子进程握着 stdin，ssh 永远等不到 EOF
 	# 外层 sh 也要重定向：否则它握着调用者的 stdout，ssh 远端起播会一直等 EOF
 	setsid sh -c "$1" >>"$LOG" 2>&1 </dev/null &
