@@ -64,6 +64,11 @@ RAWMODE=${RAWMODE:-$HW_DEC}   # 有硬解才走 RAW，否则播放器自解
 
 修复：play.sh 能力探测（§3）+ 121 装回 MPLANE 二进制。实测 121 恢复 30.79 fps。
 
+**已固化进 deploy.sh**：推送前先 `ssh $BOX cat /sys/class/video4linux/video0/name` 探驱动——
+含 `meson` → `BOX_PLANE=mplane`，推 `dist/.../v4l2hevc-aarch64`（84d7124 熟好版）；
+含 `cedrus`/`sunxi` → `BOX_PLANE=single`，推现场编的单平面二进制。探测失败按 BOX 名
+兜底（`x96*`→mplane），仍可 `PLANE=mplane|single` 强制。再不会把错的平面模式推错盒子。
+
 ## 5. 待办：统一到 #if MPLANE
 
 理想是**一份源码两种平面模式**（`-DMPLANE=1/0`），新修复同时惠及两盒，不必维护
