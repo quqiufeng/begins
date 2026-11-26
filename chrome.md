@@ -4,10 +4,11 @@
 > 谁要显示谁独占 DRM master，`systemctl stop desktop` 交棒，全屏 URL 直出 HDMI，
 > 2.4G 遥控器能操作网页。
 >
-> 当前状态：**x98h(123) 两条路线都已跑通**——
-> ① `cog -P drm`（47 包，独占直出，静态页/中文/canvas/视频均可，**动态重绘 3–5s 崩，未修**，第 7 节）；
-> ② `cage + chromium + CDP`（74 包，动态页稳定、可注入任意 JS、登录态跨重启持久，**日常用这条**，第 11–12 节）。
-> **x96(121) 未部署**（只确认了 apt 有包，见第 8 节）。
+> 当前状态：
+> ① **x98h(123)** `cog -P drm`（47 包，独占直出，静态页/中文/canvas/视频均可，**动态重绘 3–5s 崩，未修**，第 7 节）；
+> ② **x98h(123)** `cage + chromium + CDP`（74 包，动态页稳定、可注入任意 JS、登录态跨重启持久，**日常用这条**，第 11–12 节）；
+> ③ **x96(121)** `cog -P drm -O renderer=gles --device-scale=2`（61 包，**4K 3840x2160@60 直出已跑通**，
+>    动态页无长跑压测数据，第 15 节：分辨率链路 / 崩溃处置 / 装包清单）。
 >
 > **前置条件（第 10 节）**：123 能出画靠的是**内核侧的 H616/DE33 显示补丁集**（13 个 drm 补丁 + 2 处 DT），
 > 不是 cog 自带的。换盒子/重刷内核前先读第 10 节，否则 `cog -P drm` 连 plane 都拿不到。
@@ -79,6 +80,16 @@ COG_PLATFORM_PARAMS=renderer=gles cog -P drm <url>
 > `PAN_MESA_DEBUG=noafbc`、各种 linear 环境变量、隐藏 `/dev/dri/renderD128`（会掉到 llvmpipe）、
 > `gbm-linear-shim.so`、`gbm-probe-shim.so`、LD_PRELOAD 各类 `gst_*` 拦截 shim。
 
+**121（Amlogic meson + panfrost）也验证了 `renderer=gles`**：能正常出 4K 画面，
+主 plane 上是 `allocated by = cog`、`XR24`、`3840x2160`、`crtc-pos 3840x2160+0+0`，
+无 `failed to create framebuffer`、无 page flip 报错（现场读数见 §15.1）。
+所以这条参数是**两盒通用**，不是 123 专属补丁的产物
+（123 在 `modeset` 下失败是 sun4i 只认 LINEAR，见上）。121 上 `modeset` 是否可用**尚未测**，
+要试就单独试，失败不意外。
+
+121 还多一个参数 **`--device-scale=2`**：4K 面板按 CSS 视口 3840 宽算时字太小，
+给 2 折成 1920x1080 / DPI 192。**这是 121 与 123 唯一不能共用的一份配置**（§15.1）。
+
 ---
 
 ## 3. 独占 DRM master：必须 mask desktop
@@ -126,6 +137,31 @@ export DBUS_SESSION_BUS_ADDRESS="unix:path=/tmp/cogrt/bus"
 - keybd 的 `config.lua` 用 `exclude="Mouse,Touch,Video,HDMI"` 跳过鼠标类接口，`grab=true` 独占。
 - 虚拟键盘设备名 `vkeybd-browser`（`/tmp/vkeyd.lua` 实验用；正式应做成 `apps/browser.lua` + `keys/browser.lua`，**尚未做**）。
 
+### 4.1 已验证可用的最小注入器（`tmp/keyinject.c`）
+
+`/dev/uinput` 造 `lite-browser-kbd` 虚拟键盘，按名字注入，静态编译 aarch64：
+
+```c
+/* 关键部分：UI_SET_EVBIT(EV_KEY/EV_SYN) → UI_SET_KEYBIT(每个键) → UI_DEV_SETUP
+ * → UI_DEV_CREATE → usleep(300000) 等 libinput 发现 → emit(EV_KEY,code,1)
+ * → emit(EV_SYN,SYN_REPORT,0) → usleep(60000) → emit(EV_KEY,code,0) → UI_DEV_DESTROY */
+```
+
+```bash
+aarch64-linux-gnu-gcc -O2 -static -o keyinject-aarch64 keyinject.c
+scp keyinject-aarch64 x96:/root/
+ssh x96 '/root/keyinject-aarch64 right down right enter'
+```
+
+**实测（121）**：注入 `right/down/right/enter` 后页面 `keydown` 收到 `ArrowRight`、`code=39`，计数自增。
+这条链（uinput → libinput → `wpe_view_backend_dispatch_keyboard_event`）确认可用。
+
+### 4.2 真遥控器现在还到不了 cog
+
+keybd 是 `grab=true`（独占），遥控器按键被 keybd **全部吃光**，传不到 cog。
+要接真遥控器必须改 keybd：加 `apps/browser.lua` + `keys/browser.lua`（键名 → 调 `keyinject` 注入），
+或把该设备从 grab 白名单里排掉、让 cog 独享。**（尚未做，动配置文件前先决定）**
+
 键码表（uinput `KEY_*`）：
 
 ```
@@ -135,7 +171,26 @@ home=172 back=158 menu=139 volup=115 voldn=114
 
 ---
 
-## 5. 中文字体：必须硬链接进 fonts 目录
+## 5. 中文字体：先确认到底缺不缺（121 实测不缺）
+
+**别急着做硬链接。先查这一句：**
+
+```bash
+fc-list :lang=zh | wc -l
+```
+
+- **121 实测：35 条**（Noto Sans/Serif CJK 全套 + `fonts-wqy-zenhei`），`fc-match sans-serif`
+  落到 DejaVu Sans 只是默认排序，中文照样有 fallback 字形能画出来。**无需任何字体配置。**
+- 如果这一条是 0 或个位数，才走下面的硬链接流程。
+
+> 血的教训：121 上第一次出图是 `cog ç›´å‡ºæµ‹è¯•` 这种乱码，看着像字体缺失，
+> 实际**纯粹是测试页漏了 `<meta charset="utf-8">`**。补上 charset 后中文完全正常。
+> 以后见到乱码先看 charset，再怀疑字体。
+
+**判断口诀**：乱码是「一个汉字变 2–3 个西欧怪字母」→ charset 问题；
+「一个汉字变一个空心方块」→ 真缺字体。
+
+### 5.1 真缺字体时才做：硬链接进 fonts 目录
 
 盒子上的仓耳今楷（TsangerJinKai02）在 `/usr/local/share/fonts` 下，**cog 的 WebKit 沙箱看不见**
 （bwrap 私有挂载），且**符号链接在沙箱内是悬空的**。做法：
@@ -182,27 +237,65 @@ WebKit 报 `R2: Received unexpected 200 HTTP status code for range request` → 
 
 ## 7. 已知未解决问题（重要，别踩）
 
-**页面一旦重绘，cog 3–5s 内 SIGSEGV。**
+### 7.1 页面重绘崩溃：**123 特有，121 不复现**
+
+现象（**只在 123 上**见过）：页面一旦定时重绘（哪怕零按键注入），cog 3–5s 内 SIGSEGV。
 
 ```
 Buffer address requested when its parent pool has an external reference and a deferred resize pending.
     ← libwayland-server.so.0.23.1
 ```
 
-- 触发条件：页面自己定时重绘（哪怕零按键注入），如每 500ms 自更新一次。
-- 静态页（`example.com`、静态图文 `key.html`）**不崩**。
-- 试过无效：`LIBGL_ALWAYS_SOFTWARE=1`、`WEBKIT_SKIA_ENABLE_CPU_RENDERING=1`（同样崩）。
+- 触发条件（123）：页面自己定时重绘，如每 500ms 自增计数器。
+- 静态页（`example.com`、静态图文 `key.html`）在 123 上**不崩**。
+- 试过无效（123）：`LIBGL_ALWAYS_SOFTWARE=1`、`WEBKIT_SKIA_ENABLE_CPU_RENDERING=1`（同样崩）。
 - `renderer=modeset` 硬件 GL 路径不崩，但 fb 创建 EINVAL（第 2 节）。
-- **按键注入与崩溃无关**（已证明注入链可用）。
 
-**修的方向**：合成 buffer / deferred resize 路径（cog 的 drm 平台在 pool resize 期间
-不应对 parent pool 持有外部引用；要么在 resize 前释放，要么改用不 hold reference 的 wl_buffer 创建方式）。
-这是下一步要做的事。
+**121 实测（2026-11-26）：这条崩溃没复现**。
+同一个每 500ms 自更新的页面连续跑 30 秒以上存活，页内 `t` 正常自增，无 SIGSEGV；
+`https://weibo.com/` 跑约 4 分钟（21:51:59 起），cog 主进程始终在。
+
+**但 121 上出现的是另一种崩溃**：`Crash!: The renderer process crashed.`
+（WebProcess 崩、cog 自动 reload，屏幕不黑），触发前日志里是
+`GStreamer element appsink/autoaudiosink not found` + 两条 `GLib-GObject-CRITICAL`。
+处置=装满 `gstreamer1.0-plugins-base/-good/-libav`，全过程见 **§15.2**。
+
+**结论订正**：`Buffer address requested ...` 不是 `renderer=gles` 的通病，更像 123 的环境干扰
+（desktop / `resident-heal.timer` 抢 DRM master 的残留路径）。
+在 121 上排查过这条路是白费；要修就去 123 上查，或在 123 上先试
+`systemctl mask --runtime desktop` + `systemctl stop resident-heal.timer` 再复测。
+
+- **按键注入与崩溃无关**（已证明注入链可用，见 4.1）。
 
 性能参考（123）：纯 CSS/rAF 页 GPU 16.07fps / CPU 8.68→29.7fps；
 视频软解 720p 仅约 0.8fps（瓶颈在 Skia 光栅与合成，不在解码）。
 
 `cog` 退出时的 `Segmentation fault` + `No provider of eglReleaseThread found` 是**收尾噪音**，不影响出图。
+
+---
+
+### 7.2 抓图：`grabscreen` 会截半张图，必须用 `grabplane`
+
+`/root/grabscreen-aarch64` 是**写死 2560×1440** 的（一帧 14 745 600 B 的量级）。
+在 121（3840×2160，一帧 **33 177 600 B**）上跑，只抓到 1302 行就停，
+右下半截是撕裂/空白 —— **看图会误判成「页面花了 / 崩溃了」，其实是抓图工具的问题**。
+
+改用 `tmp/grabplane.c` 编译的 `/root/grabplane-aarch64`：走 DRM
+`GETRESOURCES → GETCRTC → GETFB → PRIME_HANDLE_TO_FD → mmap`，
+按 fb 自己的 pitch/height 全量导出，**分辨率无关**：
+
+```bash
+aarch64-linux-gnu-gcc -O2 -static -o grabplane-aarch64 grabplane.c
+scp grabplane-aarch64 x96:/root/
+ssh x96 '/root/grabplane-aarch64 /dev/dri/card0 /tmp/cogrt/shot.raw'
+# 回本机，raw 是 BGRA：-pix_fmt 必须写 bgr0
+ffmpeg -y -f rawvideo -pix_fmt bgr0 -s 3840x2160 -i shot.raw shot.png
+```
+
+两个坑：
+- `-pix_fmt` **必须 `bgr0`**；写 `bgra` 因 alpha=0 会得到全白图。
+- `GETRESOURCES` 第二次调用时，`count_crtcs` 是**传入数组的容量**，不是请求个数
+  （内核会把它改成实际可用数），写错会拿到空 crtc 列表。
 
 ---
 
@@ -238,48 +331,47 @@ ssh x98h '/root/cog/box-cog.sh stop'              # 收尾还原 desktop
 ssh x98h 'cat /tmp/x.raw' | ffmpeg -f rawvideo -pix_fmt bgr0 -s 2560x1440 -i - /tmp/x.png
 ```
 
-### 8.2 x96（121）：部署步骤
+### 8.2 x96（121）：已验证跑通，可直接照抄
 
-121 目前状态（已核实）：`/usr/bin/cog` **未安装**；apt 有 `cog 0.18.4-1+b1`（阿里云 trixie/main）；
-`/dev/dri/{card0,card1,renderD128}` 齐；`/root/grabscreen-aarch64` 在；`keybd` active；
-**`/usr/share/fonts/truetype/tsanger/` 不存在**（字体没按 123 的方式装）。
-121 是 Amlogic（meson + panfrost），不是 123 的 sun4i，AFBC 行为可能不同。
+121 现状（2026-11-26 实测）：
 
-按顺序做：
+| 项 | 状态 |
+|---|---|
+| `/usr/bin/cog` | **已装**，`0.18.4 (WPE WebKit 2.48.3)` |
+| `/root/cog/` | `box-cog.sh`、`cog.lua`、`startcage.sh`（与仓库 `805e5b80…` 同 md5） |
+| `/root/grabplane-aarch64`、`/root/keyinject-aarch64` | 在 |
+| 屏幕模式 | 4K 面板，`3840x2160`（**不是 123 的 2560×1440**） |
+| 中文字体 | `fc-list :lang=zh` → 35 条，**本身就有，不用装**（见第 5 节） |
+| keybd | active，配置与 123 逐字节相同 |
+
+跑起来的命令（121 实测可用）：
 
 ```bash
-# 1) 装包
-ssh x96 'apt-get install -y --no-install-recommends cog'
+# 起页面（脚本内部会 mask --runtime desktop 再起 cog，用 gles 渲染）
+ssh x96 '/root/cog/box-cog.sh open file:///tmp/k.html'
+ssh x96 '/root/cog/box-cog.sh open https://example.com'
+ssh x96 '/root/cog/box-cog.sh status'
 
-# 2) 字体：照第 5 节做硬链接 + 99-tsanger-zh.conf（121 现在没有，必须先补，否则中文方块）
-ssh x96 'ls /usr/local/share/fonts/'          # 先找到 TsangerJinKai02 的实际路径
-#    然后 mkdir + ln -f + conf + fc-cache -f
+# 抓图：⚠️ 不要用 box-cog.sh shot（见下），直接调 grabplane
+ssh x96 '/root/grabplane-aarch64 /dev/dri/card0 /tmp/x.raw'
+ssh x96 'cat /tmp/x.raw' | ffmpeg -f rawvideo -pix_fmt bgr0 -s 3840x2160 -i - /tmp/x.png
 
-# 3) 发脚本（deploy.sh 会自动跳过——它检测到没有 cog 就不推；装完 cog 再发就有）
-BOX=x96 ./deploy.sh -D -K
-ssh x96 'ls -l /root/cog/'
-
-# 4) 先试 gles（安全选择，和 123 一致）
-ssh x96 '/root/cog/box-cog.sh start https://example.com'
-ssh x96 '/root/cog/box-cog.sh shot /tmp/x.raw'
-#    抓回来转 png 看图（8.1 的 ffmpeg 命令，注意分辨率可能不是 2560x1440，先确认 TV 模式）
-
-# 5) 若 121 上 modeset（默认）也能出图，则可以省掉一次 blit，值得单独试一次：
-#    ssh x96 'COG_PLATFORM_PARAMS= cog -P drm <url>'   （即不加 renderer=gles）
-#    若报 failed to create framebuffer: Invalid argument → 回到 gles。
-
-# 6) 视频：加 GST_PLUGIN_FEATURE_RANK=v4l2slh264dec:0,v4l2slh265dec:0
-#    121 是 meson_vdec，硬解协商失败的表现需在机上确认，先按 123 的结论保守处理。
-
-# 7) 收尾
-ssh x96 '/root/cog/box-cog.sh stop'   # 必须执行，否则 desktop 一直被 mask，屏幕一直停在 cog 最后一帧
+# 收尾（必须，否则 desktop 一直被 mask，屏幕卡在 cog 最后一帧）
+ssh x96 '/root/cog/box-cog.sh stop'
 ```
 
-121 特有的注意点：
-- `box-cog.sh` 里 `GRAB=/root/grabscreen-aarch64`、`card0` —— 121 上都在，无需改。
+**已知坑：`box-cog.sh shot` 在 121 上截半张图。** 脚本第 10 行写死
+`GRAB=/root/grabscreen-aarch64`（内部固定 2560×1440），在 4K 上只出 1302 行。
+改法：第 10 行换成 `/root/grabplane-aarch64`、第 74 行同样，并让调用方传分辨率。
+**尚未改脚本，目前请直接用 `grabplane-aarch64`（见 7.2）。**
+
+121 与 123 的差异：
+- 121 是 Amlogic（meson + panfrost），123 是 allwinner sun4i。`renderer=gles` 两个都能出图。
+- 123 上「页面重绘 3–5s 崩」的问题**在 121 上不复现**（第 7.1 节），所以 121 能跑动态页面。
+- 视频硬解是 `meson_vdec`，与 123 的 `v4l2sl*` 不同；`GST_PLUGIN_FEATURE_RANK` 禁用名单
+  要在 121 上另测，别直接套 123 的 `v4l2slh264dec:0`。
 - 两个盒子的 `keybd` 配置逐字节相同（`config.lua` / `evdev.lua` / `maps/+keys` md5 一致），
-  所以遥控器→uinput 那段在 121 上**不用改**，插上接收器 keybd 自动 grab。
-  121 的服务名是 `keybd.service`（123 是 `keybd`，无所谓，`systemctl is-active` 都认）。
+  遥控器→uinput 那段**不用改**，插上接收器 keybd 自动 grab。121 的服务名是 `keybd.service`。
 
 ---
 
@@ -302,8 +394,10 @@ ssh x96 '/root/cog/box-cog.sh stop'   # 必须执行，否则 desktop 一直被 
 | `hevcdec/deploy.sh` 第 7 段 | 把 `cdp_do.lua`/`prof.sh`/`sc2.sh`/`measure.sh`/`*.html` 推到 `/root/cdp/`，md5 幂等（`-X` 跳过） |
 | `/root/cog/box-cog.sh`（盒子） | 部署落点 |
 | `/usr/bin/cog`（盒子） | apt 包 cog 0.18.4 |
-| `/usr/share/fonts/truetype/tsanger/` | 仓耳今楷硬链接 + `99-tsanger-zh.conf` |
-| `/root/grabscreen-aarch64`（盒子） | 抓 DRM 帧（2560x1440 → 14745600 B BGRA） |
+| `/usr/share/fonts/truetype/tsanger/` | 仓耳今楷硬链接 + `99-tsanger-zh.conf`（**仅 123 需要**；121 自带 CJK，不用） |
+| `/root/grabscreen-aarch64`（盒子） | 抓 DRM 帧，**写死 2560x1440**（14745600 B BGRA）→ 4K 盒子上只出半张图 |
+| `tmp/grabplane.c` → `/root/grabplane-aarch64`（121/123） | 按 fb 实际 pitch/height 全量抓帧，分辨率无关（7.2 节，**首选**） |
+| `tmp/keyinject.c` → `/root/keyinject-aarch64`（121） | uinput 虚拟键盘注入：`keyinject-aarch64 right down enter`（4.1 节） |
 
 实验残留（123 上，可清理，均已被证明不必要）：
 `/usr/local/lib/{egl-linear-only,gst-videometa-shim,gst-glconvert-shim}.so`、`/root/media/`、`/tmp/cogtest/`。
@@ -741,3 +835,153 @@ PY
 那是页面级的临时手段，不要塞进启动脚本。
 
 验证截图：`tmp/after14.png`（整幅 2560x1440）与缩放版 `tmp/after14-s.png`。
+
+---
+
+## 15. 121（x96）实战：4K 分辨率怎么来的、崩溃怎么处置、装了哪些包
+
+> 全部来自 2026-11-26 22:0x 在 x96 上的实测（`/tmp/cogrt/cog.log`、`/var/log/display-adapt.log`、
+> `/var/log/dpkg.log`、`/var/log/apt/history.log`、`i2c`/DRM sysfs 现场读数）。
+> 结论先行：**分辨率链路是干净的（crtc 3840x2160@60，cog 主 plane fb 也是 4K）；
+> 但"持续重绘不崩"没有长跑数据，别把"能开 weibo"当成"动态页稳"。**
+
+### 15.1 3840×2160 是谁定下来的：三层各管一段
+
+| 层 | 组件 | 它负责的那一段 | 121 当前状态 |
+|---|---|---|---|
+| ① 内核 | cmdline `drm.edid_firmware=edid/active.bin`（**无 `video=`**） | 开机用固件 EDID 建模式表，拿到 34 个模式、首选 3840x2160 | 在 `/proc/cmdline` 里 |
+| ② 自愈 | `/usr/local/bin/display-adapt` + `display-adapt.timer`（2 分钟一查） | 拔插 HDMI 后 fbcon 会落到 1024x768（DRM 安全模式），它负责把模式扳回首选 | timer `active`，脚本 11-25 版本 |
+| ③ 应用 | `cog -P drm -O renderer=gles --device-scale=2` | 自己 gbm 分配 LINEAR buffer 并挂主 plane，scanout 尺寸 = CRTC 模式 | 实测 plane fb=3840x2160 |
+
+**② 的自愈逻辑**（这就是"拔掉 HDMI 再插分辨率就坏"的修法）：
+
+```
+读 connector=connected，模式表 nmodes=34，当前 CUR
+CUR == PREF ? 收工
+stop desktop            # 必须停，否则它持着 DRM master，modeset 抢不到
+/usr/local/bin/drm-setmode 3840x2160
+start desktop
+回读校验 == PREF ? rm /run/display-adapt.tried : 保留 TRIED 防死循环（避免每 2 分钟重启桌面）
+```
+
+11-25 的真实现场（`/var/log/display-adapt.log`）：
+
+```
+[12:20:39] 模式表 34 项，当前 1920x1080 → 目标 3840x2160 → 停桌面 / drm-setmode / 起桌面
+OK set 3840x2160@60 on HDMI-A (crtc 46 fb 49)
+[12:20:47] 修正后 3840x2160，desktop=active   OK
+[12:26:52] 当前 1024x768 → 同上 → [12:27:00] 修正后 3840x2160   OK
+```
+
+> 老版本只 `systemctl restart desktop`，桌面顺着当前（错的）模式重建 → 死循环，
+> 已在 `display-adapt.bak-pre-modeset` 留底。
+
+**③ 的两个参数，缺一不可：**
+
+```bash
+cog -P drm -O renderer=gles --device-scale=2 https://weibo.com
+```
+
+- `renderer=gles`：默认 `modeset` 会把 WebProcess 的 AFBC buffer 直接挂 plane，
+  meson/sun4i 老 backend 只认 LINEAR → `failed to create framebuffer: Invalid argument`（第 2 节）。
+  121 上这条**实测无报错**。
+- `--device-scale=2`：4K 面板上若按 CSS 视口 3840 宽算，1 CSS px = 1 物理像素，正文小到看不清。
+  给 2 → CSS 视口折成 1920x1080、DPI=192，网页按"高分屏"排版，字恢复正常大小。
+  这是 121（4K）与 123（2560x1440，通常给 1 或 1.5）在**同一份脚本里也必须分开**的唯一参数。
+
+**现场证据（22:0x 实测）：**
+
+```
+crtc=46 fb=47 3840x2160@60          # /root/grabplane-aarch64 /dev/dri/card0 out.raw
+fb 3840x2160 pitch=15360 bpp=32
+已存 out.raw (33177600 B)            # = 3840*2160*4，与 fb 尺寸吻合
+主 plane：allocated by = cog，XR24，crtc-pos 3840x2160+0+0
+dmesg：无 failed to create framebuffer、无 page flip 报错
+```
+
+**两个假象，别当成故障：**
+
+1. `meson-drm ... Requesting EDID firmware "0" failed (err=-2)`：开机探测期刷一阵（本次 113 次）就停，
+   是 `edid_firmware` 参数被读成 `"0"` 的噪音，**模式不受影响**。
+2. `grabscreen-aarch64` 写死 2560x1440，在 121 上只抓 1302 行 → 右下半截空白，
+   看图会误判"画面只出一半 / 崩了"。必须用 `grabplane-aarch64`（见 7.2）。
+
+### 15.2 崩溃处置：两种崩溃，别混为一谈
+
+| 类型 | 现象 | 121 现状 |
+|---|---|---|
+| **cog 主进程 SIGSEGV** | 屏幕定格，进程没了；日志 `Buffer address requested when its parent pool has an external reference and a deferred resize pending.`（`libwayland-server`，shm 传帧路径） | **未复现**（只在 123 见过，见 7.1） |
+| **WebProcess 渲染进程崩溃** | 页面白一下，cog 自己 reload，屏幕不黑、进程还在 | **出现过 1 次**，自愈成功 |
+
+121 的实测日志（`/tmp/cogrt/cog.log`，访问 `https://weibo.com/`）：
+
+```
+21:51:59  Load started.
+21:52:25  The GStreamer FDK AAC plugin is missing, AAC playback is unlikely to work.
+21:52:25  GStreamer element appsink not found. Please install it.
+21:52:25  GStreamer element autoaudiosink not found. Please install it.
+21:52:29  GLib-GObject-CRITICAL: invalid (NULL) pointer instance
+21:52:29  g_signal_connect_data: assertion 'G_TYPE_CHECK_INSTANCE (instance)' failed
+21:52:29  Crash!: The renderer process crashed. Reloading the page may fix intermittent failures.
+21:52:30  Load started. → 21:52:30 Loaded successfully.
+21:52:31  No provider of eglReleaseThread found.  ← 崩掉的那个旧 WebProcess 的收尾噪音，
+          不是 cog 退出；主进程还在（4 分钟后仍在），日志此后无新错误
+```
+
+**处置（按顺序，每条都对应日志里的一行）：**
+
+1. 缺 GStreamer element → 装 `gstreamer1.0-plugins-base`（`appsink`）、
+   `gstreamer1.0-plugins-good`（`autoaudiosink`/`autovideosink`）、`gstreamer1.0-libav`（软解 `avdec_h264`）。
+   缺 element 时 WebKit 的媒体栈会走到空指针分支（上面两条 `CRITICAL`），接着就是 renderer 崩。
+2. **不加任何 GL 环境变量**。`LIBGL_ALWAYS_SOFTWARE=1`、`PAN_MESA_DEBUG=noafbc`、
+   `WEBKIT_SKIA_ENABLE_CPU_RENDERING=1`、`JSC_useJIT=0` 都会把 WebKit 推回 shm 传帧，
+   正是 123 那条 `Buffer address requested ...` 崩溃的诱因。121 也别加，
+   当前 cog 进程环境里确实一个都没有（`/proc/<pid>/environ` 只有 `DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/cogrt/bus`）。
+3. **desktop 必须 `mask --runtime` 再 `stop`**。它是 `Restart=always`，只 stop 会被拉回来抢 DRM master，
+   cog 报 `Cannot set mode (Permission denied)`，屏幕停在桌面最后一帧（曾误判为"cog 画错"）。
+   收尾必须 `unmask --runtime && start`，否则屏幕永远卡在 cog 的最后画面。
+4. 页面重绘本身目前**不需要规避**（121 上 500ms 自更新页跑过 30s+、weibo 首页跑过约 4 分钟），
+   但**没有 30 分钟以上的长跑数据**；要上"网页当播放器/游戏"这种持续重绘负载，先补压测再宣布稳。
+
+### 15.3 121 装了哪些包（2026-11-26，两批共 61 个，全部 `--no-install-recommends`）
+
+**批 1 — 21:32:32，45 个**
+
+```bash
+apt-get install -y --no-install-recommends cog
+```
+
+版本锚点：`cog 0.18.4-1+b1`、`libwpewebkit-2.0-1 2.48.3-1`、`libwpe-1.0-1 1.16.2-1`、
+`libwpebackend-fdo-1.0-1 1.16.0-1`。
+
+- 命脉 6 个（少一个都起不来）：`cog`、`libwpewebkit-2.0-1`、`libwpe-1.0-1`、
+  `libwpebackend-fdo-1.0-1`、`bubblewrap`、`xdg-dbus-proxy`（WebKit 沙箱用的 DBus 代理）
+- 输入（libinput udev backend，遥控器/键盘能进网页就靠这条链）：
+  `libinput10`、`libinput-bin`、`libevdev2`、`libmtdev1t64`、`libgudev-1.0-0`、
+  `libwacom9`、`libwacom-common`、`libmanette-0.2-0`、`libhidapi-hidraw0`、`libxkbcommon-x11-0`、`libxcb-xkb1`
+- 网络 / 渲染 / 文本：`libsoup-3.0-0(+common)`、`glib-networking(+services,+common)`、
+  `dconf-gsettings-backend`、`dconf-service`、`libdconf1`、`gsettings-desktop-schemas`、`libproxy1v5`、
+  `libavif16`、`libgav1-1`、`libyuv0`、`libwoff1`、`libxslt1.1`、`iso-codes`、`libduktape207`、`libatk1.0-0t64`、`at-spi2-common`
+- GStreamer 骨架（只有骨架，没有元素）：`libgstreamer1.0-0`、`libgstreamer-plugins-base1.0-0`、
+  `libgstreamer-gl1.0-0`、`libgstreamer-plugins-bad1.0-0`、`liborc-0.4-0t64`、
+  `libgssdp-1.6-0`、`libgupnp-1.6-0`、`libgupnp-igd-1.6-0`、`libnice10`
+
+**批 2 — 21:59:56，16 个（补 WebRTC/媒体元素，直接对应 15.2 的 renderer 崩溃）**
+
+```bash
+apt-get install -y --no-install-recommends gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
+```
+
+连带自动包：`libtheora0`、`libdv4t64`、`libwavpack1`、`libtag2`、`libshout3`、`libvisual-0.4-0`、
+`libopencore-amrnb0`、`libopencore-amrwb0`、`libaa1`、`libncurses6`、`libcdparanoia0`、`libxdamage1`、`libxtst6`。
+
+**刻意没装**：`cage`、`chromium`、`Xorg`、任何桌面/合成器、Node.js、Python 运行时。
+整条链路 61 个包，且不需要 Wayland 合成器 —— 这是 cog 路线相对 cage+chromium（74 包 + 合成器 + 抢 DRM master）的实际差距。
+
+**核对方法（换盒子重装后照这个查）**：
+
+```bash
+dpkg -l | grep -iE 'cog|wpewebkit|wpebackend|libwpe'          # 版本锚点
+awk '$3=="install"{print $1, $4}' /var/log/dpkg.log | grep 2026-11-26
+awk '/^Start-Date: 2026-11-26/{p=1} p' /var/log/apt/history.log | grep -E 'Commandline|Install:'
+```
