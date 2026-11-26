@@ -1,10 +1,12 @@
 #!/bin/sh
 # deploy.sh — 编译 + 推盒子 + 拉起守护，一条命令到底
 #
-#   ./deploy.sh                    # 播放器 + rcd + 桌面 + 遥控器(keybord) → 推 → 重启守护
+#   ./deploy.sh                    # 播放器 + rcd + 桌面 + 遥控器(keybord) + 浏览器脚本 → 推 → 重启守护
 #   ./deploy.sh -n                 # 跳过编译，只推现有产物（老行为）
 #   ./deploy.sh -D                 # 只发播放器链路，跳过桌面（改播放器时常用来省一次重启）
 #   ./deploy.sh -K                 # 跳过遥控器（keybord → /opt/keybord）
+#   ./deploy.sh -C                 # 跳过浏览器脚本（cog → /root/cog，含 startcage.sh）
+#   ./deploy.sh -X                 # 跳过浏览器调试脚本（cdp → /root/cdp）
 #   ./deploy.sh -p 片子 [秒]       # 推完直接开播（带声音）
 #   ./deploy.sh -p 片子 -s 1200    # 同上，指定起播秒
 #
@@ -27,7 +29,8 @@ BINS="v4l2hevc-aarch64 rcinputd-aarch64"
 # play.sh：rcinputd 按键回调（默认 /root/play.sh）
 # rcup-start.sh：x96-rc.service 开机拉起 rcinputd
 # tvplay-node.sh 是老链路，rc-up.sh 自己都写着已下线 → 不再推。
-SCRIPTS="play.sh rcup-start.sh"
+# rollback-6.18.sh：内核回滚脚本（盒上一直有、但以前没进仓也没推 → 重建要手抄）。
+SCRIPTS="play.sh rcup-start.sh rollback-6.18.sh"
 # 桌面：整棵源码树，加上交叉编译出来的 kmsflip.so（→ /opt/desktop/lib/）。
 # 只列真正属于源码的条目，/opt/desktop 下的 run.sh、.env、lib/ 由盒子自己管。
 DESKTOP_D="$DIR/../desktop"
@@ -40,12 +43,14 @@ KEYBORD_D="$DIR/../keybord"
 KEYB_ITEMS="act.lua config.lua evdev.lua explore.lua keybd.lua keynames.lua pctl.lua sock.lua apps keys maps tools"
 PCTL_SO="$DIR/libpctl-aarch64.so"
 
-PLAY=0; SRC=; SS=0; BUILD=1; DESK=1; KEYB=1
-while getopts 'nDKp:s:h' _o 2>/dev/null; do
+PLAY=0; SRC=; SS=0; BUILD=1; DESK=1; KEYB=1; COG=1; CDP=1
+while getopts 'nDKCXp:s:h' _o 2>/dev/null; do
 	case "$_o" in
 	n) BUILD=0 ;;
 	D) DESK=0 ;;
 	K) KEYB=0 ;;
+	C) COG=0 ;;
+	X) CDP=0 ;;
 	p) PLAY=1; SRC=$OPTARG ;;
 	s) SS=$OPTARG ;;
 	h) awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
@@ -158,7 +163,7 @@ scp -q $(
 # ------------------------------------------------ 3) 落权限 + 重启守护
 ssh "$BOX" 'set -u
 chmod 755 /root/v4l2hevc-aarch64 /root/rcinputd-aarch64 \
-          /root/play.sh /root/rcup-start.sh
+          /root/play.sh /root/rcup-start.sh /root/rollback-6.18.sh
 # 开机服务指向还是老路径（/root/rcup/rcup-start.sh）就改过来，
 # 不然重启后又去跑那份已经被删的副本，遥控器照样失灵。
 if grep -q "/root/rcup/" /etc/systemd/system/x96-rc.service 2>/dev/null; then
@@ -344,7 +349,85 @@ else
 	say "跳过遥控器（-K）"
 fi
 
-# ----------------------------------------------------------- 6) 可选开播
+# --------------------------------------------- 6) 浏览器直出脚本（/root/cog）
+# cog（WPE WebKit）是第四种直出 app：和桌面/阅读器/播放器一样独占 DRM master，
+# 谁要显示谁 start（box-cog.sh start 会 mask --runtime desktop 抢 DRM，stop 再还原）。
+# 这里只发脚本本身 —— /usr/bin/cog 是 apt 包，不在这儿装（盒子上没有就跳过，
+# 免得推一份跑不起来的东西上去）。不重启用任何守护：cog 不是常驻服务。
+if [ "$COG" = 1 ]; then
+	COG_D="$DIR/../tools/cog"
+	# startcage.sh：cage+chromium 的启动脚本（掩掉 desktop、修字号、setsid 起 kiosk）。
+	#   以前只在盒上 /root/startcage.sh，仓库没有 → 换台盒子就得手抄，这次一并收进来。
+	#   落点是 /root/cog/，同时在 /root/startcage.sh 放一个转发壳，老的敲法照旧能用。
+	# cog.lua：开发机侧 LuaJIT 遥控（start/open/shot/stop），盒子上用不到但同源一份，
+	#   保证「盒上跑的东西仓库里都有」这条不留例外。
+	COG_ITEMS="box-cog.sh startcage.sh cog.lua"
+	for f in $COG_ITEMS; do
+		[ -f "$COG_D/$f" ] || { say "缺浏览器条目 tools/cog/$f"; exit 1; }
+	done
+	# 没装 cog 也照推：startcage.sh 走的是 cage+chromium，跟 cog 没关系，
+	# 以前拿 cog 当整段开关，结果新盒子上连 startcage 都发不过去。
+	if ! ssh "$BOX" 'command -v cog >/dev/null 2>&1'; then
+		say "提示：盒子没装 cog（apt install cog），box-cog.sh 暂时跑不起来"
+	fi
+	TAR=/tmp/cog-deploy.tar
+	tar -C "$COG_D" -cf "$TAR" $COG_ITEMS || exit 1
+	COGMD5=$(md5sum "$TAR" | cut -c1-32)
+	R=$(ssh "$BOX" '[ -f /root/cog/.deploy.tar.md5 ] && cat /root/cog/.deploy.tar.md5 || echo -')
+	if [ "$R" = "$COGMD5" ]; then
+		say "浏览器脚本无变化 → 跳过推送"
+	else
+		ssh "$BOX" 'mkdir -p /root/cog'
+		ssh "$BOX" 'cat > /tmp/cog-deploy.tar' < "$TAR" || exit 1
+		ssh "$BOX" 'set -eu
+		tar --no-same-owner -C /root/cog -xf /tmp/cog-deploy.tar
+		rm -f /tmp/cog-deploy.tar
+		chmod 755 /root/cog/box-cog.sh /root/cog/startcage.sh
+		# 老敲法 /root/startcage.sh 留着，但只做转发 —— 实体只有 /root/cog 一份，
+		# 两份同源文件迟早会改歪（rcup 那次就是）。
+		printf "#!/bin/sh\nexec /root/cog/startcage.sh \"\$@\"\n" > /root/startcage.sh
+		chmod 755 /root/startcage.sh
+		echo "浏览器脚本已落盘"' || exit 1
+		ssh "$BOX" "printf '%s\n' $COGMD5 > /root/cog/.deploy.tar.md5"
+		say "浏览器脚本已发布（$BOX:/root/cog，/root/startcage.sh 为转发壳）"
+	fi
+else
+	say "跳过浏览器（-C）"
+fi
+
+# --------------------------------------------- 7) 浏览器调试脚本（/root/cdp）
+# cdp_do.lua 是盒子侧的控制入口（连 127.0.0.1:9222 的 CDP，@nav/@key/@shot/@js…），
+# prof.sh/sc2.sh/measure.sh 是配套的抓帧与性能测量，几个 html 是压测页。
+# 以前这些只躺在盒子的 /tmp（tmpfs，重启就没），等于每次重来都要重写一遍。
+if [ "$CDP" = 1 ]; then
+	CDP_D="$DIR/../tools/cdp"
+	CDP_ITEMS="cdp_do.lua prof.sh sc2.sh measure.sh bench.html bench2.html vid.html probe.html"
+	for f in $CDP_ITEMS; do
+		[ -f "$CDP_D/$f" ] || { say "缺调试条目 tools/cdp/$f"; exit 1; }
+	done
+	TAR=/tmp/cdp-deploy.tar
+	tar -C "$CDP_D" -cf "$TAR" $CDP_ITEMS || exit 1
+	CDPMD5=$(md5sum "$TAR" | cut -c1-32)
+	R=$(ssh "$BOX" '[ -f /root/cdp/.deploy.tar.md5 ] && cat /root/cdp/.deploy.tar.md5 || echo -')
+	if [ "$R" = "$CDPMD5" ]; then
+		say "调试脚本无变化 → 跳过推送"
+	else
+		ssh "$BOX" 'mkdir -p /root/cdp'
+		ssh "$BOX" 'cat > /tmp/cdp-deploy.tar' < "$TAR" || exit 1
+		ssh "$BOX" 'set -eu
+		tar --no-same-owner -C /root/cdp -xf /tmp/cdp-deploy.tar
+		rm -f /tmp/cdp-deploy.tar
+		chmod 755 /root/cdp/prof.sh /root/cdp/sc2.sh /root/cdp/measure.sh
+		chmod 644 /root/cdp/cdp_do.lua /root/cdp/*.html
+		echo "调试脚本已落盘"' || exit 1
+		ssh "$BOX" "printf '%s\n' $CDPMD5 > /root/cdp/.deploy.tar.md5"
+		say "调试脚本已发布（$BOX:/root/cdp）"
+	fi
+else
+	say "跳过调试脚本（-X）"
+fi
+
+# ----------------------------------------------------------- 8) 可选开播
 if [ "$PLAY" = 1 ]; then
 	[ -n "$SRC" ] || { say "没给片源"; exit 1; }
 	say "开播：$SRC @ ${SS}s"

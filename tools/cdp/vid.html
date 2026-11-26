@@ -1,0 +1,13 @@
+<!doctype html><meta charset=utf-8><style>html,body{margin:0;background:#000;overflow:hidden}
+video{width:100vw;height:100vh;object-fit:contain}#hud{position:fixed;right:10px;top:10px;color:#0f0;font:16px monospace;z-index:9}</style>
+<div id=hud>x</div>
+<video id=v src="/tmp/hd720.mp4" autoplay muted loop playsinline></video>
+<script>
+window.__stats={f:0,canvasMs:0};window.__t0=performance.now();
+const v=document.getElementById('v');
+function tick(){window.__stats.f++;v.requestVideoFrameCallback(tick)}
+v.requestVideoFrameCallback(tick);
+v.play().catch(e=>{document.getElementById('hud').textContent='ERR '+e.message});
+setInterval(()=>{const s=window.__stats,d=(performance.now()-window.__t0)/1000;
+ document.getElementById('hud').textContent='vframe '+(s.f/d).toFixed(1)+'/s  f '+s.f+'  e='+v.error?.code+' rs'+v.readyState},400);
+</script>

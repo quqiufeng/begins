@@ -1,0 +1,30 @@
+<!doctype html><meta charset=utf-8><style>
+html,body{margin:0;overflow:hidden;background:#0d0d10;color:#eee;font:16px sans-serif}
+#hud{position:fixed;right:8px;top:8px;color:#0f0;font:14px monospace;z-index:99}
+.card{position:absolute;width:760px;height:420px;border-radius:18px;padding:24px;
+  background:linear-gradient(135deg,#2a2f4a,#161a2b);
+  box-shadow:0 24px 60px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.12);
+  backdrop-filter:blur(6px)}
+.card h2{margin:0 0 10px;font-size:26px}
+.card p{opacity:.8;line-height:1.7}
+.blur{position:absolute;width:520px;height:320px;border-radius:50%;
+  background:radial-gradient(circle,#6cf,#a3f 55%,transparent 70%);
+  filter:blur(28px);opacity:.75;mix-blend-mode:screen;
+  animation:mv 7s linear infinite alternate;will-change:transform,filter}
+@keyframes mv{from{transform:translate3d(0,0,0) scale(1)}to{transform:translate3d(1900px,900px,0) scale(1.4)}}
+.sh{position:absolute;width:300px;height:150px;background:#fff;opacity:.06;filter:blur(40px)}
+</style>
+<div id=hud>x</div>
+<div class=blur></div><div class=blur style="animation-duration:11s;left:900px"></div>
+<div class=sh style="left:200px;top:150px"></div>
+<div class=card style="left:90px;top:110px"><h2>模糊滤镜 / 阴影 / 层混合压测</h2>
+<p>这是接近真实网站的渲染负载：大尺寸 backdrop-filter、多层 box-shadow、mix-blend-mode、径向渐变与合成动画。全部由 Skia 光栅 + 合成器处理。</p></div>
+<div class=card style="left:1180px;top:560px;background:linear-gradient(135deg,#3a2a3f,#1b1426)">
+<h2>第二块卡片</h2><p>用于测量大面积重绘时的帧率与每核占用。</p></div>
+<script>
+let f=0;window.__stats={f:0,canvasMs:0};window.__t0=performance.now();
+function loop(){window.__stats.f++;f++;requestAnimationFrame(loop)}
+requestAnimationFrame(loop);
+setInterval(()=>{const d=document.getElementById('hud');
+ d.textContent='fps '+(window.__stats.f/((performance.now()-window.__t0)/1000)).toFixed(1)+'  f '+window.__stats.f},400);
+</script>

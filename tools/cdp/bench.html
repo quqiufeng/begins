@@ -1,0 +1,48 @@
+<!doctype html><meta charset=utf-8><style>
+html,body{margin:0;padding:0;overflow:hidden;background:#111}
+.cv{position:absolute;width:640px;height:360px;box-shadow:0 0 0 1px #333}
+.bar{position:absolute;left:0;bottom:0;height:6px;background:#0f0}
+.blob{position:absolute;width:180px;height:180px;border-radius:50%;
+  background:radial-gradient(circle at 30% 30%,#7af,#a3f 60%,#205);
+  animation:mv 4s linear infinite alternate;will-change:transform}
+@keyframes mv{from{transform:translate3d(0,0,0) rotate(0)}to{transform:translate3d(2200px,1100px,0) rotate(360deg)}}
+#hud{position:absolute;right:8px;top:8px;color:#0f0;font:14px monospace;z-index:99}
+</style>
+<div id=hud>warming</div>
+<div class=blob></div>
+<script>
+const cvs=[];
+for(let i=0;i<6;i++){const c=document.createElement('canvas');c.className='cv';
+  c.width=640;c.height=360;
+  c.style.left=(i%3)*853+'px';c.style.top=Math.floor(i/3)*720+'px';
+  document.body.appendChild(c);cvs.push(c);}
+// 每帧在 6 块 canvas 上画满路径+渐变+文字，纯 CPU 光栅压力
+function paint(c,t){
+  const x=c.getContext('2d');const W=c.width,H=c.height;
+  const g=x.createLinearGradient(0,0,W,H);
+  g.addColorStop(0,'hsl('+(t*40%360)+',80%,50%)');g.addColorStop(1,'hsl('+((t*40+180)%360)+',80%,40%)');
+  x.fillStyle=g;x.fillRect(0,0,W,H);
+  for(let k=0;k<180;k++){
+    const a=t*0.01+k*0.7,r=20+90*Math.abs(Math.sin(t*0.02+k));
+    x.beginPath();x.arc(W/2+Math.cos(a)*r*3,H/2+Math.sin(a*1.3)*r*1.2,r*0.6,0,6.283);
+    x.strokeStyle='hsla('+((k*17+t)%360)+',90%,70%,0.55)';x.lineWidth=1+k%5;x.stroke();
+  }
+  x.fillStyle='rgba(255,255,255,.9)';x.font='bold 28px monospace';
+  x.fillText('frame '+t+'  '+performance.now().toFixed(0),16,H-16);
+}
+let f=0,t0=performance.now();
+window.__stats={f:0,canvasMs:0};
+function loop(){
+  const a=performance.now();
+  for(const c of cvs)paint(c,f);
+  window.__stats.canvasMs+=performance.now()-a;
+  window.__stats.f++;f++;
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+setInterval(()=>{
+  const s=window.__stats,sec=(performance.now()-t0)/1000;
+  document.getElementById('hud').textContent=
+    'fps '+(s.f/sec).toFixed(1)+'  canvas/frame '+(s.canvasMs/s.f).toFixed(1)+'ms  f '+s.f;
+},500);
+</script>

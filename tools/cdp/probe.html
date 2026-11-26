@@ -1,0 +1,13 @@
+<!doctype html><meta charset=utf-8><div id=o style="font:14px monospace;white-space:pre"></div>
+<script>
+const T="汉字测试ABCWi";
+function w(fam,size=32){const s=document.createElement('span');s.style.cssText=`font:${size}px ${fam};position:absolute;white-space:pre`;s.textContent=T;document.body.appendChild(s);const r=s.getBoundingClientRect().width;s.remove();return r;}
+const ref=w("'TsangerJinKai02'");
+const fams=["sans-serif","serif","Arial","Helvetica","system-ui","-apple-system","'PingFang SC'","'Microsoft YaHei'","'Segoe UI'","'Noto Sans CJK SC'","'WenQuanYi Zen Hei'","monospace"];
+let out="TsangerJinKai02 ref width = "+ref.toFixed(2)+"\n";
+for(const f of fams){const x=w(f);
+  out+=f.padEnd(20)+x.toFixed(2).padStart(8)+"  "+(Math.abs(x-ref)<0.5?"== 仓耳":"≠  别的字体")+"\n";}
+out+="fontconfig check: "+document.fonts.check("32px 'TsangerJinKai02'")+"\n";
+out+="载入字体集: "+[...document.fonts].filter(f=>f.status=="loaded").map(f=>f.family).join(", ")+"\n";
+document.getElementById('o').textContent=out;
+</script>
