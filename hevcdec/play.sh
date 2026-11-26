@@ -703,11 +703,29 @@ do_play() {
 	# /proc/asound/cards 是空的，就是这么哑掉的）。这里兜一下，别静默。
 	if [ "$AUDIO" = 1 ]; then
 		_i=0
-		while [ ! -e /proc/asound/card0 ] && [ "$_i" -lt 15 ]; do
+		while [ -z "$(ls /proc/asound/card*/id 2>/dev/null)" ] && [ "$_i" -lt 15 ]; do
 			[ "$_i" = 0 ] && modprobe snd_soc_meson_axg_sound_card 2>/dev/null
 			_i=$((_i + 1)); sleep 0.2
 		done
-		[ -e /proc/asound/card0 ] || say "警告：声卡没起来（modprobe axg_sound_card 失败），只放画面"
+		[ -n "$(ls /proc/asound/card*/id 2>/dev/null)" ] || say "警告：声卡没起来，只放画面"
+		# 挑出声的那张卡，别按 index 写死：card 号随驱动加载顺序变。
+		# 2026-11-27 x98h：HDMI 卡抢了 card0、H616 模拟 codec 挪到 card1，
+		# aout 写死的 pcmC0D0p 于是把声音全灌给没接通的 HDMI —— 起播即无声。
+		if [ -z "${AUDIO_DEV:-}" ]; then
+			for _f in /proc/asound/card*/id; do
+				[ -e "$_f" ] || continue
+				_cid=$(cat "$_f" 2>/dev/null)
+				case "$_cid" in HDMI|hdmi*) continue ;; esac
+				_n=$(printf '%s' "$_f" | sed 's#.*/card##; s#/id##')
+				if [ -e "/dev/snd/pcmC${_n}D0p" ]; then
+					AUDIO_DEV="/dev/snd/pcmC${_n}D0p"; AUDIO_DEV_ID="$_cid"; break
+				fi
+			done
+		fi
+		if [ -n "${AUDIO_DEV:-}" ]; then
+			export AOUT_DEV="$AUDIO_DEV"
+			say "音频设备 $AUDIO_DEV（${AUDIO_DEV_ID:-?} 卡）"
+		fi
 	fi
 	[ -n "$FPS" ] && export FPS
 	[ -n "$LEAD" ] && export LEAD

@@ -783,6 +783,11 @@ static int g_th_on;
 int aout_open(int rate, int ch, const char *fmt, int buf, int period,
 	      int vol, int quiet)
 {
+	const char *e;
+	/* 设备可以被环境变量改：card 号是驱动加载顺序决定的，写死会翻车。
+	 * 2026-11-27：x98h 上 HDMI 卡抢了 index 0，H616 模拟 codec 变成 card1，
+	 * 写死的 pcmC0D0p 于是把声音灌进没接通的 HDMI —— 从头到尾没声，快进重开也没声。 */
+	if ((e = getenv("AOUT_DEV")) && *e) g_dev = e;
 	if (rate > 0)   g_rate = (unsigned)rate;
 	if (ch > 0)     g_ch = (unsigned)ch;
 	if (buf > 0)    g_buf = (snd_pcm_uframes_t)buf;
