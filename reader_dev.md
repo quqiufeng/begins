@@ -169,6 +169,29 @@ SDL_VIDEODRIVER=dummy ./build/native-reader testdata/cjk.pdf \
 差别只在 `SDL_VIDEODRIVER` 取 `x11` / `kmsdrm` / `dummy` —— 
 这正是「平台差异收敛在一个环境变量」的设计。
 
+### 4.1 窗口尺寸不是随便给的（一次真实的「字发虚」）
+
+`lua/ui/app.lua` 建窗用 `W, H`，默认 `900x1200`。x11 下无所谓，
+**kmsdrm 下窗口尺寸就是显示模式选择器**：SDL 拿窗口大小去匹一个模式，
+`900x1200` 匹到的不是 2560x1440 而是 1080p 一类，再上采样 → 笔画糊、看着像字体没加载对。
+
+所以建窗前要先问屏幕要尺寸，而这段逻辑曾因为两个纯 Lua 的坑整段没跑：
+
+```lua
+local kmsdrm = video_driver == "kmsdrm"   -- 坑 1：SDL 给的是大写 "KMSDRM"
+local dw, dh = sdl.get_preferred_display_mode and sdl.get_preferred_display_mode()
+                                          -- 坑 2：`and` 只返回第一个值，dh 恒 nil
+```
+
+两句话记住：
+
+- **字符串来自 C 的一律先 `:lower()`**。「常量看着像小写」不等于运行期是小写。
+- **`cond and f()` 会把多返回值截成 1 个**。要两个值就写 `if cond then a, b = f() end`。
+
+取 preferred（索引 0）而不是 `get_current_display_mode()`，并**别再补一次
+`SDL_SetWindowFullscreen`** —— 它会把模式打回 `desktop_mode`（上次进程的 crtc 模式）。
+细节和 plane 验收命令在 `arm64_build.md` §9.3。
+
 ---
 
 ## 5. `package.path` 与 cwd（唯一的工作目录假设）

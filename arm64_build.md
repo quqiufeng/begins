@@ -331,7 +331,53 @@ SDL_VIDEODRIVER=dummy ./build/native-reader testdata/cjk.pdf \
 # --- log ---
 ```
 
-### 9.3 工作目录的坑
+### 9.3 窗口尺寸决定显示模式（画面发虚的坑）
+
+kmsdrm 下 **窗口尺寸就是模式选择器**：SDL 会拿窗口大小去匹一个最接近的显示模式。
+默认窗口是 `900x1200`，匹到的不是 connector 首选的 `2560x1440`，而是 1080p/1536 一类，
+再被显示器上采样 → 字迹发虚、笔画糊成一团（看着像字体没带对，其实是分辨率错了）。
+
+`lua/ui/app.lua` 建窗前做了这件事，但曾经因为两个 bug 整段是死代码：
+
+```lua
+local kmsdrm = video_driver == "kmsdrm"        -- bug 1：SDL 返回的是大写 "KMSDRM"
+local dw, dh = sdl.get_preferred_display_mode and sdl.get_preferred_display_mode()
+                                               -- bug 2：`and` 只返回第一个值，dh 恒为 nil
+```
+
+正确写法：
+
+```lua
+local kmsdrm = type(video_driver) == "string" and video_driver:lower() == "kmsdrm"
+if kmsdrm then
+    local dw, dh
+    if sdl.get_preferred_display_mode then dw, dh = sdl.get_preferred_display_mode() end
+    if not (dw and dh and dw > 0 and dh > 0) then
+        dw, dh = sdl.get_current_display_mode()
+    end
+    if dw and dh and dw > 0 and dh > 0 then W, H = dw, dh end
+end
+```
+
+两条注意：
+
+- 取 **connector 首选模式**（索引 0），不要取 `get_current_display_mode()` ——
+  建窗前它返回的还是 kmsdrm 初始化默认值（1080p），拿它建窗会先要 1080p 的 fb 去配
+  2560x1440，内核 check 失败回 `-ENOSPC`。
+- 建窗后**不要再补一次 `SDL_SetWindowFullscreen`**：它会把模式打回
+  `display->desktop_mode`（上次进程留下的 crtc 模式），把刚算好的首选模式覆盖掉。
+  全屏只置逻辑状态即可。
+
+验收不是「窗口起来了」，而是读 DRM plane：
+
+```bash
+sed -n '/plane\[41\]/,/plane\[45\]/p' /sys/kernel/debug/dri/0/state | grep -E 'size=|allocated by'
+# 		allocated by = native-reader
+# 		size=2560x1440
+# 				size=14868480        ← 2560*1440*4 ≈ 14.7 MB，BGRA 单缓冲
+```
+
+### 9.4 工作目录的坑
 
 `main.c` 里 lua 路径是**硬编码相对当前目录**的（`lua/ui/app.lua` + `./lua/?.lua` 搜索路径），
 所以必须 `cd /opt/reader` 再起，或者用 `READER_ROOT` 指定根。
@@ -367,6 +413,8 @@ SDL_VIDEODRIVER=dummy ./build/native-reader testdata/cjk.pdf \
 | 换启动方式就找不到库 | 靠 `LD_LIBRARY_PATH` 临时糊的 | `INSTALL_RPATH=$ORIGIN` + `BUILD_WITH_INSTALL_RPATH` |
 | `SDL_Init` 失败 | 已有进程占着 card0，或忘了 `SDL_VIDEODRIVER` | `pkill -f native-reader`；显式给 `kmsdrm`/`dummy` |
 | 窗口起来但白屏 | 工作目录不对，lua 没加载 | `cd /opt/reader`，或设 `READER_ROOT` |
+| 画面发虚 / 字糊（像字体不对） | 窗口 900x1200 让 SDL 匹到 1080p，再上采样 | 按 connector 首选模式建窗（§9.3），读 plane size 验收 2560x1440 |
+| 建窗就报 `-ENOSPC` | 用建窗前的 `get_current_display_mode()`（1080p）去配 2560x1440 | 取 preferred（索引 0）|
 | 中文全豆腐 | 字体没带到盒子 / 路径不对 | 只带 `assets/fonts` 的两个 ttf |
 | 交叉时报 `onnxruntime` 架构不符 | OCR 只有 x86_64 ORT | `-DREADER_OCR=OFF` |
 | 盒子上编到天荒地老 | 4 核 A53 + 71 MB 库链接 | 交叉编译，增量秒级 |
