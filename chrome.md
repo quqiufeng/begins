@@ -8,7 +8,9 @@
 > ① **x98h(123)** `cog -P drm`（47 包，独占直出，静态页/中文/canvas/视频均可，**动态重绘 3–5s 崩，未修**，第 7 节）；
 > ② **x98h(123)** `cage + chromium + CDP`（74 包，动态页稳定、可注入任意 JS、登录态跨重启持久，**日常用这条**，第 11–12 节）；
 > ③ **x96(121)** `cog -P drm -O renderer=gles --device-scale=2`（61 包，**4K 3840x2160@60 直出已跑通**，
->    动态页无长跑压测数据，第 15 节：分辨率链路 / 崩溃处置 / 装包清单）。
+>    动态页无长跑压测数据，第 15 节：分辨率链路 / 崩溃处置 / 装包清单）；
+> ④ **x98h(123)** `cage 0.2.0 + 微信 4.1.13.29 arm64`（**Chromium 内核的非浏览器 app**，
+>    718M，独占直出 2560x1440 已跑通，第 16 节：装机 / 直出原理 / 输入现状）。
 >
 > **前置条件（第 10 节）**：123 能出画靠的是**内核侧的 H616/DE33 显示补丁集**（13 个 drm 补丁 + 2 处 DT），
 > 不是 cog 自带的。换盒子/重刷内核前先读第 10 节，否则 `cog -P drm` 连 plane 都拿不到。
@@ -985,3 +987,173 @@ dpkg -l | grep -iE 'cog|wpewebkit|wpebackend|libwpe'          # 版本锚点
 awk '$3=="install"{print $1, $4}' /var/log/dpkg.log | grep 2026-11-26
 awk '/^Start-Date: 2026-11-26/{p=1} p' /var/log/apt/history.log | grep -E 'Commandline|Install:'
 ```
+
+## 16. 微信 Linux 版（arm64）当直出 app（2026-11-26，123 实测）
+
+### 16.1 为什么微信能直出：它也是 Chromium
+
+微信 4.x 的 Linux 客户端不是 Qt 也不是 Electron 壳，而是**腾讯自研外壳 + Chromium 内核**，
+从 `/opt/wechat/` 的库名就能认出来：
+
+| 库 | 作用 |
+|---|---|
+| `libmmmojo.so` | Mojo IPC（Chromium 的多进程消息总线），主进程 ↔ 渲染进程 |
+| `libmmcronet.so` | Cronet（Chromium 的 network stack），所有 HTTP/HTTPS 走它 |
+| `libandromeda.so` / `libilink2.so` / `libilink_stream.so` | 腾讯自研传输层（长连接/信令） |
+| `libowl.so` | 腾讯 OWL 组件框架 |
+| `libvlc.so` / `libvlccore.so.9` | 语音/视频消息播放，对应子进程 `wxplayer` |
+| `crashpad_handler` | Chromium 的 crashpad，崩溃转储 |
+
+**结论：渲染链和 chromium 完全同源**，所以第 11 节 cage + chromium 那条路能跑，微信这条路就能跑，
+而且不需要 CDP、不需要 `--kiosk`——微信自己就是全屏最大化。
+
+### 16.2 直出链路（和 cog 的关键差别在这里）
+
+实测抓到的实物证据（`/proc/<pid>/fd`、`/proc/net/unix`、`grabplane`）：
+
+```text
+cage(60944)   → /dev/dri/card0 ×7、/dev/dri/renderD128 ×7   ← DRM master + 自家 EGL/GLES
+wechat(60947) → /dev/dri/renderD128 ×2                       ← 只有渲染节点，没有 card0
+crtc=49  fb=56  2560x1440@60  pitch=10240 bpp=32             ← 全屏单 plane（XR24）
+```
+
+也就是说屏幕上的像素走这条链：
+
+```text
+1. cage 用 libseat(seatd) 拿 DRM master，打开 card0，取当前 CRTC 49 / plane 41，模式 2560x1440@60
+2. wechat 以 Chromium 的 ozone/wayland 后端建一个 wl_surface，EGL + GLESv2（panfrost/panvk 自家驱动）
+   渲到 gbm 分配的 dmabuf，commit 给 cage 的 wayland-0（socket 在 /run/user/0/wayland-0）
+3. cage 做合成：把 client buffer 合成到自己的一张**线性** XR24 buffer（fb 2560x1440 pitch=10240）
+4. drmModeSetPlane 把这张 fb 直接贴到 plane 41 → sun4i/DE33 → HDMI
+```
+
+**和 cog 的差别，一句话**：cog 是**零拷贝**——把 WebKit(panfrost) 的 buffer 直接挂 plane，
+所以 sun4i 只认 `DRM_FORMAT_MOD_LINEAR` 这一条（第 2 节）会把 AFBC buffer 打成
+`failed to create framebuffer: Invalid argument`；cage 是**多一次 copy**——合成成自家的线性 buffer
+再上屏，代价是一次全屏 blit（2560x1440×4B = 14MB/帧），换来**不挑 modifier、不动内核**。
+
+这就是为什么微信这条一次就跑通，而 cog 要折腾 `renderer=gles`（第 2 节）。
+
+**没有 X11**：`pgrep Xwayland` 为空，`DISPLAY=:0` 只是继承来的死变量；wechat 是
+`--ozone-platform=wayland` 纯 Wayland 客户端。所以任何依赖 X11 的输入法/托盘都不会有。
+
+四种直出并排：
+
+| | 拿 master | 渲染栈 | 上屏方式 | 改内核 | 动态页面 |
+|---|---|---|---|---|---|
+| desktop | 自己 | 自研 GLES | 自建 fb → plane | 是（DE33 补丁） | — |
+| 阅读器 / 播放器 | 自己 | mupdf / 自研 vdec+GLES | 自建 fb → plane | 是 | — |
+| cog -P drm | 自己 | WPE WebKit + panfrost | 零拷贝挂 plane（必须 gles） | 是 | 123 会崩（第 7 节） |
+| cage + chromium / 微信 | cage | Chromium + panfrost | 合成后单 plane | **否** | 稳定 |
+
+### 16.3 装机
+
+包来自腾讯官网的 arm64 deb（本机下载后 scp 到盒子，`/root/deb/`）：
+
+```bash
+ls -lh /root/deb/WeChatLinux_arm64.deb
+# -rw-r--r-- 1 root root 203M  /root/deb/WeChatLinux_arm64.deb
+
+apt-get install -y /root/deb/WeChatLinux_arm64.deb
+```
+
+实测装配结果：
+
+```text
+Package: wechat   Version: 4.1.13.29   Architecture: arm64
+Installed-Size: 734894 KB                     ← 解包后 /opt/wechat = 718M
+Depends: fonts-noto-cjk | google-noto-cjk-fonts
+Description: wechat from Tencent
+```
+
+- **只多装 1 个包**：`fonts-noto-cjk 1:20240730+repack1-1`（91MB，arm64）。
+  它是**硬 Depends**，`--no-install-recommends` 也挡不住；中文靠它显示（盒子上没有桌面字体）。
+  123 原本没装它，装微信时被一起拽上来（`/var/log/apt/history.log` 里能看到
+  `fonts-noto-cjk:arm64 (…, automatic)`）。
+- **不需要**：X11、桌面、`chromium`、Node.js、Python 运行时、任何额外 .so。
+- 入口：`/usr/bin/wechat` → `/opt/wechat/wechat`，ELF 64-bit LSB pie / ARM aarch64。
+- 用户数据不在 `/opt`：`/root/.xwechat/`（配置 + mmkv 库）、`/root/xwechat_files/`（聊天文件）。
+
+空间提醒：`/opt/wechat` 718M + deb 203M，`/root` 要留出 1G 以上；`/tmp` 是 tmpfs（2G），别往那儿解包。
+
+### 16.4 启动脚本 `/root/wx-run.sh`（123 上就是这份）
+
+```bash
+#!/bin/bash
+systemctl mask --runtime desktop 2>/dev/null
+systemctl stop desktop 2>/dev/null
+export XDG_RUNTIME_DIR=/run/user/0
+export LIBSEAT_BACKEND=seatd
+cd /root
+exec dbus-run-session -- cage -- /opt/wechat/wechat --no-sandbox --ozone-platform=wayland \
+  --disable-dev-shm-usage --window-size=1280,720 --start-maximized
+```
+
+逐条理由：
+
+- `mask --runtime desktop` + `stop`：desktop 是 `Restart=always`，只 stop 会被拉回来抢 DRM master（同第 3 节）。
+  **`wx-run.sh` 只 mask 不还原**，收尾必须手动 `systemctl unmask --runtime desktop && systemctl start desktop`。
+- `XDG_RUNTIME_DIR=/run/user/0`：cage 的 wayland socket 落在这里（`/run/user/0/wayland-0`）；
+  root 直接跑不设这个，cage 会拒绝建 socket。
+- `LIBSEAT_BACKEND=seatd` + `dbus-run-session`：cage 0.2.0 靠 libseat 拿 master，seatd 已在跑；
+  dbus session 是 Chromium 系进程的最低要求（不然有一堆 dbus 报错，虽不致命）。
+- `--ozone-platform=wayland`：**必须**，否则会去找 X11 然后 `DISPLAY=:0` 连不上直接退出。
+- `--no-sandbox` / `--disable-dev-shm-usage`：root 跑 Chromium 内核的老两样；后者是因为 `/dev/shm` 小。
+- `--window-size=1280,720` + `--start-maximized`：给个初始值，cage 全屏后仍是 2560x1440。
+- **不要加 `--disable-gpu`**：panfrost 能渲，加了反而把光栅压到 CPU（微信的圆角/阴影/图片滚动会明显掉帧）。
+
+日志：`/root/wx.log`（当前 3.4K，33 行）。
+
+### 16.5 实测（123，2560x1440@60，2026-11-26 23:18）
+
+进程与内存（登录二维码界面，闲置）：
+
+| 进程 | RSS | 说明 |
+|---|---|---|
+| `cage` | 138M | 合成器 + DRM master |
+| `wechat` | 546M | 主进程（Chromium 外壳 + 主窗口） |
+| `wxocr` | 169M | 扫码/图片识别子进程 |
+| `wxplayer` ×2 | 28M + 17M | libvlc，语音视频消息 |
+| **合计** | **≈ 918M** | 整机 `free`: used 1170M / 3910M，available 2739M |
+
+出图判定：
+
+```bash
+cd /root && ./grabplane-aarch64          # → crtc=49 fb=56 2560x1440@60，落 /tmp/plane.raw 14745600B
+# 回本机：raw 是 BGRA，-pix_fmt 必须写 bgr0（写 bgra 因 alpha=0 得全白图）
+ffmpeg -f rawvideo -pix_fmt bgr0 -s 2560x1440 -i plane.raw -frames:v 1 wx.png
+```
+
+`libinput` 在本机 USB 鼠标上报 `event processing lagging behind by 28ms/69ms`
+（`event7 Lenovo ThinkPad USB Laser Mouse`）：4×A53 上 Chromium 系进程吃满单核时的正常抱怨，不影响点击。
+
+### 16.6 输入现状（遥控器**还进不去**，这是当前唯一断点）
+
+- cage 走 libinput + seatd（第 4 节那条链的 cage 版），**鼠标可用**：微信里点联系人/滚动都行。
+- 2.4G 遥控器（`XING WEI 2.4G USB`）的 4 个键盘类接口 `event1/2/4/5/6` 被
+  **`keybd.service`（/opt/reader/bin/luajit /opt/keybord/keybd.lua，config `grab=true`）独占**，
+  而 keybd 没有建 uinput 虚拟键盘（`/proc/bus/input/devices` 里没有虚拟设备，`/dev/uinput` 空闲），
+  所以遥控器按键到不了 cage/微信。
+- 要用遥控器，二选一（都**未做**）：
+  1. `systemctl stop keybd` 让 cage 的 libinput 直接吃遥控器（最简单，验证用）；
+  2. 给 keybd 加 app 映射（`browser`/`wechat`），把按键经 uinput 注入 cage —— 同第 4.1 节注入器思路，
+     app 表目前只有 `player(30)/reader(20)/desktop(10)/shell(0)`。
+- 中文输入：装了 noto-cjk 只是**能显示**；盒子上没有 IBus/Fcitx，键盘直输英文/数字可以，
+  中文得靠手机端或后续接输入法（未做）。
+
+### 16.7 坑（都踩过）
+
+1. **`EGL_BAD_PARAMETER eglQueryDeviceStringEXT`**（wx.log 开头两行）：Chromium 在探测 EGL 设备扩展，
+   panfrost 不实现该扩展，报错**无害**，别去改驱动。
+2. **`FlueGlobalStorage, fail to get keys from db, delete db_dir = /root/.xwechat/radium/mmkv/xweb_global_storage`**
+   （首次启动连刷多条）：首次建库的自我修复，登录一次后消失，**不是装坏了**。
+3. **不要指望 wechat 自己 `-P drm`**：它只开 `renderD128`（只有渲染节点），拿 master 的是 cage。
+   想省掉 cage 就得像 cog 那样自己写 DRM 后端——没必要，cage 这条已验证稳定。
+4. **`WeChatLinux_arm64.deb` 203M 别留在 `/tmp`**：tmpfs 重启即清且会静默写失败；放 `/root/deb/`。
+5. **收尾不还原 desktop，屏幕就卡在微信最后一帧**（第 3 节同款坑）：
+   ```bash
+   pkill -x wechat; pkill -x cage
+   systemctl unmask --runtime desktop && systemctl start desktop
+   systemctl is-active desktop    # 必须是 active
+   ```
+6. 磁盘/内存水位：718M 程序 + 546M 常驻，`/` 与 `/root` 余量低于 500M 时先清 `/root/media`、`/tmp/cogtest`。
