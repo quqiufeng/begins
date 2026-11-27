@@ -278,15 +278,13 @@ local function on_key(name)
 	elseif name == "PAGEDOWN" or name == "CHANNELDOWN" then g:page(fs, 1)
 	elseif name == "HOME" then g:home(fs)
 	elseif name == "MENU" then
-		-- 遥控器 ☰ 键（keybd 派 nav.menu）：刷新 + 换一套配色，和底部提示
-		-- "MENU 刷新·换色" 一致。遥控器上没有 T 键，以前这里只刷新，
-		-- 于是"按 MENU 换主题"永远换不了。
-		-- 内部路径（进目录 / 退出播放器回来）只调 rescan()，不走这里，
-		-- 所以不会再出现"颜色自己乱变"。
+		-- 遥控器 ☰ 键（实测报 KEY_3+Ctrl，keybd 派 nav.menu）：只刷新列表。
+		-- 这里以前顺带 theme.cycle(1) 换配色，结果 ☰ 一按主题就变——用户以为
+		-- 是"进目录/退出播放器主题自己乱变"。换色改成显式动作 nav.theme（T 键
+		-- / 自动化），MENU 不再碰配色。
 		rescan()
-		local n = theme.cycle(1)
-		toast(("配色：%s"):format(theme.label or n), 2)
-		logf("MENU 刷新 + 配色 → " .. tostring(n))
+		toast("已刷新", 1.2, theme.text_dim)
+		logf("MENU 刷新 dir=" .. tostring(fs.dir))
 	elseif name == "FONTUP" or name == "FONTDOWN" then
 		-- 字号 ±10%，落盘 theme.json（下次开桌面还是这个字号）
 		local k = theme.step_scale(name == "FONTUP" and 0.1 or -0.1)
@@ -511,7 +509,7 @@ end
 local ACTIONS = {
 	"nav.left", "nav.right", "nav.up", "nav.down", "nav.pageup", "nav.pagedown",
 	"nav.home", "nav.end", "nav.ok", "nav.back", "nav.refresh", "nav.roots",
-	"nav.menu", "nav.fontup", "nav.fontdown", "nav.fontreset",
+	"nav.menu", "nav.theme", "nav.fontup", "nav.fontdown", "nav.fontreset",
 	"view.screenshot", "view.quit",
 }
 
@@ -532,6 +530,8 @@ local function action_map()
 		["nav.refresh"] = function() return on_key("REFRESH") end,
 		["nav.roots"] = function() return on_key("ROOTS") end,
 		["nav.menu"] = function() return on_key("MENU") end,
+		-- 显式换色（☰ 不再顺带换，见 on_key MENU 分支）
+		["nav.theme"] = function() return on_key("THEME") end,
 		["nav.fontup"] = function() return on_key("FONTUP") end,
 		["nav.fontdown"] = function() return on_key("FONTDOWN") end,
 		["nav.fontreset"] = function() return on_key("FONTRESET") end,
