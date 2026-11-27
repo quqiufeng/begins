@@ -190,6 +190,7 @@ local HINTS = {
 	{ "OK", "打开" },
 	{ "BACK", "上一级" },
 	{ "MENU", "刷新·换色" },
+	{ "C-4/5", "字号" },
 }
 
 function M:draw_bottom(ren, fs, W, H, sdl)

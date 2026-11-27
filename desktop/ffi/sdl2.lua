@@ -159,7 +159,7 @@ M.SDLK = {
 	LEFT = 0x40000050, RIGHT = 0x4000004F, UP = 0x40000052, DOWN = 0x40000051,
 	PAGEUP = 0x4000004B, PAGEDOWN = 0x4000004E,
 	HOME = 0x4000004A, END = 0x4000004D,
-	F1 = 0x4000003A, F2 = 0x4000003B, F5 = 0x4000003E,
+	F1 = 0x4000003A, F2 = 0x4000003B, F5 = 0x4000003E, F6 = 0x4000003F,
 	F10 = 0x40000043, F11 = 0x40000044, F12 = 0x40000045,
 	MENU = 0x40000076, PRINTSCREEN = 0x40000046,
 	A = 97, B = 98, C = 99, D = 100, E = 101, G = 103, H = 104,
@@ -169,6 +169,9 @@ M.SDLK = {
 	K0 = 48, K1 = 49, K2 = 50, K3 = 51, K4 = 52,
 	K5 = 53, K6 = 54, K7 = 55, K8 = 56, K9 = 57,
 	SLASH = 47, PERIOD = 46, MINUS = 45, EQUALS = 61,
+	-- 0x4000002B = SDLK_PLUS（shift+=）; 盒上这份头文件原来没这两项，
+	-- main.lua 里 KEYSYM 用它做「字号+」，缺了会 table index nil
+	PLUS = 0x4000002B, KP_PLUS = 0x40000057, KP_MINUS = 0x40000056,
 }
 
 local function ok(rc) return rc ~= nil and rc >= 0 end

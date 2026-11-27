@@ -27,6 +27,10 @@ M.map = {
 	-- 遥控器上的 ☰ 键实测报 KEY_3 带 Ctrl 修饰（C-3）；键盘上也认 MENU/CONTEXT_MENU
 	["C-3"] = "nav.menu", MENU = "nav.menu",
 	OPTION = "nav.menu", CONTEXT_MENU = "nav.menu",
+	-- 上排 🔊＋/🔇 键（KEY_4/KEY_5 + Ctrl，实测键位，阅读器里也是字号±）
+	["C-4"] = "nav.fontup", ["C-5"] = "nav.fontdown",
+	-- ☰ 键长按 / 键盘 F6：字号回自动档
+	F6 = "nav.fontreset",
 }
 
 -- 长按连发：只放行方向键（翻列表）

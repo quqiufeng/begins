@@ -131,17 +131,54 @@ local BASE = {
 	top_bar_h = M.top_bar_h, bottom_bar_h = M.bottom_bar_h,
 }
 
-function M.fit(h)
-	local k = 1
+-- 屏幕高 → 默认字号档（用户没自己定过就吃这套）
+local function auto_scale(h)
+	if h >= 2000 then return 1.7
+	elseif h >= 1400 then return 1.45
+	elseif h >= 1000 then return 1.25
+	elseif h >= 800 then return 1.08 end
+	return 1
+end
 
-	if h >= 2000 then k = 1.7
-	elseif h >= 1400 then k = 1.45
-	elseif h >= 1000 then k = 1.25
-	elseif h >= 800 then k = 1.08 end
-
+-- 以 BASE 为底乘 k（幂等：重复调用不会越放越大）
+function M.apply_scale(k)
 	for key, v in pairs(BASE) do M[key] = math.floor(v * k + 0.5) end
 	M.font_scale = k
 	return k
+end
+
+function M.fit(h)
+	h = tonumber(h) or M.view_h or 720
+	M.view_h = h
+	M.auto_scale = auto_scale(h)
+	-- 用户自己定过（遥控器 C-4/C-5 或 DESKTOP_FONT_SCALE）就听用户的，
+	-- 否则按窗口高推。拉窗口跨过档位时也走这里，所以已定的值不会被冲掉。
+	return M.apply_scale(M.user_scale or M.auto_scale)
+end
+
+-- 手动定字号：C-4/C-5 每按一次 ±10%，落盘记住
+local SCALE_MIN, SCALE_MAX = 0.8, 2.2
+
+function M.set_scale(k, nosave)
+	k = math.floor((tonumber(k) or 1) * 100 + 0.5) / 100
+	if k < SCALE_MIN then k = SCALE_MIN end
+	if k > SCALE_MAX then k = SCALE_MAX end
+	M.user_scale = k
+	M.apply_scale(k)
+	if not nosave then M.save() end
+	return k
+end
+
+function M.step_scale(d)
+	return M.set_scale((M.font_scale or 1) + (d or 0.1))
+end
+
+-- 回到按屏幕高自动算的档（调试/写错值时的出口）
+function M.reset_scale()
+	M.user_scale = nil
+	M.apply_scale(M.auto_scale or auto_scale(M.view_h or 720))
+	M.save()
+	return M.font_scale
 end
 
 -- ---------- 选色系（原地刷新整张表） ----------
@@ -230,11 +267,14 @@ end
 
 M.mix = mix
 
--- ---------- 记住用户选的色系 ----------
--- 以前只有 DESKTOP_THEME 一个来源：T 键 / 刷新换出来的配色只在内存里，
--- 桌面一重启（进新目录、退出播放器后重新拉起）就掉回 moon —— 用户看到的
--- 是「主题自己变来变去」。现在落盘到 <state>/theme，载入时按
--- DESKTOP_THEME > 落盘值 > 默认 moon 的顺序取。
+-- ---------- 记住用户选的色系 + 字号（一份 theme.json） ----------
+-- 以前只落盘一行色系名（<state>/theme），字号是 fit(窗口高) 现推的，用户按了
+-- 也留不住。现在一份 json 全记下来：
+--   {"theme":"moon","font_scale":1.45,"font":{"font_name":32,…},"auto_scale":1.45,"updated":"…"}
+-- 读取优先级：env（DESKTOP_THEME / DESKTOP_FONT_SCALE）> json 落盘值 > 默认 moon / 按屏高推。
+-- 兼容旧的纯文本 theme 文件（整份就是一行色系名），读到就当色系名用，下次保存自动迁成 json。
+local json = require("util.json")
+
 local function state_dir()
 	local d = os.getenv("DESKTOP_STATE_DIR")
 		or ((os.getenv("HOME") or "/root") .. "/.config/desktop")
@@ -243,37 +283,93 @@ local function state_dir()
 end
 
 function M.file()
-	return os.getenv("DESKTOP_THEME_FILE") or (state_dir() .. "/theme")
+	return os.getenv("DESKTOP_THEME_FILE") or (state_dir() .. "/theme.json")
 end
 
+-- 读落盘状态：返回 {theme=…, font_scale=…, …}，没有/坏了都返回 nil（别让坏文件拦住启动）
+function M.load()
+	local f = io.open(M.file(), "rb")
+
+	if not f then
+		-- 迁移旧格式：老版本只写 <state>/theme（一行色系名）。theme.json 还没
+		-- 生成时读它一次，用户之前选的色系不至于丢（下次 save 就写成 json 了）。
+		local old = state_dir() .. "/theme"
+
+		if old ~= M.file() then f = io.open(old, "rb") end
+	end
+	if not f then return nil end
+	local s = f:read("*a")
+	f:close()
+	if not s or s == "" then return nil end
+
+	local ok, t = pcall(json.decode, s)
+
+	if ok and type(t) == "table" then return t end
+	-- 旧格式：整份文件就是一行色系名（"moon\n"），json 解不出来就走这条
+	local name = s:gsub("%s+$", "")
+
+	if M.THEMES[name] then return { theme = name } end
+	return nil
+end
+
+-- 写落盘状态。色系取当前 M.name，字号取 M.font_scale；font 明细一起写，
+-- 是为了 cat 一眼能看出「这套设置实际是多少 px」，读的时候只用 font_scale 重算。
 function M.save(name)
 	local p = M.file()
 	local f = io.open(p, "w")
 
 	if not f then
-		-- 目录可能还不存在：建一次再写（失败就算了，下次启动只是回默认）
-		os.execute(("mkdir -p '%s' 2>/dev/null"):format(state_dir()))
+		-- 目录可能还不存在：建一次再写（失败就算了，下次启动只是回默认）。
+		-- 建的是 p 自己的目录，不是 state_dir()：DESKTOP_THEME_FILE 可能指到别处，
+		-- 早先按 state_dir() 建目录，指到别处时永远写不进去。
+		local dir = p:match("^(.*)/[^/]+$")
+
+		if dir then os.execute(("mkdir -p '%s' 2>/dev/null"):format(dir)) end
 		f = io.open(p, "w")
 		if not f then return false end
 	end
-	f:write((name or M.name or M.DEFAULT) .. "\n")
+
+	local font = {}
+
+	for k, v in pairs(BASE) do font[k] = M[k] or v end
+
+	local st = {
+		theme = name or M.name or M.DEFAULT,
+		font_scale = M.font_scale or 1,
+		auto_scale = M.auto_scale or M.font_scale or 1,
+		font = font,
+	}
+
+	if M.user_scale then st.user_scale = M.user_scale end
+	st.updated = os.date("%Y-%m-%dT%H:%M:%S")
+
+	f:write(json.encode(st), "\n")
 	f:close()
 	return true
 end
 
-function M.load()
-	local f = io.open(M.file(), "rb")
+-- 载入时定色系 / 字号：env > json > 默认
+M.stored = M.load() or {}
 
-	if not f then return nil end
-	local s = f:read("*l")
-	f:close()
-	if not s then return nil end
-	s = s:gsub("%s+$", "")
-	if M.THEMES[s] then return s end
-	return nil
+local function pick_theme()
+	local env = os.getenv("DESKTOP_THEME")
+
+	if env and M.THEMES[env] then return env end
+	local st = M.stored.theme
+
+	if st and M.THEMES[st] then return st end
+	return M.DEFAULT
 end
 
--- 载入时定色系：DESKTOP_THEME > 落盘值 > 默认 moon
-M.use(os.getenv("DESKTOP_THEME") or M.load() or M.DEFAULT)
+M.use(pick_theme())
+
+-- 字号只记 k，具体 px 等 window 起来后 fit(win.H) 以 BASE 重算（幂等）
+do
+	local env = tonumber(os.getenv("DESKTOP_FONT_SCALE") or "")
+	local st = tonumber(M.stored.user_scale) or tonumber(M.stored.font_scale)
+
+	if env then M.user_scale = math.floor(env * 100 + 0.5) / 100
+	elseif st then M.user_scale = math.floor(st * 100 + 0.5) / 100 end
+end
 
 return M

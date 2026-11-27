@@ -287,6 +287,16 @@ local function on_key(name)
 		local n = theme.cycle(1)
 		toast(("配色：%s"):format(theme.label or n), 2)
 		logf("MENU 刷新 + 配色 → " .. tostring(n))
+	elseif name == "FONTUP" or name == "FONTDOWN" then
+		-- 字号 ±10%，落盘 theme.json（下次开桌面还是这个字号）
+		local k = theme.step_scale(name == "FONTUP" and 0.1 or -0.1)
+
+		layout()
+		toast(("字号：%d%%"):format(k * 100), 2)
+		logf(("字号 → %d%%"):format(k * 100))
+	elseif name == "FONTRESET" then
+		layout()
+		toast(("字号：自动 %d%%"):format((theme.reset_scale() or 1) * 100), 2)
 	elseif name == "END" then g:endk(fs)
 	elseif name == "OK" or name == "ENTER" or name == "RETURN" or name == "SPACE" then
 		open_current()
@@ -325,7 +335,14 @@ do
 		{ K.PAGEDOWN, "PAGEDOWN" }, { K.HOME, "HOME" }, { K.END, "END" },
 		{ K.F5, "REFRESH" }, { K.Q, "QUIT" }, { K.T, "THEME" },
 		{ K.TAB, "ROOTS" },
-	}) do KEYSYM[p[1]] = p[2] end
+		-- 字号：键盘上 +/-，遥控器上 C-4/C-5（keybd 派 nav.fontup/fontdown）
+		{ K.PLUS, "FONTUP" }, { K.EQUALS, "FONTUP" }, { K.KP_PLUS, "FONTUP" },
+		{ K.MINUS, "FONTDOWN" }, { K.KP_MINUS, "FONTDOWN" },
+		{ K.F6, "FONTRESET" },
+	}) do
+		-- 少一项就整张表挂掉（KEYSYM[nil]），宁可跳过也别让桌面起不来
+		if p[1] then KEYSYM[p[1]] = p[2] end
+	end
 end
 
 -- ---------- 自动化 ----------
@@ -368,6 +385,7 @@ local CAPS = {
 		REFRESH = true, F5 = true, UP_DIR = true,
 		ROOTS = true, TAB = true, NEXTROOT = true,
 		MENU = true, T = true, THEME = true,
+		FONTUP = true, FONTDOWN = true, FONTRESET = true,
 	},
 	calls = {
 		"^app%.capture$", "^app%.goto$", "^app%.rescan$", "^app%.size$",
@@ -493,7 +511,7 @@ end
 local ACTIONS = {
 	"nav.left", "nav.right", "nav.up", "nav.down", "nav.pageup", "nav.pagedown",
 	"nav.home", "nav.end", "nav.ok", "nav.back", "nav.refresh", "nav.roots",
-	"nav.menu",
+	"nav.menu", "nav.fontup", "nav.fontdown", "nav.fontreset",
 	"view.screenshot", "view.quit",
 }
 
@@ -514,6 +532,9 @@ local function action_map()
 		["nav.refresh"] = function() return on_key("REFRESH") end,
 		["nav.roots"] = function() return on_key("ROOTS") end,
 		["nav.menu"] = function() return on_key("MENU") end,
+		["nav.fontup"] = function() return on_key("FONTUP") end,
+		["nav.fontdown"] = function() return on_key("FONTDOWN") end,
+		["nav.fontreset"] = function() return on_key("FONTRESET") end,
 		["view.screenshot"] = function()
 			local p = capture(("/tmp/desktop-%s.png"):format(os.date("%H%M%S")))
 			return { ok = p ~= nil, path = p }
