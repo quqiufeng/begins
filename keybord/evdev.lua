@@ -93,7 +93,27 @@ end
 function M.ungrab(fd) C.ioctl(fd, EVIOCGRAB, ffi.cast("int", 0)) end
 function M.close(fd) if fd and fd >= 0 then C.close(fd) end end
 
--- 读一批事件；回调 fn(type, code, value)。返回 条数, 设备是否已消失(ENODEV)
+-- 事件自带的内核时间戳（CLOCK_REALTIME）→ 单调时钟毫秒。
+-- 主循环被阻塞时（比如一次桌面动作花了 300ms），按下事件会被"晚读到"：
+-- 拿读到的时间当按下时刻，按 0.9s 的长按会被算成 0.6s，0.7s 阈值永远差一口气。
+-- 所以长按判定用事件里的 time，而不是读到的时刻。
+local clk_offset
+local function rt_offset()
+	if clk_offset then return clk_offset end
+	local rt, mo = ffi.new("struct ev_timespec"), ffi.new("struct ev_timespec")
+
+	C.clock_gettime(0, rt)   -- CLOCK_REALTIME
+	C.clock_gettime(1, mo)   -- CLOCK_MONOTONIC
+	clk_offset = (tonumber(rt.tv_sec) * 1000 + math.floor(tonumber(rt.tv_nsec) / 1e6))
+		- (tonumber(mo.tv_sec) * 1000 + math.floor(tonumber(mo.tv_nsec) / 1e6))
+	return clk_offset
+end
+
+function M.ev_ms(t)
+	return tonumber(t.tv_sec) * 1000 + math.floor(tonumber(t.tv_usec) / 1e3) - rt_offset()
+end
+
+-- 读一批事件；回调 fn(type, code, value, time)。返回 条数, 设备是否已消失(ENODEV)
 local evbuf = ffi.new("struct input_event[64]")
 local ENODEV, ENXIO = 19, 6
 function M.drain(fd, fn)
@@ -111,7 +131,7 @@ function M.drain(fd, fn)
 		for i = 0, cnt - 1 do
 			local e = evbuf[i]
 
-			fn(e.type, e.code, e.value)
+			fn(e.type, e.code, e.value, e.time)
 			n = n + 1
 		end
 	end

@@ -72,9 +72,23 @@ M.hold = { ["C-3"] = "nav.theme" }   -- 按住 ≥ CFG.hold_ms（默认 700ms）
   没有抬起，走长按逻辑会把动作挂住，所以 `devname` 是 `ctl`/`cli` 时直接派发 `M.map`。
 - 日志分得清：`short C-3 ... -> nav.menu ok` / `hold C-3 ... -> nav.theme ok`。
 - 实测用 `tools/vkey.lua`：`VKEY_NAME=vremote-test /opt/reader/bin/luajit tools/vkey.lua ctrl+3`
-  （短按）、`VKEY_NAME=vremote-test VKEY_HOLD=1.2 ... vkey.lua hold:ctrl+3`（长按）。
-  `VKEY_NAME` 必须换个名字 —— 默认 `vkeybd-test` 含 `keybd-`，keybd 会当成自己的
-  uinput 键盘排除掉。
+  （短按）、`VKEY_NAME=vremote-test VKEY_HOLD=0.9 ... vkey.lua hold:ctrl+3`（0.9s 长按，
+  该过 0.7s 阈值）。`VKEY_NAME` 必须换个名字 —— 默认 `vkeybd-test` 含 `keybd-`，
+  keybd 会当成自己的 uinput 键盘排除掉。
+
+### 判定精度：两个曾经让 0.9s 长按变短按的坑
+
+长按要的是"按下到抬起"的真实时长，中间任何一处取错时刻都会让阈值差一口气：
+
+1. **主循环 `select` 超时 `CFG.poll_ms`（默认 100ms）**：`hold_tick()` 只在每轮
+   `select` 返回后跑，超时给 500ms 时，按 0.9s 要等满 1.0s 才判定，手一快就变短按。
+2. **记按下时刻用事件自带的时间戳（`evdev.ev_ms()`），不用读到的时刻**：上一个动作
+   （例如经 socket 让桌面刷一次列表）会把主循环占住两三百毫秒，事件晚读，若拿
+   `evdev.now_ms()` 当按下时刻，0.9s 会被算成 0.6s。`struct input_event.time` 是
+   `CLOCK_REALTIME`，`ev_ms()` 一次性算好与 `CLOCK_MONOTONIC` 的偏移再换算。
+3. 顺带记一笔测试工具的坑：`vkey.lua` 早先是"数 sleep 次数"控制长按时长，
+   每轮 `nanosleep` 被信号打断就少睡一点，累积下来 `VKEY_HOLD=0.9` 只按住 0.66s；
+   现在按绝对时钟到点为止（`hold_for()`）。
 
 桌面（`apps/desktop.lua`）现在是：☰ 短按 = 刷新列表，☰ 长按 0.7s = 换主题。
 

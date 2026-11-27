@@ -55,6 +55,10 @@ local CFG = {
 	scan_ms = 2000,
 	vkbd_hold_ms = 1500,
 	hold_ms = 700,        -- app.hold 里声明的键：按住超过这个毫秒数算长按
+	-- 主循环 select 的超时：长按判定只能在这一轮 select 返回后才做，
+	-- 所以超时必须远小于 hold_ms，否则按 0.9s 也要等满 1.0s 才触发、
+	-- 手一快抬起就被结算成短按（实测 500ms 时 0.9s 长按会漏判）。
+	poll_ms = 100,
 }
 
 -- /opt/keybord/config.lua 先铺底，环境变量最后覆盖（这样 service 里 Environment= 说了算）
@@ -398,7 +402,7 @@ local function back_by_app(name)
 	return (a and a.name == "browser") and true or false
 end
 
-local function press(name, code, val, devname)
+local function press(name, code, val, devname, t)
 	if (devname == "ctl" or devname == "cli") and external_up() and not back_by_app(name) then
 		passthru(1, code, val)
 	end
@@ -426,8 +430,10 @@ local function press(name, code, val, devname)
 
 	if hold_act and devname ~= "ctl" and devname ~= "cli" then
 		if val == 1 then
-			HOLD[code] = { at = evdev.now_ms(), app = app, key = name,
-				short = action, long = hold_act }
+			-- at 取事件时间戳：主循环被上一个动作用掉几百毫秒时，
+			-- 读到事件的时刻比真正按下晚，拿它算长按会把 0.9s 算成 0.6s。
+			HOLD[code] = { at = (t and evdev.ev_ms(t)) or evdev.now_ms(),
+				app = app, key = name, short = action, long = hold_act }
 			return
 		end
 		if val == 2 then return end   -- 按住不放：连发不参与，等 hold_tick 派发长按
@@ -503,7 +509,7 @@ local function scan_devices()
 	end
 end
 
-local function handle_ev(d, type, code, val)
+local function handle_ev(d, type, code, val, t)
 	-- 真设备（不是控制口/命令行）才需要直通到 uinput 虚拟键盘。
 	-- 直通必须和下面的去重共用同一次判定：早先直通是在 drain 回调里无条件做的，
 	-- 一次物理按键被两个接口各报一遍时（键盘 + Consumer Control）就直通两遍，
@@ -554,7 +560,7 @@ local function handle_ev(d, type, code, val)
 		log("back 交给 app，不直通 %s", name)
 	end
 	if direct then passthru(type, code, val) end
-	press(name, code, val, d.name)
+	press(name, code, val, d.name, t)
 end
 
 -- —— 控制口 ——
@@ -737,7 +743,7 @@ while running do
 	local fds = { ctl_fd }
 	for _, d in ipairs(devs) do fds[#fds + 1] = d.fd end
 
-	evdev.poll(fds, 500)
+	evdev.poll(fds, CFG.poll_ms)
 
 	if sock.wait(ctl_fd, 0) then
 		local c = sock.accept(ctl_fd)
@@ -749,9 +755,9 @@ while running do
 
 		-- 设备消失（拔掉/虚拟键盘退出）时 read 报 ENODEV：立刻摘掉并马上重扫，
 		-- 否则要等 scan_ms 才发现，期间新节点上的按键会丢。
-		local _, gone = evdev.drain(d.fd, function(t, c, v)
+		local _, gone = evdev.drain(d.fd, function(t, c, v, et)
 			external_up()
-			handle_ev(d, t, c, v)
+			handle_ev(d, t, c, v, et)
 		end)
 
 		if gone then

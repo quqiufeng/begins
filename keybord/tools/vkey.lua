@@ -25,6 +25,7 @@ ffi.cdef [[
 	long write(int fd, const void *buf, unsigned long n);
 	int close(int fd);
 	int nanosleep(const struct timespec *req, struct timespec *rem);
+	int clock_gettime(int clk, struct timespec *tp);
 ]]
 
 local C = ffi.C
@@ -75,6 +76,27 @@ local function sleep_s(sec)
 
 	ts.tv_sec, ts.tv_nsec = whole, frac
 	while C.nanosleep(ts, ts) ~= 0 do end          -- 被信号打断就补睡
+end
+
+-- 长按时长的绝对时钟：按"到点为止"循环，而不是数 sleep 次数。
+-- 数次数时每轮 sleep 被打断/短于请求都会累积误差（实测 0.9s 只走 0.66s），
+-- 于是 keybd 那边 0.7s 的长按阈值永远差一口气。
+local function now_s()
+	local ts = ffi.new("struct timespec")
+
+	C.clock_gettime(1, ts)   -- CLOCK_MONOTONIC
+	return tonumber(ts.tv_sec) + tonumber(ts.tv_nsec) / 1e9
+end
+
+local function hold_for(secs, on_tick)
+	local t_end = now_s() + secs
+
+	while true do
+		on_tick()
+		local left = t_end - now_s()
+		if left <= 0 then break end
+		sleep_s(math.min(0.04, left))
+	end
 end
 
 -- 参数解析
@@ -188,11 +210,10 @@ for _, p in ipairs(plan) do
 
 			emit(EV_KEY, p.code, 1)
 			emit(EV_SYN, 0, 0)
-			for _ = 1, math.max(1, math.floor(secs / 0.04 + 0.5)) do
-				sleep_s(0.04)
+			hold_for(secs, function()
 				emit(EV_KEY, p.code, 2)
 				emit(EV_SYN, 0, 0)
-			end
+			end)
 			emit(EV_KEY, p.code, 0)
 			emit(EV_SYN, 0, 0)
 			sleep_s(0.35)
@@ -203,16 +224,15 @@ for _, p in ipairs(plan) do
 		emit(EV_SYN, 0, 0)
 	elseif p.hold then
 		-- 长按：value=2 是内核的 autorepeat 语义，keybd 按连发算。
-		-- 时长默认 0.4s；测 app.hold（0.7s 阈值）要 VKEY_HOLD=1.2 之类。
+		-- 时长默认 0.4s；测 app.hold（0.7s 阈值）给 VKEY_HOLD=0.9 就到点抬起。
 		local secs = tonumber(os.getenv("VKEY_HOLD")) or 0.4
 
 		emit(EV_KEY, p.code, 1)
 		emit(EV_SYN, 0, 0)
-		for _ = 1, math.max(1, math.floor(secs / 0.04 + 0.5)) do
-			sleep_s(0.04)
+		hold_for(secs, function()
 			emit(EV_KEY, p.code, 2)
 			emit(EV_SYN, 0, 0)
-		end
+		end)
 		emit(EV_KEY, p.code, 0)
 		emit(EV_SYN, 0, 0)
 		sleep_s(0.35)
