@@ -4,6 +4,8 @@
 --   luajit tools/vkey.lua ok down ok           # 连按
 --   luajit tools/vkey.lua ctrl+1               # 组合键
 --   luajit tools/vkey.lua hold:right           # 模拟长按连发（value=2）
+--   VKEY_HOLD=1.2 luajit tools/vkey.lua hold:ctrl+3   # 按住 1.2s 再抬起（测 app.hold 长按）
+--   VKEY_NAME=vremote-test luajit tools/vkey.lua right # 换个设备名，让 keybd 抓得到这个虚拟键盘
 --   luajit tools/vkey.lua --list               # 看支持的键名
 --
 -- 纯 LuaJIT FFI，直连 libc 的 open/ioctl/write，不依赖 python。
@@ -116,7 +118,7 @@ for _, sp in ipairs(specs) do
 		if not (m and c) then
 			io.stderr:write("不认识的键: " .. sp .. "（--list 看键名）\n") os.exit(2)
 		end
-		plan[#plan + 1] = { hold = false, mod = m, code = c }
+		plan[#plan + 1] = { hold = hold, mod = m, code = c }   -- hold: 要能带修饰键
 	else
 		local c = code_of(spec)
 
@@ -152,7 +154,10 @@ setup.id.bustype = 3          -- BUS_USB
 setup.id.vendor = 1
 setup.id.product = 1
 setup.id.version = 1
-ffi.copy(setup.name, "vkeybd-test", 11)
+-- 设备名默认 "vkeybd-test"：名字里含 "keybd-"，keybd 扫描时会把它当自己的
+-- uinput 键盘排除掉（防自激）。想让 keybd 真的收到这个键盘，用 VKEY_NAME 换个名字。
+local vname = os.getenv("VKEY_NAME") or "vkeybd-test"
+ffi.copy(setup.name, vname, math.min(#vname, 79))
 must(C.ioctl(fd, UI_DEV_SETUP, setup), "UI_DEV_SETUP")
 must(C.ioctl(fd, UI_DEV_CREATE), "UI_DEV_CREATE")
 
@@ -178,14 +183,32 @@ for _, p in ipairs(plan) do
 	if p.mod then
 		emit(EV_KEY, p.mod, 1)
 		emit(EV_SYN, 0, 0)
-		press(p.code)
+		if p.hold then
+			local secs = tonumber(os.getenv("VKEY_HOLD")) or 1.2
+
+			emit(EV_KEY, p.code, 1)
+			emit(EV_SYN, 0, 0)
+			for _ = 1, math.max(1, math.floor(secs / 0.04 + 0.5)) do
+				sleep_s(0.04)
+				emit(EV_KEY, p.code, 2)
+				emit(EV_SYN, 0, 0)
+			end
+			emit(EV_KEY, p.code, 0)
+			emit(EV_SYN, 0, 0)
+			sleep_s(0.35)
+		else
+			press(p.code)
+		end
 		emit(EV_KEY, p.mod, 0)
 		emit(EV_SYN, 0, 0)
 	elseif p.hold then
-		-- 长按：value=2 是内核的 autorepeat 语义，keybd 按连发算
+		-- 长按：value=2 是内核的 autorepeat 语义，keybd 按连发算。
+		-- 时长默认 0.4s；测 app.hold（0.7s 阈值）要 VKEY_HOLD=1.2 之类。
+		local secs = tonumber(os.getenv("VKEY_HOLD")) or 0.4
+
 		emit(EV_KEY, p.code, 1)
 		emit(EV_SYN, 0, 0)
-		for _ = 1, 10 do
+		for _ = 1, math.max(1, math.floor(secs / 0.04 + 0.5)) do
 			sleep_s(0.04)
 			emit(EV_KEY, p.code, 2)
 			emit(EV_SYN, 0, 0)

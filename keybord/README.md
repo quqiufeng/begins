@@ -56,6 +56,28 @@ keybd 启动时读它当 map，`DISPATCH=exec` 时每键 fork 一条
 | `tools/vkey.lua` | 用 /dev/uinput 造虚拟键盘往盒子里打按键（LuaJIT FFI，无 python） |
 | `tools/gen-keynames.lua` | 从 `input-event-codes.h` 全量生成 `keynames.lua`；`--check` 校验漏码 |
 
+## 长按（app.hold）
+
+一个物理键想干两件事时，用 `apps/<app>.lua` 里的 `M.hold` 声明长按动作：
+
+```lua
+M.map  = { ["C-3"] = "nav.menu" }    -- 短按（抬起前松手）
+M.hold = { ["C-3"] = "nav.theme" }   -- 按住 ≥ CFG.hold_ms（默认 700ms）
+```
+
+- 按下只记账不派发；抬起（短按）派发 `M.map` 里那一层的动作，按住超过
+  `hold_ms` 派发 `M.hold` 的动作，派发过长按后抬起不再补发短按。
+- 设备连发（`value=2`）不参与长按，只等 `hold_ms` 到点，一次按键只出一个动作。
+- **控制口/命令行（`act.lua`、测试脚本、`{"cmd":"key"}`）不受影响**：它们只发按下
+  没有抬起，走长按逻辑会把动作挂住，所以 `devname` 是 `ctl`/`cli` 时直接派发 `M.map`。
+- 日志分得清：`short C-3 ... -> nav.menu ok` / `hold C-3 ... -> nav.theme ok`。
+- 实测用 `tools/vkey.lua`：`VKEY_NAME=vremote-test /opt/reader/bin/luajit tools/vkey.lua ctrl+3`
+  （短按）、`VKEY_NAME=vremote-test VKEY_HOLD=1.2 ... vkey.lua hold:ctrl+3`（长按）。
+  `VKEY_NAME` 必须换个名字 —— 默认 `vkeybd-test` 含 `keybd-`，keybd 会当成自己的
+  uinput 键盘排除掉。
+
+桌面（`apps/desktop.lua`）现在是：☰ 短按 = 刷新列表，☰ 长按 0.7s = 换主题。
+
 ## 安装
 
 ```sh

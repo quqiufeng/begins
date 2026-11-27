@@ -29,8 +29,15 @@ M.map = {
 	OPTION = "nav.menu", CONTEXT_MENU = "nav.menu",
 	-- 上排 🔊＋/🔇 键（KEY_4/KEY_5 + Ctrl，实测键位，阅读器里也是字号±）
 	["C-4"] = "nav.fontup", ["C-5"] = "nav.fontdown",
-	-- ☰ 键长按 / 键盘 F6：字号回自动档
+	-- 键盘 F6：字号回自动档
 	F6 = "nav.fontreset",
+}
+
+-- 长按表：按住不放走这里，短按仍按 M.map 派发。
+-- ☰（遥控器实测报 KEY_3+Ctrl = C-3）短按只是刷新列表，长按 0.7s 才换主题 ——
+-- 换色是有副作用、会落盘的操作，不该和"刷新"共用一次点按。
+M.hold = {
+	["C-3"] = "nav.theme", MENU = "nav.theme", CONTEXT_MENU = "nav.theme",
 }
 
 -- 长按连发：只放行方向键（翻列表）

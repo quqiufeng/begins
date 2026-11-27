@@ -54,6 +54,7 @@ local CFG = {
 	learn = false,
 	scan_ms = 2000,
 	vkbd_hold_ms = 1500,
+	hold_ms = 700,        -- app.hold 里声明的键：按住超过这个毫秒数算长按
 }
 
 -- /opt/keybord/config.lua 先铺底，环境变量最后覆盖（这样 service 里 Environment= 说了算）
@@ -348,6 +349,45 @@ local function vkbd_release_stale()
 	end
 end
 
+-- 长按（hold）：app.hold[name] 声明"这个键按住不放干什么"。
+-- 按下先只记账、不派发；抬起（短按）派发 map 里那一层的普通动作，
+-- 按住超过 CFG.hold_ms（长按）派发 hold 动作，之后抬起不再补发短按动作。
+-- 只对真设备生效：控制口/命令行（act.lua、apps/*.lua、测试脚本）发键只有按下没有抬起，
+-- 走这套逻辑会把动作永远挂住 —— ctl/cli 一律直接派发，行为与以前完全一致。
+local HOLD = {}
+
+local function hold_fire(h, code, what)
+	local ok, detail = run_action(h.app, h.action, h.key)
+
+	log("%s %s code=%s focus=%s -> %s %s", what, h.key, tostring(code),
+		h.app.name, h.action, ok and "ok" or ("FAILED " .. tostring(detail)))
+end
+
+local function hold_tick()
+	if next(HOLD) == nil then return end
+	local now = evdev.now_ms()
+
+	for code, h in pairs(HOLD) do
+		if now - h.at >= CFG.hold_ms then
+			HOLD[code] = nil
+			hold_fire({ app = h.app, key = h.key, action = h.long }, code, "hold")
+		end
+	end
+end
+
+local function hold_release(code)
+	local h = HOLD[code]
+
+	if not h then return end
+	HOLD[code] = nil
+	if h.short then
+		hold_fire({ app = h.app, key = h.key, action = h.short }, code, "short")
+	else
+		log("short %s code=%s focus=%s -> 无短按动作（只有长按）", h.key,
+			tostring(code), h.app.name)
+	end
+end
+
 -- 浏览器前台时返回键交给 app 自己处理（browser.lua 合成 158），这里绝不直通：
 -- 直通的话页面会先自己退一步，browser.lua 随后读到的 url 已经是首页 → 误判"在首页"→
 -- 一次 BACK 直接把 chromium 收掉（实测就是这么退进程的）。
@@ -382,6 +422,16 @@ local function press(name, code, val, devname)
 	local layer = tostring(why or "up")
 
 	local action = app.map and app.map[name]
+	local hold_act = app.hold and app.hold[name]
+
+	if hold_act and devname ~= "ctl" and devname ~= "cli" then
+		if val == 1 then
+			HOLD[code] = { at = evdev.now_ms(), app = app, key = name,
+				short = action, long = hold_act }
+			return
+		end
+		if val == 2 then return end   -- 按住不放：连发不参与，等 hold_tick 派发长按
+	end
 	if not action then
 		log("press %s code=%s focus=%s[%s]: 该 app 无此键", name, tostring(code), app.name, layer)
 		return
@@ -477,6 +527,7 @@ local function handle_ev(d, type, code, val)
 	-- 只认按下(1)/连发(2)：抬起(0) 绝不能派发动作，否则一次按键翻两次页
 	if val == 0 then
 		if direct then passthru(type, code, 0) end
+		hold_release(code)   -- 抬起：有挂着的长按键就在这里结算成短按
 		return
 	end
 
@@ -713,6 +764,7 @@ while running do
 	end
 	local now = evdev.now_ms()
 	vkbd_release_stale()
+	hold_tick()
 	if now - last_scan >= CFG.scan_ms then
 		last_scan = now
 		scan_devices()
