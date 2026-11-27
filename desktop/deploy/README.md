@@ -79,3 +79,31 @@ keybd：
 `keybd` 的「活着但派发错」：app 崩了留孤儿（PPID=1）但 socket 还在 `ping` 得通，
 `detect()` 会把它当成前台，遥控全被吞掉。目前靠人 `kill -9` 孤儿解决。
 根治要给 `apps/*.lua` 的 `detect()` 加一条：PPID=1 或 `state` 超时就降级/跳过。
+
+## 桌面本体 + 浏览器（2026-11-27 补齐的落点表）
+
+仓库里 `desktop/` 与 `keybord/` 是**盒上现场文件的完整副本**，不是节选。改动前先在这里
+`scp x98h:/opt/desktop/<f> .` 拉一遍，避免用旧版盖掉盒上的修复（`main.lua` 的
+`local toast` 前向声明和 `ev.key.sym`、`core/hotplug.lua` 的 `opendir/readdir` 取法，
+盖错会分别导致「首页图标刷不出来」和「U 盘永远扫不到」）。
+
+| 仓库文件 | 盒子落点 |
+| --- | --- |
+| `desktop/*.lua`、`desktop/core/`、`desktop/ui/`、`desktop/ffi/`、`desktop/tools/` | `/opt/desktop/` 同名 |
+| `desktop/assets/icons/*.png` | `/opt/desktop/assets/icons/`（`browser` 256、`wechat` 512、`usb`/`host`/`nas` 256） |
+| `desktop/assets/browser-home.html` | `/root/browser-home.html`（浏览器首页卡片，配置里是绝对路径 `file:///root/browser-home.html`） |
+| `desktop/tools/cdp.py` | `/root/cdp.py`（调 9222 的 CDP 小工具；页面线程卡死时 `Runtime.evaluate` 会超时，判活先看 `curl 127.0.0.1:9222/json/list`） |
+| `desktop/deploy/desktop.service` | `/etc/systemd/system/desktop.service`（含 `XDG_RUNTIME_DIR=/run/user/0`、`LIBSEAT_BACKEND=seatd`，cage 缺前者立即 exit 1） |
+| `keybord/*.lua`、`keybord/apps/`、`keybord/keys/`、`keybord/maps/` | `/opt/keybord/` 同名 |
+
+`keybord/apps/browser.lua`（order=25）是浏览器前台时的按键表：方向/ENTER 走 uinput 直通，
+`BACK/ESC` 不在首页时合成 `KEY_BACK(158)` 让 chromium 后退、已在首页时收浏览器并
+`systemctl restart desktop`，`MENU/C-3/STOP/EXIT` 直接退出。
+
+部署后校验（都别靠肉眼看屏幕）：
+
+```sh
+systemctl restart desktop && sleep 3
+ls -l /proc/$(systemctl show -p MainPID --value desktop)/fd | grep dri   # 有 /dev/dri/card0
+curl -s --max-time 4 127.0.0.1:9222/json/list | grep title               # 浏览器活着才通
+```

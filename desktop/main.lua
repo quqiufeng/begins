@@ -87,17 +87,22 @@ local auto
 local base_roots = {}
 local hp -- 前向声明：下面的 on_change 闭包里要用到
 local rescan
+local toast -- 同理：下面 on_change 里先 toast 再 rescan，不声明就变成全局 nil 调用
 
 for i, r in ipairs(cfg.roots) do base_roots[i] = r end
 
 local function refresh_roots()
 	local roots = {}
+	-- 已挂上的 U 盘：既进"根"（TAB 切换），也进首页图标（core/fs.lua 的
+	-- app_items 读 cfg.usb_vols，没盘就是空表，图标自然不出现）
+	local vols = hp and hp:list() or {}
 
 	for i, r in ipairs(base_roots) do roots[i] = r end
-	for _, v in ipairs(hp and hp:list() or {}) do
+	for _, v in ipairs(vols) do
 		roots[#roots + 1] = { path = v.mnt, label = v.label, kind = "usb" }
 	end
 	cfg.roots = roots
+	cfg.usb_vols = vols
 end
 
 hp = cfg.usb.enabled and hotplug.new(cfg, {
@@ -108,7 +113,9 @@ hp = cfg.usb.enabled and hotplug.new(cfg, {
 
 		if kind == "add" then
 			logf(("U 盘挂上 %s → %s"):format(v.dev, v.mnt))
-			toast(("U 盘 %s 已就绪（TAB 切换）"):format(name), 3)
+			toast(("U 盘 %s 已就绪（桌面图标）"):format(name), 3)
+			-- 正停在首页：立刻把 U 盘图标画出来
+			if fs.dir == cfg.home_dir then rescan() end
 			-- 正停在挂载点父目录（/media）上：直接刷新，新盘立刻出现在网格里
 			if fs.dir == v.mnt or fs.dir == (v.mnt:match("^(.*)/[^/]+$") or v.mnt) then
 				rescan()
@@ -116,6 +123,7 @@ hp = cfg.usb.enabled and hotplug.new(cfg, {
 		else
 			logf(("U 盘拔了 %s"):format(v.dev))
 			toast(("U 盘 %s 已移除"):format(name), 3)
+			if fs.dir == cfg.home_dir then rescan() end
 			-- 正在看被拔走的盘：退回起始目录，别留在空气里
 			if fs.dir == v.mnt or fs.dir:sub(1, #v.mnt + 1) == v.mnt .. "/" then
 				fs:scan(cfg.start_dir)
@@ -134,7 +142,9 @@ local dirty = true
 local last_clock = ""
 local need_scan = true
 
-local function toast(msg, sec, color) bar:toast(msg, sec, color); dirty = true end
+-- 注意：上面 on_change 在 145 行之前就调用 toast，所以这里必须是给前向声明的
+-- local 赋值，写成 "local function toast" 会让 on_change 里的 toast 变成全局 nil
+toast = function(msg, sec, color) bar:toast(msg, sec, color); dirty = true end
 
 local function layout()
 	if not win.ren then return end
@@ -695,7 +705,7 @@ while running do
 		if ty == sdl.QUIT then
 			running = false
 		elseif ty == sdl.KEYDOWN then
-			local name = KEYSYM[tonumber(ev.key.keysym.sym)]
+			local name = KEYSYM[tonumber(ev.key.sym)]
 
 			if name then on_key(name) end
 		elseif ty == sdl.WINDOWEVENT then

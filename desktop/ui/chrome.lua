@@ -166,11 +166,13 @@ function M:draw_top(ren, fs, W, sdl)
 	end
 
 	local show_center = cx > path_x and center_right < W - t.padding - cntw - 12
-	local show_path = path_x + self.ttf.width(self.font, fs.dir, t.font_small) + 12 <
+	-- 首页的虚拟路径（home:）不是给人看的，显示成「应用」
+	local shown_dir = fs.is_home and fs.is_home(self.cfg, fs.dir) and "应用" or fs.dir
+	local show_path = path_x + self.ttf.width(self.font, shown_dir, t.font_small) + 12 <
 		(show_center and cx or (W - t.padding - cntw - 12))
 
 	if show_path then
-		self.ttf.draw(ren, self.font, fs.dir, t.font_small,
+		self.ttf.draw(ren, self.font, shown_dir, t.font_small,
 			path_x, path_y, t.text_dim, "left")
 	end
 	if not show_center then return end

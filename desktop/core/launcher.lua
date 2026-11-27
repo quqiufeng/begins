@@ -353,6 +353,21 @@ function M:open(fs, preview, item)
 	end
 	local kind = item.kind
 
+	-- 进入型 app（NAS / 本机）：不起进程，只是把目录切过去
+	if item.goto and item.goto ~= "" then
+		local ok, err = fs:scan(item.goto)
+
+		if not ok then return nil, err end
+		return "into"
+	end
+	-- 直出 app：没有文件参数，起进程后等它退出，桌面自动回来（run 里已 suspend）
+	if item.app then
+		if not item.cmd or item.cmd == "" then
+			return nil, "没配置启动命令：" .. tostring(item.name)
+		end
+		return self:run(item.name, item.cmd) and "opened", nil
+	end
+
 	if kind == "ebook" then
 		if not self:has_reader() then
 			return nil, "没找到阅读器：" .. tostring(self.cfg.reader_cmd)

@@ -119,19 +119,22 @@ end
 -- 目录列表：盘上没 lfs.so，直接 FFI readdir（和 core/fs.lua 同一套 ABI）
 local readdir
 do
-	local ok = pcall(ffi.cdef, [[
+	-- 注意：core/fs.lua 已经 cdef 过同一套 ABI，这里再 cdef 会报
+	-- "attempt to redefine 'dirent'"。那不是故障：结构体和符号照样能用。
+	-- （曾经把 redefine 当成"不可用"→ readdir=nil → U 盘永远扫不到）
+	pcall(ffi.cdef, [[
 	typedef struct dirent {
 		uint64_t d_ino; int64_t d_off;
 		unsigned short d_reclen; unsigned char d_type; char d_name[256];
 	} dirent;
 	DIR *opendir(const char *name);
 	struct dirent *readdir(DIR *dirp);
+	int closedir(DIR *dirp);
 	]])
 
-	if ok then
-		local opendir = C.opendir
-		local rd = C.readdir
+	local opendir, rd = C.opendir, C.readdir
 
+	if opendir and rd then
 		readdir = function(path)
 			local dir = opendir(path)
 

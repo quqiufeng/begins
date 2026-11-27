@@ -41,6 +41,12 @@ end
 
 M.basename, M.dirname, M.join = basename, dirname, join
 
+-- 虚拟首页（不放文件，只放 app 图标）。cfg.home_dir 默认 "home:"，
+-- 所有「现在是首页吗」的判断都走这一个函数，别到处比字符串。
+function M.is_home(cfg, path)
+	return path ~= nil and path == (cfg and cfg.home_dir or "home:")
+end
+
 -- ---------- 读目录 ----------
 -- 优先 lfs（装了就用），否则 FFI readdir。两条路返回同样的 {name=,dir=} 列表。
 
@@ -213,6 +219,7 @@ end
 function M:display_name()
 	local cfg = self.cfg
 
+	if M.is_home(cfg, self.dir) then return cfg.home_label or "桌面" end
 	-- 标题栏：NAS 根显示 "NAS"，子目录显示目录名（远端路径太长了）
 	if dav.is_dav(self.dir) then
 		local remote = dav.remote(self.dir):gsub("/+$", "")
@@ -225,8 +232,62 @@ function M:display_name()
 	return basename(self.dir)
 end
 
+-- 首页的虚拟条目：没有真实路径（path 用 app:// 只给缩略图缓存当 key），
+-- size/mtime 一律 0，小字走 meta。goto 型（NAS/本机）点开是切目录，
+-- cmd 型（浏览器/微信）点开是起外部进程。
+local function app_items(cfg)
+	local out = {}
+
+	local used = {}
+
+	for i, a in ipairs(cfg.apps or {}) do
+		used[a.name] = true
+		out[#out + 1] = {
+			name = a.name, path = "app://" .. tostring(a.kind) .. "/" .. tostring(i),
+			dir = false, kind = a.kind, ext = "", size = 0, mtime = 0,
+			app = true, cmd = a.cmd, goto = a.goto,
+			meta = a.meta or "应用",
+		}
+	end
+	-- U 盘：只有在这一刻真的插着（热插拔已经挂上）才出图标，
+	-- 拔盘时 main.lua 的 on_change 重扫首页，图标跟着消失。
+	-- cfg.usb_vols 由 main.lua 的 refresh_roots() 维护，这里只读。
+	for _, v in ipairs(cfg.usb_vols or {}) do
+		local name = v.label or "U盘"
+		local base, n = name, 1
+
+		-- 两个盘同卷标（UDISK x2）时后缀区分，select.<name> 才不会歧义
+		while used[name] do
+			n = n + 1
+			name = ("%s %d"):format(base, n)
+		end
+		used[name] = true
+		out[#out + 1] = {
+			name = name, path = "app://usb/" .. tostring(v.mnt or name),
+			dir = false, kind = "usb", ext = "", size = 0, mtime = 0,
+			app = true, goto = v.mnt,
+			meta = v.mnt or "U盘",
+		}
+	end
+	return out
+end
+
+M.app_items = app_items
+
 function M:scan(dir, keep)
 	dir = dir or self.dir
+	-- 首页不读盘：只有 app 图标，别人（NAS/本机）在图标后面
+	if M.is_home(self.cfg, dir) then
+		local prev = keep
+		self.dir, self.items = dir, app_items(self.cfg)
+		self.scanned, self.err, self.sel = os.time(), nil, 1
+		if prev then
+			for i, it in ipairs(self.items) do
+				if it.name == prev then self.sel = i; break end
+			end
+		end
+		return true
+	end
 	local raw, err = list_raw(dir, self.cfg)
 
 	if not raw then
@@ -322,15 +383,23 @@ end
 
 -- 返回上级；把刚才那个目录选回来（桌面上很关键，不然每次返回都跳回第一页）
 function M:up()
-	if self.dir == "/" then return nil, "at root" end
-	-- NAS 的根：base 的上一级一般是共享列表，没意义；上到 base 就停
-	if dav.is_dav(self.dir) then
-		local remote = dav.remote(self.dir):gsub("/+$", "")
-		local base = (self.cfg.nas.base or ""):gsub("/+$", "")
+	local cfg = self.cfg
 
-		if remote == "" or remote == "/" or remote == base then
-			return nil, "at nas root"
+	if M.is_home(cfg, self.dir) then return nil, "at home" end
+	-- 任何一个「根」（NAS 共享根、本机 home）往上都回首页，别再爬到 / 或共享列表
+	for _, r in ipairs(cfg.roots or {}) do
+		if r.path == self.dir then
+			local ok, err = self:scan(cfg.home_dir)
+
+			if not ok then return nil, err end
+			return cfg.home_dir
 		end
+	end
+	if self.dir == "/" then
+		local ok, err = self:scan(cfg.home_dir)
+
+		if not ok then return nil, err end
+		return cfg.home_dir
 	end
 	local child = basename(self.dir)
 	local parent = dirname(self.dir)

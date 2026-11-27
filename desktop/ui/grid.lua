@@ -347,7 +347,7 @@ function M:draw(ren, fs, W, H)
 			local ly = iy + ih + 10
 			local bottom = y + self.cell_h - pad
 			-- 右下角小字：文件夹给项数做不了（要再扫），这里给类别/大小
-			local meta = item.dir and "文件夹" or fs.human_size(item.size)
+			local meta = item.meta or (item.dir and "文件夹" or fs.human_size(item.size))
 			-- 两行长名 + 小字会打架：空间不够时不画小字（名字更重要），
 			-- 名字块再整体上移贴底，别溢出到下一张卡片。
 			local show_meta = (ly + name_h + 4 + t.font_small) <= bottom

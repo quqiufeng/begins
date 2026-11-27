@@ -53,6 +53,7 @@ local CFG = {
 	dispatch = "inproc",
 	learn = false,
 	scan_ms = 2000,
+	vkbd_hold_ms = 1500,
 }
 
 -- /opt/keybord/config.lua 先铺底，环境变量最后覆盖（这样 service 里 Environment= 说了算）
@@ -255,7 +256,83 @@ local function ring_add(v)
 end
 
 -- 一个键从"设备事件"到"app 动作"
+-- 外部合成器（cage/chromium 之类自己吃 evdev 的 app）在前台时，
+-- keybd 把独占设备的按键通过 uinput 虚拟键盘直通给它。
+local VKBD
+local EXT = { at = 0, up = false }
+
+-- 虚拟键盘一辈子不销毁：cage 只在启动那一刻枚举一次输入设备，之后
+-- 才出现的 uinput 设备有相当高的概率抓不到（实测同一盒子上时好时坏），
+-- 抓不到就是"整场都没反应"——遥控按 OK 打不开网页就是这么来的。
+-- 所以 keybd 起来就把设备建好，cage 每次启动都能在枚举时看见它。
+local function vkbd_ensure()
+	if VKBD then return VKBD end
+	local fd, err = evdev.uinput_create("keybd-passthru")
+
+	if fd then
+		VKBD = fd
+		log("uinput 虚拟键盘已建立（keybd 常驻，供外部合成器直通）")
+	else
+		log("WARN uinput 建不起来: %s", tostring(err))
+	end
+	return VKBD
+end
+
+-- 新合成器上来时把按键状态清零：合成器不在的那段时间里按下的键，key-up 发不出去，
+-- 虚拟键盘上就变成"一直按着"，内核对它自动重复(val=2)，页面（按 e.repeat 过滤）
+-- 于是把之后每一次按键都当重复丢掉——同样表现为"按 OK 没反应"。
+local function vkbd_clear()
+	if not VKBD then return end
+	for c = 0, 255 do evdev.uinput_emit(VKBD, 1, c, 0) end
+	log("uinput 虚拟键盘：按键状态已清零")
+end
+
+local function external_up()
+	local now = evdev.now_ms()
+
+	vkbd_ensure()
+	if now - EXT.at < 1000 then return EXT.up end
+	EXT.at = now
+	local p = io.popen("pgrep -x cage >/dev/null 2>&1 && echo y || echo n")
+	local out = p and p:read("*a") or "n"
+
+	if p then p:close() end
+	local was = EXT.up
+
+	EXT.up = out:find("y", 1, true) ~= nil
+	if EXT.up and not was then vkbd_clear() end
+	return EXT.up
+end
+
+-- 按键直通：外部合成器在跑时把事件重放进 uinput 虚拟键盘。
+-- uinput 上没有"自动抬起"：谁发下去谁就必须发上来。控制口/脚本发键（act.lua、
+-- apps/browser.lua、测试脚本）只发 val=1 是常态，漏掉抬起后内核认为该键一直按着，
+-- 之后每一次按下都被当成重复(val=2)，页面里 e.repeat 一过滤就"按 OK 毫无反应"。
+-- 所以这里记账 + 超时兜底（下面 vkbd_release_stale），让虚拟键盘不会卡键。
+local HELD = {}
+local function passthru(t, c, v)
+	if (t ~= 1 and t ~= 2) or not VKBD or not EXT.up then return end
+	evdev.uinput_emit(VKBD, t, c, v)
+	if t == 1 then HELD[c] = (v == 0) and nil or evdev.now_ms() end
+end
+
+local function vkbd_release_stale()
+	if not VKBD then return end
+	local now = evdev.now_ms()
+	for c, at in pairs(HELD) do
+		if now - at > CFG.vkbd_hold_ms then
+			evdev.uinput_emit(VKBD, 1, c, 0)
+			HELD[c] = nil
+			log("uinput 虚拟键盘：code=%d 超时补发抬起", c)
+		end
+	end
+end
+
 local function press(name, code, val, devname)
+	if (devname == "ctl" or devname == "cli") and external_up() then
+		passthru(1, code, val)
+	end
+
 	ring_add(("%s%s"):format(name, val == 2 and "~" or ""))
 	if CFG.learn then
 		log("LEARN %s code=%s val=%s dev=%s", name, tostring(code), tostring(val), tostring(devname))
@@ -304,7 +381,13 @@ local last, last_rep = {}, {}
 
 local function scan_devices()
 	local all = evdev.scan()
-	local chosen = evdev.pick(all, CFG.devices, CFG.exclude)
+	-- 自己造的 uinput 虚拟键盘必须排除，否则 grab 到自己转发的事件 → 自激环路
+	local real = {}
+
+	for _, e in ipairs(all) do
+		if not e.name:find("keybd-", 1, true) then real[#real + 1] = e end
+	end
+	local chosen = evdev.pick(real, CFG.devices, CFG.exclude)
 	local seen = {}
 
 	for _, e in ipairs(chosen) do
@@ -337,18 +420,31 @@ local function scan_devices()
 end
 
 local function handle_ev(d, type, code, val)
-	if type ~= evdev.EV_KEY then return end
+	-- 真设备（不是控制口/命令行）才需要直通到 uinput 虚拟键盘。
+	-- 直通必须和下面的去重共用同一次判定：早先直通是在 drain 回调里无条件做的，
+	-- 一次物理按键被两个接口各报一遍时（键盘 + Consumer Control）就直通两遍，
+	-- 浏览器/阅读器里表现为"按一下跳两格"，而 desktop 那一份被去重挡掉了。
+	local direct = (d.name ~= "ctl" and d.name ~= "cli")
+
+	if type ~= evdev.EV_KEY then
+		if direct then passthru(type, code, val) end
+		return
+	end
 	local raw = keynames[code] or ("KEY_" .. code)
 	local now = evdev.now_ms()
 
 	if MODS[code] then
 		mods[code] = (val ~= 0) and true or nil
 		if val == 1 then ring_add(raw) end
+		if direct then passthru(type, code, val) end
 		return
 	end
 	if val ~= 0 and val ~= 1 and val ~= 2 then return end   -- 有的遥控报天外飞仙值
 	-- 只认按下(1)/连发(2)：抬起(0) 绝不能派发动作，否则一次按键翻两次页
-	if val == 0 then return end
+	if val == 0 then
+		if direct then passthru(type, code, 0) end
+		return
+	end
 
 	local prefix = ""
 	for _, c in ipairs({ 29, 97, 42, 54, 56, 100, 125, 126 }) do
@@ -368,6 +464,7 @@ local function handle_ev(d, type, code, val)
 		if last_rep[code] and now - last_rep[code] < CFG.repeat_ms then return end
 		last_rep[code] = now
 	end
+	if direct then passthru(type, code, val) end
 	press(name, code, val, d.name)
 end
 
@@ -537,6 +634,7 @@ if not ctl_fd then
 end
 
 scan_devices()
+vkbd_ensure()   -- 先把虚拟键盘建好，cage 启动枚举时它就已经在设备表里
 if #devs == 0 then
 	log("ERROR: 没有可用输入设备（DEVICES=%s EXCLUDE=%s）", tostring(CFG.devices), CFG.exclude)
 else
@@ -562,7 +660,10 @@ while running do
 
 		-- 设备消失（拔掉/虚拟键盘退出）时 read 报 ENODEV：立刻摘掉并马上重扫，
 		-- 否则要等 scan_ms 才发现，期间新节点上的按键会丢。
-		local _, gone = evdev.drain(d.fd, function(t, c, v) handle_ev(d, t, c, v) end)
+		local _, gone = evdev.drain(d.fd, function(t, c, v)
+			external_up()
+			handle_ev(d, t, c, v)
+		end)
 
 		if gone then
 			log("close %s (%s) 设备消失", d.path, d.name)
@@ -573,6 +674,7 @@ while running do
 		end
 	end
 	local now = evdev.now_ms()
+	vkbd_release_stale()
 	if now - last_scan >= CFG.scan_ms then
 		last_scan = now
 		scan_devices()

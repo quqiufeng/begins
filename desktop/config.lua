@@ -76,7 +76,13 @@ M.nas.enabled = M.nas.url ~= ""
 -- 桌面的起始虚拟路径；NAS 没配就退回本地 home
 M.nas.start = M.nas.enabled and ("dav:" .. M.nas.base) or nil
 
-M.start_dir = env("DESKTOP_START", M.nas.start or M.home)
+-- 桌面首页：虚拟根，不放任何文件，只放 app 图标（NAS / 本机 / 浏览器 / 微信）。
+-- 用户的要求是「NAS 目录不直接摊在首页，先点 NAS 图标才进去」，
+-- 所以起始目录是这个虚拟根，扫描时由 core/fs.lua 直接生成 app 条目。
+M.home_dir = "home:"
+M.home_label = env("DESKTOP_HOME_LABEL", "桌面")
+
+M.start_dir = env("DESKTOP_START", M.home_dir)
 
 -- 侧栏/根：NAS 永远排第一，本地只留 home 和真正的外接点
 M.roots = {}
@@ -161,6 +167,53 @@ if M.music_cmd == "" and M.music_script == "" then
 		"/usr/bin/cvlc", "/usr/bin/vlc", "/usr/bin/mpv",
 	}) or ""
 end
+-- 直出 app：不是文件，是"空转启动"的外部程序。桌面把它们当虚拟条目插在
+-- 书架最前面（图标取 assets/icons/<kind>.png，缺图自动退回文字徽章）。
+-- 之所以按"能不能找到程序"决定是否出现，是为了让同一份代码在开发机上也能跑。
+M.apps = {}
+if env("DESKTOP_APPS", "1") ~= "0" then
+	local function add_app(t) M.apps[#M.apps + 1] = t end
+	-- 文件管理入口：goto = 点开就切到这个目录，不起外部进程。
+	-- NAS 没配就不出现（否则点进去是一片「NAS 未配置」）。
+	if M.nas.start then
+		add_app({
+			name = M.nas.label or "NAS", kind = "nas", meta = "网络存储",
+			goto = M.nas.start,
+		})
+	end
+	add_app({ name = "本机", kind = "host", meta = "本机文件", goto = M.home })
+	-- 浏览器：cage 独占 DRM + chromium kiosk。这台盒子上 cog/WPE 已经不在系统里了
+	-- （dpkg 无 cog、全盘无 cog 二进制），cage+chromium 是还能跑通的直出路线。
+	if exists("/usr/bin/cage") and exists("/usr/bin/chromium") then
+		add_app({
+			name = "浏览器", kind = "browser", meta = "网页",
+			-- 首页：本地 /root/browser-home.html，没有这个文件就退回白页
+			cmd = env("DESKTOP_BROWSER_CMD",
+				"exec dbus-run-session -- cage -- chromium --kiosk --no-sandbox "
+				-- lang/translate：cage 直接起没有 locale，chromium 会判定页面是外语，
+				-- 右上角弹「翻译成英语」气泡盖住页面，一并关掉
+				.. "--lang=zh-CN --accept-lang=zh-CN,zh "
+				.. "--disable-features=Translate,TranslateUI "
+				.. "--disable-dev-shm-usage --ozone-platform=wayland "
+				-- keybd 的 browser app 要读当前 url 才能判断「回首页 / 退出」：
+				-- 只监听 127.0.0.1，不对外网暴露
+				.. "--remote-debugging-port=9222 "
+				
+				.. (exists("/root/browser-home.html")
+					and "file:///root/browser-home.html" or "about:blank")),
+		})
+	end
+	-- 微信：同样是 cage + wayland（/root/wx-run.sh 的原样参数）
+	if exists("/opt/wechat/wechat") then
+		add_app({
+			name = "微信", kind = "wechat", meta = "聊天",
+			cmd = env("DESKTOP_WECHAT_CMD",
+				"exec dbus-run-session -- cage -- /opt/wechat/wechat --no-sandbox "
+				.. "--ozone-platform=wayland --disable-dev-shm-usage "
+				.. "--window-size=1280,720 --start-maximized"),
+		})
+	end
+end
 M.launch_log = env("DESKTOP_LAUNCH_LOG", "/tmp/desktop-launch.log")
 
 -- 外部 app 的自动化口 / 状态文件：桌面把它们汇总成一份语义 state 给 agent，
@@ -237,6 +290,8 @@ end
 M.KIND_LABEL = {
 	dir = "文件夹", ebook = "电子书", video = "视频",
 	audio = "音频", image = "图片", other = "文件",
+	-- 首页 fixture：底部状态栏用它代替「文件」
+	nas = "网络存储", host = "本机", browser = "浏览器", wechat = "微信",
 }
 
 return M

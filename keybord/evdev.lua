@@ -158,4 +158,58 @@ function M.now_ms()
 	return tonumber(ts.tv_sec) * 1000 + math.floor(tonumber(ts.tv_nsec) / 1e6)
 end
 
+
+-- —— uinput 虚拟键盘 ——
+-- keybd 以 EVIOCGRAB 独占遥控器后，合成器（cage/chromium）就再也读不到按键。
+-- 这里在 /dev/uinput 上造一个虚拟键盘，把独占设备的按键原样转发回内核，
+-- 于是 keybd 既保留自己的派发能力，外部合成器也能拿到方向键。
+local UI_DEV_CREATE = 0x5501
+local UI_SET_EVBIT  = 0x40045564
+local UI_SET_KEYBIT = 0x40045565
+local UI_SET_RELBIT = 0x40045566
+local UI_DEV_SETUP  = 0x405c5503
+local O_WRONLY = 1
+
+ffi.cdef [[
+struct uinput_input_id { uint16_t bustype, vendor, product, version; };
+struct uinput_setup { struct uinput_input_id id; char name[80]; uint32_t ff_effects_max; };
+long write(int fd, const void *buf, unsigned long count);
+]]
+
+function M.uinput_create(name)
+	local fd = C.open("/dev/uinput", O_WRONLY + O_NONBLOCK)
+
+	if fd < 0 then fd = C.open("/dev/input/uinput", O_WRONLY + O_NONBLOCK) end
+	if fd < 0 then return nil, "open /dev/uinput failed" end
+	for _, t in ipairs({ 0, 1, 2, 20 }) do   -- SYN/KEY/REL/REP
+		C.ioctl(fd, UI_SET_EVBIT, ffi.cast("int", t))
+	end
+	for c = 0, 255 do C.ioctl(fd, UI_SET_KEYBIT, ffi.cast("int", c)) end
+	for _, c in ipairs({ 0, 1, 6, 8 }) do    -- REL_X/Y/HWHEEL/WHEEL
+		C.ioctl(fd, UI_SET_RELBIT, ffi.cast("int", c))
+	end
+	local us = ffi.new("struct uinput_setup")
+
+	us.id.bustype, us.id.vendor, us.id.product, us.id.version = 0x03, 0x4b42, 0x0001, 1
+	ffi.copy(us.name, name)
+	if C.ioctl(fd, UI_DEV_SETUP, us) ~= 0 then
+		C.close(fd)
+		return nil, "UI_DEV_SETUP failed"
+	end
+	if C.ioctl(fd, UI_DEV_CREATE) ~= 0 then
+		C.close(fd)
+		return nil, "UI_DEV_CREATE failed"
+	end
+	return fd
+end
+
+local ubuf = ffi.new("struct input_event[2]")
+
+function M.uinput_emit(fd, t, code, value)
+	if not fd or fd < 0 then return end
+	ubuf[0].type, ubuf[0].code, ubuf[0].value = t, code, value
+	ubuf[1].type, ubuf[1].code, ubuf[1].value = 0, 0, 0
+	C.write(fd, ubuf, M.SIZE * 2)
+end
+
 return M
