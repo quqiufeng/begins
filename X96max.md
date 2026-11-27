@@ -1851,6 +1851,8 @@ NAS 镜像备份  dav://192.168.1.53:5005/sata11-18072858035/x96max/
                基础镜像只在 amlogic-s9xxx-armbian/build/output/images/ 一处
                （`~` 下无副本；`~/x96-backup/` 只剩 usb-stick 快照，见 §19.6.3）
 设备          root@192.168.1.121（DHCP，可能变化；ssh 用 IP）
+只换内核      §23：编 Image/dtb/modules → scp 到盒子 /tmp → 盒上 depmod+mkinitramfs+mkimage → 重启
+              不动 rootfs、不做镜像、不写卡；/boot 是 mmcblk1p1，uEnv.txt 加载 zImage + uInitrd + dtb
 ```
 
 ---
@@ -2553,7 +2555,12 @@ rootfs 部分相同——想再瘦要动 §18 的包清单，而不是内核。
 | `initrd/uInitrd/uEnv.txt.bak.*` | 66M | 打补丁前的临时回滚副本，可重建 |
 
 **保留**：`7.2.12-trim`（裁剪源码树，解压不出来）、`kbuild-trim`、`pkgs/`、`recovery/orig/`、
-`recovery/*.img.gz` 两个成品、`amlogic-s9xxx-armbian`（基础镜像唯一副本）、`base-own.img`、`boot-good/bad`。
+`recovery/*.img.gz` 两个成品、`amlogic-s9xxx-armbian`（基础镜像唯一副本）、`base-own.img`。
+
+> 2026-11-27 23:55 又清一轮（`/x96-build` 8.3G → 7.8G）：删 `boot-bad`(107M)、`boot-good`(104M)、
+> 老内核 `7.2.12-x96`（非 trim）的 `initrd.img`/`uInitrd`/`vmlinuz` 与 `base-boot-backup` 里的整套
+> （后者只留 `-trim` 一套并修好 `Image`/`uInitrd` 符号链接，113M → 49M）。
+> 现役只剩 `7.2.12-x96-trim`：源树 `7.2.12-trim` + 增量树 `kbuild-trim` 在，随时可重编。
 还能再砍：`amlogic-s9xxx-armbian` 里的 ophub 源码 3.3G（先把基础镜像挪出来）、`base-own.img` 1.2G（`mkbase.sh` 可重造）。
 
 **第二轮（23:44，`/tmp` 3.0G×2 与错压的旧构建）**：删 `/tmp/x96-trim-autoinstall.img`（3.0G，21:52 旧构建解压体，
@@ -2602,6 +2609,8 @@ sudo ./x96max/patch-bootargs.sh -r rootdelay=15        # 清掉历史遗留（�
 
 > 不要再手工 `dd`：见 §10.1.3（自动挂载把日志回放出的垃圾固化进卡）与 §10.1.4（裸盘 `cmp` 不是判据）。
 > 完整流程、手工等价命令、失败判定表在 **§10.1**。
+>
+> **盒子已经在跑、只是换了内核 → 别写卡，走 §23**（scp Image/dtb/modules，盒上重做 uInitrd，3 分钟）。
 
 盒子从 U 盘/SD 启动后确认：
 
@@ -3088,4 +3097,166 @@ systemctl disable desktop; systemctl stop desktop
 
 ---
 
-*文档版本: 2.2 · 更新: 2026-11-18 · 设备: X96 Max / S905X2*
+## 23. 只换内核：单独编译 → 直接装进盒子（不重做镜像）
+
+一句话：**改的是内核，就别碰 rootfs。** `Image` + `dtb` + `modules` 三样 SCP 上去，
+在盒子**本机**重做 initrd/uInitrd，重启即可。**装这一段实测约 2 分钟**（盒上 `mkinitramfs` 14 秒 + 重启到 ssh 回来 35 秒 + 传输校验），
+编译时间另看 `$OUT/.build-sec`（无改动时增量复查 8 秒即过）。2026-11-27 23:50 实测走通一遍（含重启回读）。
+
+### 23.1 判据：这套流程管的是"盒子已在跑、只换内核"
+
+| 要走 §23 | 要走 §19.6 / §10 |
+|---|---|
+| 已有能启动的盒子（eMMC 或 U 盘），只改内核/配置/dtb/模块 | 新卡、换系统、rootfs 裁剪、首启自动装 eMMC |
+| 判据：`ssh root@<盒子IP> uname -r` 有输出且 `/lib/modules/<KNAME>` 在 | 判据：`lsblk` 里没有可用的 rootfs 分区 |
+
+盒子现役（2026-11-27 核对）：eMMC 启动，`/boot` = `mmcblk1p1`（vfat 510M），`/` = `mmcblk1p2`（ext4 56.9G），
+`uEnv.txt` 的 `LINUX=/zImage`、`INITRD=/uInitrd`、`FDT=/dtb/amlogic/meson-g12a-x96-max.dtb`。
+
+> **`/boot/vmlinuz-7.2.12-x96-trim` 和 `/boot/initrd.img-*` 不是启动用的那份** —— 它们是 ophub 打包留下的
+> Debian 风格副本（vmlinuz 还是 4 月 14 日的旧文件）。u-boot 只认 `uEnv.txt` 里那三个路径，
+> **改错文件等于没改**：必须动 `zImage` / `uInitrd` / `dtb/amlogic/*.dtb`。
+
+### 23.2 主机：只编内核（不出 initrd、不打包、不做镜像）
+
+```bash
+cd /home/quqiufeng/kernel
+./x96max/trim/build-kernel.sh          # 裁剪套（现役）：config-7.2.12-x96-trim → kbuild-trim
+# ./x96max/full/build-kernel.sh        # 全量套：另一个产物树，两套互不覆盖
+```
+
+产物（`/x96-build/kbuild-trim`，本次实测值）：
+
+| 产物 | 大小 | md5 |
+|---|---|---|
+| `arch/arm64/boot/Image` | 32512512 | `fa0a45cd93293add25b70aeb3a64539a` |
+| `arch/arm64/boot/dts/amlogic/meson-g12a-x96-max.dtb` | 51123 | `bc5d038e84a8faacd6271b812f8b17cf` |
+| `modules/lib/modules/7.2.12-x96-trim/` | 16M / 155 个 `.ko` | — |
+
+编完先自查 LOCALVERSION 与模块目录名对得上（对不上，装上就起不来，见 23.6）：
+
+```bash
+grep '^CONFIG_LOCALVERSION=' /x96-build/kbuild-trim/.config     # "-x96-trim"
+basename /x96-build/kbuild-trim/modules/lib/modules/*           # 7.2.12-x96-trim
+```
+
+### 23.3 主机：打包三样并传到盒子 `/tmp`
+
+```bash
+OUT=/x96-build/kbuild-trim
+KNAME=7.2.12-x96-trim
+BOX=root@192.168.1.121
+
+tar -czf /tmp/mod-$KNAME.tar.gz -C "$OUT/modules/lib/modules" $KNAME      # 4.0M（155 个 .ko）
+scp /tmp/mod-$KNAME.tar.gz \
+    "$OUT/arch/arm64/boot/Image" \
+    "$OUT/arch/arm64/boot/dts/amlogic/meson-g12a-x96-max.dtb" \
+    $BOX:/tmp/
+```
+
+### 23.4 盒子：备份 → 覆盖 → depmod → 重做 initrd/uInitrd
+
+> initrd **不需要主机 qemu chroot**（§6 / §19.4 那是给镜像准备时用的离线做法）。
+> 盒子自己就是 arm64，`mkinitramfs`/`update-initramfs`/`mkimage`/`depmod`/`cpio`/`gzip` 全都有
+> （`u-boot-tools 2025.01-3+deb13u1`、`initramfs-tools 0.148.4`），直接在本机生成，14 秒。
+
+```bash
+KNAME=7.2.12-x96-trim
+S=$(date +%Y%m%d-%H%M%S)
+
+# 1) 备份：boot 里 5 个 + dtb 1 个
+cd /boot
+for f in zImage uInitrd uInitrd-$KNAME initrd.img-$KNAME vmlinuz-$KNAME; do
+  [ -f $f ] && cp -a $f $f.bak-inst-$S
+done
+cp -a dtb/amlogic/meson-g12a-x96-max.dtb dtb/amlogic/meson-g12a-x96-max.dtb.bak-inst-$S
+
+# 2) 模块（整目录覆盖，不要只解新文件）
+tar -xzf /tmp/mod-$KNAME.tar.gz -C /lib/modules/
+find /lib/modules/$KNAME -name '*.ko*' | wc -l        # 期望 155
+
+# 3) 内核与 dtb：uEnv.txt 里 LINUX=/zImage、FDT=/dtb/amlogic/...
+cp /tmp/Image /boot/zImage
+cp /tmp/meson-g12a-x96-max.dtb /boot/dtb/amlogic/
+
+# 4) 依赖表 + initrd
+depmod -a $KNAME
+mkinitramfs -o /boot/initrd.img-$KNAME $KNAME
+# 盒子没有 zstd → 会打 "W: No zstd ... using gzip"，是提示不是错误；压缩方式随之变成 gzip
+
+# 5) uInitrd：两份都要换（uEnv.txt 加载 /uInitrd，另一份是 ophub 命名习惯的副本）
+mkimage -A arm64 -O linux -T ramdisk -C gzip -n uInitrd \
+  -d /boot/initrd.img-$KNAME /boot/uInitrd
+cp /boot/uInitrd /boot/uInitrd-$KNAME
+```
+
+判据（三条都成立才算装上）：
+
+```bash
+md5sum /boot/zImage                                                            # 应等于主机 Image 的 md5
+md5sum /boot/dtb/amlogic/meson-g12a-x96-max.dtb                                # 应等于主机 dtb 的 md5
+ls -l /boot/zImage /boot/uInitrd /boot/uInitrd-$KNAME                          # uInitrd 两份字节数一致
+```
+
+### 23.5 重启与验收（本次实测）
+
+```bash
+sync; systemctl reboot
+# 约 35 秒后 ssh 能进（本次 35s）
+ssh root@192.168.1.121 'uname -a; cat /proc/version; uptime -p; systemctl is-active desktop console-wall'
+```
+
+```text
+Linux x96src 7.2.12-x96-trim #13 SMP PREEMPT_DYNAMIC Fri Nov 27 23:27:09 CST 2026 aarch64 GNU/Linux
+up 0 minutes
+desktop: active   console-wall: active
+eth0 UP 192.168.1.121/24
+
+# dmesg（err 级）里只有这些陈年噪声，都不是本次引入的：
+#   meson-drm ff900000.vpu: DSI transceiver device is disabled        ← 正常（不用 DSI）
+#   Failed to find module 'autofs4'                                    ← config 里就是 "# CONFIG_AUTOFS_FS is not set"（第 7254 行）
+#   panfrost ffe40000.gpu: -ENODEV: _opp_set_regulators: no regulator (mali) ← DT 没给 mali 调压器，一直如此，不影响显示
+```
+
+> **版本名没变，`uname -r` 认不出换了没有** —— 同 `KNAME` 覆盖安装时唯一变的是 build 时间戳
+> （`#13 SMP PREEMPT_DYNAMIC Fri Nov 27 23:27:09 CST 2026`）。要确认到底换没换，
+> 对 `md5sum /boot/zImage` 与主机 `Image` 的 md5，或看 `/proc/version` 里的编译时间。
+
+### 23.6 回滚
+
+> **2026-11-27 23:55 起这些备份已不存在**：新内核跑稳后清了 `/boot` 里全部 `*.bak-inst-*`
+> 与 `*.bak-pre-vdec-1127`、7 个 `uEnv.txt.bak-*`（323M → 120M，24%）。
+> 现在要回退只能**重编同版本**（`kbuild-trim` 源树都在）或从 `/x96-build/base-boot-backup`
+> （只留 `-trim` 一套，49M）取件。下面的命令是**当时**的写法，留着给以后打备份时用。
+
+一条命令回到上一版（备份是同一时刻的全套，别跨版本混用）：
+
+```bash
+S=20261127-235032          # 上一步打的时间戳，/boot 里 ls *.bak-inst-* 能看到
+cd /boot
+for f in zImage uInitrd uInitrd-7.2.12-x96-trim initrd.img-7.2.12-x96-trim vmlinuz-7.2.12-x96-trim; do
+  [ -f $f.bak-inst-$S ] && cp -a $f.bak-inst-$S $f
+done
+cp -a dtb/amlogic/meson-g12a-x96-max.dtb.bak-inst-$S dtb/amlogic/meson-g12a-x96-max.dtb
+sync; systemctl reboot
+```
+
+模块目录要回滚就重解旧 tar（本流程没保留旧模块包时，只能重编同版本或从 §19.5 的四件套里取）。
+
+### 23.7 这段流程的坑
+
+1. **改错文件**：动 `vmlinuz-*` / `initrd.img-*` 不生效（u-boot 读 `uEnv.txt` 的 `LINUX=/zImage`）。详见 23.1 的提示。
+2. **`/boot` 只有 510M**：一套备份 ≈ 100M（zImage 32M + vmlinuz 32M + initrd 12.7M + uInitrd 12.7M×2 + dtb）。
+   本次装完从 225M 涨到 323M，只剩 188M（清理后回到 120M/391M 可用）。**只留一代备份**，装第二轮前先删上一轮 `.bak-inst-*`，
+   否则 `/boot` 满了以后 `cp` 失败会留下半截 `zImage`。
+3. **模块目录名必须等于 `CONFIG_LOCALVERSION` 拼出来的 KNAME**。名不对 → `depmod` 不报错，
+   但开机后模块全加载失败（网卡/声卡/文件系统驱动全没）。
+4. **`mkinitramfs` 与 `mkimage` 的压缩参数要一致**（这里都是 gzip）。盒子没有 zstd，别手写 `-C zstd`。
+5. **`initrd.img-*` 里只有 7 个 `.ko`**，其余 148 个在 `/lib/modules` 里由 depmod 索引 —— 所以
+   **`/lib/modules` 必须先解完再 `mkinitramfs`**，顺序反了 initrd 里就是旧依赖表。
+6. **不要在主机上 `cp Image /boot/zImage` 式的远程强写**（vfat 不能原子替换，断网/断电会得到半截内核）。
+   要么像 23.3 那样先落 `/tmp` 再本机 `cp`，要么 `sync` 后立刻校验 md5。
+
+---
+
+*文档版本: 2.3 · 更新: 2026-11-27 · 设备: X96 Max / S905X2*
