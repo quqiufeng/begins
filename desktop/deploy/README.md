@@ -94,7 +94,7 @@ keybd：
 | `desktop/assets/browser-home.html` | `/root/browser-home.html`（浏览器首页卡片，配置里是绝对路径 `file:///root/browser-home.html`） |
 | `desktop/tools/cdp.py` | `/root/cdp.py`（调 9222 的 CDP 小工具；页面线程卡死时 `Runtime.evaluate` 会超时，判活先看 `curl 127.0.0.1:9222/json/list`） |
 | `desktop/deploy/desktop.service` | `/etc/systemd/system/desktop.service`（含 `XDG_RUNTIME_DIR=/run/user/0`、`LIBSEAT_BACKEND=seatd`，cage/sway 缺前者立即 exit 1） |
-| `desktop/wechat.conf` | `/opt/desktop/wechat.conf`（微信专用 **sway** 配置：2560x1440 + 壁纸 `bg … fill` + 全窗口 floating + `exec wx-center.py` + 微信退出即 `swaymsg exit`） |
+| `desktop/wechat.conf` | `/opt/desktop/wechat.conf`（微信专用 **sway** 配置：**不写死 `mode`**，用 output 的 preferred（123=2560x1440 / 121=3840x2160）+ 壁纸 `bg … fill` + 全窗口 floating + `exec wx-center.py` + 微信退出即 `swaymsg exit`） |
 | `desktop/bin/wx-center.py` | `/opt/desktop/bin/wx-center.py`（`chmod +x`；等 `sway-ipc` socket，`swaymsg` 把微信 resize 1280×720 并居中。只用 python3 标准库） |
 | `desktop/assets/wallpaper.png` | `/opt/desktop/assets/wallpaper.png`（swaybg 的背景图，6.0MB。**主机**上用 `desktop/tools/bgra2png.py` 从同目录 `wallpaper.bgra` 转，盒上没 PIL） |
 | `keybord/*.lua`、`keybord/apps/`、`keybord/keys/`、`keybord/maps/` | `/opt/keybord/` 同名 |
@@ -125,6 +125,19 @@ apt-get install -y -q sway
 `desktop/config.lua` 的判断是 `exists("/opt/wechat/wechat") and exists("/usr/bin/sway")`：
 **有 sway 走 sway，没有就静默回退 `cage` 老路径**（不报错、不提示，只是窗口又贴回左上角、没有壁纸）。
 所以「微信窗口居中 + 壁纸」这套失效时，第一件事是查 `which sway` 与 `dpkg -l sway`。
+
+装完必须确认三件事，缺一个 sway 起不来（微信黑屏/直接掉回桌面）：
+
+```bash
+apt-get install -y -q sway
+systemctl is-active seatd || systemctl start seatd     # enabled ≠ active！装完且 enabled 也可能没跑
+systemctl is-enabled seatd                              # 要 enabled，否则重启后又没了
+systemctl show -p Environment desktop | tr ' ' '\n' | grep -E 'XDG_RUNTIME_DIR|LIBSEAT_BACKEND'
+```
+
+- `seatd` 没跑 → sway 拿不到 DRM master，日志里 `wl_display` 直接失败；
+- 缺 `XDG_RUNTIME_DIR=/run/user/0` → sway/libseat 立刻退（`desktop.service` 里已带，改完记得 `daemon-reload`）；
+- 121（电视 3840x2160）上位的就是这条：seatd 装了但没 active，只报 `sway: cannot open display` 之类，`desktop.log` 里微信那条 `stopped:user`。修完 `wx-center.py` 按 4K 算中心 `1280,720`，和 123 的 `640,360` 是同一套数学。
 
 回退：`apt-get remove --purge sway swaybg`，`cage 0.2.0-2` 仍在机器上，配置不用动。
 完整包清单/落点/坑见 `../../chrome.md` §16.3.1。
