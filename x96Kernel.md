@@ -403,10 +403,18 @@ ssh root@192.168.1.121 'lsmod | grep -c vdec; dmesg | grep -i meson_vdec; v4l2-c
 md5 `ced8780025c8c5c3eb0b9a13abe0225f`，`lsmod | grep -c vdec` = 3，vdec 仍是模块）。
 所以上面 ② 的运行时证据仍然缺，刷上才算完。
 
-> **误判记录（2026-11-27）**：我曾写「盒子 121 离线（`ping` 不通）」——这是假的。
-> 本机**根本没装 `ping`**（`bash: ping: 未找到命令`，退出码 127），我把「命令不存在」
-> 读成了「主机不通」。判断盒子死活用 `ssh -o ConnectTimeout=5 root@192.168.1.121 'uname -r'`，
-> 或用 `ip neigh` / `timeout 3 bash -c 'cat </dev/tcp/192.168.1.121/22'`，别依赖 `ping`。
+> **误判记录（2026-11-27）**：我曾写「盒子 121 离线（`ping` 不通）」——这是假的，121 一直通。
+> 根因是：本机没有 `iputils-ping` 包，`ping` 这个名字在 PATH 里不存在（`127`），
+> 唯一能用的是 busybox 的 applet，而且**打 raw socket 需要 root**：
+>
+> ```bash
+> $ ping -c 2 192.168.1.121                 # bash: ping: 未找到命令  (127) ← 我只看这一行就下了结论
+> $ sudo -n busybox ping -c 2 192.168.1.121 # 2 packets received, 0% loss, 0.53 ms  ← 实际是通的
+> ```
+>
+> 教训：`127` 只说明「命令没找到」，**不携带任何网络状态**。探活至少做两件事：
+> `ip neigh show 192.168.1.121` + `ssh -o ConnectTimeout=5 root@192.168.1.121 'uname -r'`；
+> 想用 ping 就写 `sudo -n busybox ping`，别用裸 `ping`。
 
 ---
 

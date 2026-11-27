@@ -2,7 +2,8 @@
 
 > 主用机：**123 `x98h`**，全志 H618，aarch64，内核 `7.2.12-x98`，HDMI 2560×1440。
 > 121 `x96src`（Amlogic S905X2，内核 `7.2.12-x96-trim`）**在线可 ssh**（`root@192.168.1.121`）；
-> 之前「不可达 / No route to host」是误判——本机没有 `ping` 命令，127 被当成了不通。
+> 之前「不可达 / No route to host」是误判——本机没装 `iputils-ping`，裸 `ping` 报 127 被当成了不通；
+> 实际 `sudo -n busybox ping -c2 192.168.1.121` 是 0% 丢包。
 > 那台机器上验证过的分辨率/崩溃差异仍记在 `chrome.md` §15，别把两条机型的结论混着引用。
 > 具体命令细节分三份文档：构建打包 `arm64_build.md`，业务代码写法 `reader_dev.md`，
 > 浏览器/微信/内核侧 `chrome.md`，硬件与内核 `x98h.md`。
