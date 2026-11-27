@@ -13,7 +13,7 @@
 | 存储 | `sda` 29.3 G（U 盘：`BOOT` 511M vfat + `ROOTFS` 28.8G ext4，**当前系统在此**）；`mmcblk1` eMMC 58.2 G（`BOOT_EMMC` + `ROOTFS_EMMC`，闲置）；`mmcblk1boot0/boot1` 各 4 M | 需要 `CONFIG_MMC_MESON_GX`、USB 存储、ext4/vfat；eMMC 在用故保留 MMC 栈 |
 | GPU | Mali（`panfrost` + `gpu_sched` 已加载），G12A 对应 Mali-G31 MP2 | 保留 `DRM_PANFROST`，其余 GPU 驱动全关 |
 | 显示 | `meson-drm`（`vpu@ff900000`），`card0-HDMI-A-1` = connected，模式 1920x1080 | 保留 `DRM_MESON`；HDMI 音频需 `SND_SOC_MESON_G12A_TOHDMITX` |
-| 视频硬解 | `meson_vdec` 已加载（H.264/H.265/VP9） | 保留 `VIDEO_MESON_VDEC` + `VIDEO_DEV` 最小集；tuner/DVB 全关 |
+| 视频硬解 | `meson_vdec`（H.264/H.265/VP9）；**2026-11-27 起编进内核 `=y`，不再是模块** | 保留 `VIDEO_MESON_VDEC=y` + `V4L2_MEM2MEM_DEV=y` + `VIDEOBUF2_DMA_CONTIG=y` + `VIDEO_DEV` 最小集；tuner/DVB 全关 |
 | 有线网 | `eth0` 192.168.1.121/24，含公网 IPv6 `240e:390:aaa:a60::b/128` | 保留 `STMMAC_ETH`/`DWMAC_MESON`；IPv6 在用，勿关 |
 | 无线 | RTL8822BS，SDIO 接口（`rtw88_8822bs` + `rtw88_sdio` + `rtw88_core` + `mac80211`） | 保留 `RTW88` 一系 + `CFG80211`/`MAC80211`；其余 wifi 厂商全关 |
 | 蓝牙 | 芯片有（8822BS 组合），驱动未加载 | 当前未用，可裁；若日后要用需补 `BT_HCIUART`/`RTW88` bt 支持 |

@@ -7,7 +7,7 @@
 
 | | 121 x96max | 123 x98h |
 |---|---|---|
-| 内核解码驱动 | `meson-vdec` (Amlogic) | `sunxi-cedrus` |
+| 内核解码驱动 | `meson-vdec` (Amlogic)，7.2.12-x96-trim 起内置 `=y` | `sunxi-cedrus` |
 | `device_caps` | **Multiplanar** | 单平面 |
 | 接受的 V4L2 buf type | `*_MPLANE`（`NV12M`） | `VIDEO_CAPTURE/OUTPUT`（`NV12`） |
 | request/stateless API | 否 | 是（`supports_requests=true`） |

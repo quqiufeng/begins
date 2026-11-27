@@ -91,7 +91,7 @@ mkdir -p /x96-build/7.2.12-full && tar xf /opt/linux/src/linux-7.2.12.tar.xz \
 | netconsole 日志 | `/x96-build/logs/netconsole.log` | 92636 B / 1164 行 |
 | **盒子 /boot** | `/boot/zImage`、`/boot/uEnv.txt`、`/boot/dtb/` | 启动三件套 |
 | **盒子 模块目录** | `/lib/modules/7.2.12-x96-trim/` | 必须与 `CONFIG_LOCALVERSION="-x96-trim"` 对上 |
-| **vdec 驱动备份** | `meson-vdec/` | HEVC 8bit 修复后的整套 vdec 目录副本（源码 + `.ko`），见 §3.5 |
+| **vdec 驱动备份** | `meson-vdec/` | HEVC 8bit 修复后的整套 vdec 目录副本（源码 + `.ko`）；`=m` 时代存档，vdec 现已内置，见 §3.5/§3.6 |
 | **播放脚本 / 盒子配置** | `tvcast.sh`、`tvplay.sh`、`box-mpv.conf`、`box-stats.lua`（仓库根快照）= 运行位置 `~/bin/` 同名文件 | 高清播放全流程见 [`docs/playback.md`](docs/playback.md) |
 
 关键约束：**`CONFIG_LOCALVERSION` 与模块目录名、`uname -r` 三者必须一致**。
@@ -99,8 +99,11 @@ trim 套是 `-x96-trim` → `7.2.12-x96-trim`；full 套是 `-x96` → `7.2.12-x
 
 config 只有一份（**用哪个 config 就写哪个 config**，不存在第二份要手动同步的副本）：
 `x96max/kernel/config-7.2.12-x96-trim` → 脚本拷到 `/x96-build/kbuild-trim/.config` 编译，
-归档 `configs/config-7.2.12-x96-trim-live-20261116` 供回溯。三者实测同 md5
-`a4a2e8218137f3f9356fcd909dbe2250`（sha256 前 12 位 `e8e75c67d463`）。
+归档 `configs/config-7.2.12-x96-trim-live-20261127` 供回溯。三者实测同 md5
+`475d4959479e735f7975b153f8b4a390`（sha256 前 12 位 `221af358f4b6`）。
+
+> 上一版 md5 是 `a4a2e8218137f3f9356fcd909dbe2250`（sha256 `e8e75c67d463`），归档为
+> `...-live-20261116`，差别只有 vdec 内置那三行，见 §3.6。
 
 ---
 
@@ -128,11 +131,14 @@ make O=$O ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- amlogic/meson-g12a-x96-max
 产物：
 
 ```
-/x96-build/kbuild-trim/arch/arm64/boot/Image        32444928 B
+/x96-build/kbuild-trim/arch/arm64/boot/Image        32512512 B   (md5 fa0a45cd93293add25b70aeb3a64539a)
 /x96-build/kbuild-trim/arch/arm64/boot/dts/amlogic/meson-g12a-x96-max.dtb   51123 B
-/x96-build/kbuild-trim/System.map                    6411578 B
-/x96-build/kbuild-trim/drivers/staging/media/meson/vdec/meson-vdec.ko
+/x96-build/kbuild-trim/System.map
+/x96-build/kbuild-trim/vmlinux                       41576832 B
 ```
+
+> **没有 `meson-vdec.ko` 了**：vdec 自 2026-11-27 起编进内核（`=y`），输出树里不再产
+> `.ko`。要确认它真进去了，别找文件，查符号（§3.6）。
 
 > 注意 `Image`（未压缩的 arm64 镜像），不是 `zImage`。盒子 u-boot 侧文件名仍叫 `zImage`，直接覆盖即可，它认的是裸 Image。
 
@@ -151,21 +157,24 @@ X96_SKIP_AUDIT=1 ./x96max/build-kernel.sh --trim   # 跳过裁剪审计 audit_st
 
 脚本**每次都会 `cp $CFG $OUT/.config`**，所以 `$CFG` 就是唯一权威源：改配置请改
 `x96max/kernel/config-7.2.12-x96-trim`，不要只手改 `$OUT/.config`（下次跑脚本就被盖回去）。
-这三份实测同 md5（`a4a2e8218137f3f9356fcd909dbe2250` / sha256 前 12 位 `e8e75c67d463`）：
+这三份实测同 md5（`475d4959479e735f7975b153f8b4a390` / sha256 前 12 位 `221af358f4b6`）：
 
 ```
-x96max/kernel/config-7.2.12-x96-trim        ← 脚本入口（CFG）
-/x96-build/kbuild-trim/.config             ← 编译实际读的那份
-configs/config-7.2.12-x96-trim-live-20261116 ← 归档（脚本自动比对，一致才不告警）
+x96max/kernel/config-7.2.12-x96-trim          ← 脚本入口（CFG）
+/x96-build/kbuild-trim/.config               ← 编译实际读的那份
+configs/config-7.2.12-x96-trim-live-20261127 ← 归档（脚本自动比对，一致才不告警）
 ```
 
 `-n` 自检应打印这三行：
 
 ```
-  归档 config-7.2.12-x96-trim-live-20261116 一致（e8e75c67d463）
-  .config 与上次一致（e8e75c67d463）：增量编译
+  归档 config-7.2.12-x96-trim-live-20261127 一致（221af358f4b6）
+  .config 与上次一致（221af358f4b6）：增量编译
   dry-run：不写 /x96-build/kbuild-trim/.config、不编译。
 ```
+
+> 归档 glob 是 `ls ... | tail -1`，所以留着的 `...-live-20261116`（旧 md5 `a4a2e82`）
+> 仍在新归档旁边不影响；删了它也能跑。
 
 脚本退出码与耗时落在 `$OUT/.build-rc`、`$OUT/.build-sec`，日志落在
 `/x96-build/logs/build-<MODE>-<时间戳>.log`。当前 kbuild-trim 记录：rc=0，8 秒（纯复用，无改动时的最短耗时）。
@@ -241,7 +250,7 @@ cd /x96-build/kbuild-trim/_install && tar cf - lib/modules/7.2.12-x96-trim \
   | ssh root@192.168.1.121 'cd / && tar xf - && depmod -a 7.2.12-x96-trim'
 ```
 
-只换一个驱动的快路（调驱动时 99% 用这个，秒级）：
+只换一个驱动的快路（调驱动时 99% 用这个，秒级）——**注意：vdec 已内置（§3.6），下面这条对它无效**，改 vdec 只能重编 Image 重刷：
 
 ```bash
 scp /x96-build/kbuild-trim/drivers/staging/media/meson/vdec/meson-vdec.ko \
@@ -272,7 +281,12 @@ APPEND=root=UUID=6deadcc9-47f7-4648-9d78-d365caaaf1e4 rootflags=data=writeback r
 **坑**：本内核 `netconsole_parser_cmdline` 要求 target IP 后面必须跟 `/`，否则报
 `couldn't parse config` 静默不生效。
 
-### 3.5 驱动副本 `meson-vdec/`（HEVC 8bit 修复版）
+### 3.5 驱动副本 `meson-vdec/`（HEVC 8bit 修复版，`=m` 时代的存档）
+
+> ⚠️ **这一节是历史路线的存档**。2026-11-27 起 vdec 编进内核（`=y`），盒子
+> `/lib/modules/7.2.12-x96-trim/` 里不再有 `meson-vdec.ko`，本节 a) 的 scp 快路失效。
+> 现在的做法看 §3.6。这里的源码/`.ko` 仍值得留：它是「改完代码、还没重编内核」时
+> 用来对照 diff 的参照物。
 
 `/home/quqiufeng/kernel/meson-vdec/` 是源码树驱动目录的原样副本：
 
@@ -334,6 +348,60 @@ ssh root@192.168.1.121 /tmp/v4l2hevc-aarch64 /tmp/test720.265
 
 ---
 
+### 3.6 vdec 编进内核（`=y`，2026-11-27 起）
+
+**为什么改**：vdec 一直是 `=m`，改一行代码就得 `scp .ko` + `rmmod/modprobe`。盒子
+重启后模块目录与内核版本一旦错位就加载不上，而且 `=m` 的 `.ko` 与内置走的是两条编译
+路径（`M=... modules` vs 主构建），改完「看着编过了、实际 Image 里没变」这种错很难发现。
+
+**改了 config 三行**（`x96max/kernel/config-7.2.12-x96-trim`，diff 就这三处）：
+
+```diff
+-CONFIG_V4L2_MEM2MEM_DEV=m
++CONFIG_V4L2_MEM2MEM_DEV=y
+-CONFIG_VIDEOBUF2_DMA_CONTIG=m
++CONFIG_VIDEOBUF2_DMA_CONTIG=y
+-CONFIG_VIDEO_MESON_VDEC=m
++CONFIG_VIDEO_MESON_VDEC=y
+```
+
+`V4L2_MEM2MEM_DEV` / `VIDEOBUF2_DMA_CONTIG` 是 vdec 的依赖，必须跟着一起变 y
+（`olddefconfig` 不会替你翻，得手动改）。
+
+**编完的形态变了**：
+
+| | `=m`（旧） | `=y`（现在） |
+|---|---|---|
+| 输出树产物 | `.../meson/vdec/meson-vdec.ko` 142000 B | 无 `.ko`，全部在 `vmlinux` 里 |
+| 盒上加载 | `modprobe meson-vdec` / `lsmod` 可见 | 开机即在内核，`lsmod` **看不到 vdec** |
+| 驱动名 | `meson-vdec` | `meson_vdec`（同名，但不是模块） |
+| 改代码代价 | 重编单目录模块（秒级） | 必须 `make Image` + 重刷 `/boot/zImage` |
+| `/dev/video0` | 依赖模块在位 | 只要 vdec 编进去就有 |
+
+**怎么证明它真在内核里**（不要用 `lsmod`，也不要用「文件存在」判断）：
+
+```bash
+# ① 字符串证据：内置才会把 dev_dbg 消息编进 vmlinux/Image
+strings /x96-build/kbuild-trim/vmlinux | grep 'max_refs %u > HW limit'   # → 1 行
+strings /x96-build/kbuild-trim/vmlinux | grep 'meson-video-decoder'     # → V4L2 驱动名
+
+# ② 盒子侧（起得来才有意义）
+ssh root@192.168.1.121 'lsmod | grep -c vdec; dmesg | grep -i meson_vdec; v4l2-ctl --list-devices'
+#    期望：lsmod 计数 0（内置不占模块表），dmesg/设备节点仍在
+```
+
+**踩过的坑**：`cp -a` 保留 mtime。把补丁过的 `codec_h264.c` 用 `cp -a` 盖回源码树后，
+新文件 mtime 比 `.o` 旧，`make` 判定「不用重编」直接跳过 —— 编出来的 Image 还是旧的，
+但 `make` 照样 `RC=0`。所以改完源码要用 `cp`（不带 `-a`）或 `touch` 一下，并且**只认
+新 Image 的 md5 / 时间戳**，别信编译器说没事。
+
+本次结果：`Image` 32512512 B，md5 `fa0a45cd93293add25b70aeb3a64539a`，
+`build-clamp-builtin-1127.log` / `build-clamp2-1127.log` 均 `RC=0`、vdec 相关 0 warning，
+`modules_install` 也 `RC=0`。**盒子 121 当时离线（`ping` 不通），运行时验证未做**，
+刷上后要按上面 ② 补一遍。
+
+---
+
 ## 4. 验证新内核真的跑起来了
 
 ```bash
@@ -341,7 +409,9 @@ ssh root@192.168.1.121 'uname -r; uname -v; md5sum /boot/zImage; ls /lib/modules
 md5sum /x96-build/kbuild-trim/arch/arm64/boot/Image      # 两边 md5 必须相等
 ```
 
-本次实测结果（就是「跑通了」的硬证据）：
+`uname -r` 与镜像 md5 两边必须相等，这是唯一可信的判据（`make RC=0` 不算）。
+
+历史实测结果（`=m` 时代的 `#5`）：
 
 | 项 | 盒子 | 本机产物 | |
 |---|---|---|---|
@@ -350,6 +420,15 @@ md5sum /x96-build/kbuild-trim/arch/arm64/boot/Image      # 两边 md5 必须相�
 | 镜像 md5 | `5b2f811d278edf3a7252ea84c3d486f8` | `5b2f811d...` 同大小 32444928 | ✅ |
 | 模块目录 | `/lib/modules/7.2.12-x96-trim` 就位 | `LOCALVERSION=-x96-trim` | ✅ |
 | 稳定性 | 多次 reboot（含 panic 自动复位）后仍正常起、ssh/网络可用 | — | ✅ |
+
+vdec 内置那版（2026-11-27）：
+
+| 项 | 本机产物 | 盒子 |
+|---|---|---|
+| `Image` | 32512512 B / md5 `fa0a45cd93293add25b70aeb3a64539a` | 待刷（121 离线，未验） |
+| `vmlinux` | 41576832 B，含 `max_refs %u > HW limit` 串 | — |
+| `.ko` | 输出树已无 `meson-vdec.ko` | `/lib/modules/.../vdec/` 该目录应只剩空壳或不存在 |
+| 编译 | `build-clamp-builtin-1127.log` / `build-clamp2-1127.log` `RC=0`，0 warning | — |
 
 ---
 
