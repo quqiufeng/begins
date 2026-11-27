@@ -2558,9 +2558,10 @@ rootfs 部分相同——想再瘦要动 §18 的包清单，而不是内核。
 `recovery/*.img.gz` 两个成品、`amlogic-s9xxx-armbian`（基础镜像唯一副本）、`base-own.img`。
 
 > 2026-11-27 23:55 又清一轮（`/x96-build` 8.3G → 7.8G）：删 `boot-bad`(107M)、`boot-good`(104M)、
-> 老内核 `7.2.12-x96`（非 trim）的 `initrd.img`/`uInitrd`/`vmlinuz` 与 `base-boot-backup` 里的整套
-> （后者只留 `-trim` 一套并修好 `Image`/`uInitrd` 符号链接，113M → 49M）。
-> 现役只剩 `7.2.12-x96-trim`：源树 `7.2.12-trim` + 增量树 `kbuild-trim` 在，随时可重编。
+> 老内核 `7.2.12-x96`（非 trim）的 `initrd.img`/`uInitrd`/`vmlinuz`，以及 `base-boot-backup/` 整个目录
+> （先砍到只剩 `-trim` 一套 49M，23:58 确认盒子已跑稳后全删）。`/boot` 的 `*.bak-inst-*` 也已是 0 个。
+> **结论：现在没有任何内核备份副本**，现役只有 `7.2.12-x96-trim`；源树 `7.2.12-trim` + 增量树 `kbuild-trim`
+> 都在位，要回退就是重编同版本（约 8 秒增量复查 / 全量按 §23 走）。
 还能再砍：`amlogic-s9xxx-armbian` 里的 ophub 源码 3.3G（先把基础镜像挪出来）、`base-own.img` 1.2G（`mkbase.sh` 可重造）。
 
 **第二轮（23:44，`/tmp` 3.0G×2 与错压的旧构建）**：删 `/tmp/x96-trim-autoinstall.img`（3.0G，21:52 旧构建解压体，
@@ -2570,7 +2571,11 @@ rootfs 部分相同——想再瘦要动 §18 的包清单，而不是内核。
 
 **为什么要单独备份基础镜像**：`build-image.sh:68` 硬校验 `$BASE`，缺了直接 `missing base image` 退出；
 它的 rootfs 会被整体清空（§19.6 步骤 1），但那个 ext4 分区容器本身不能凭空造出来，
-`mkbase.sh` 虽能自造（§19.6.1），仍需源码 rootfs 与 `base-boot-backup` 都在位。留着最省事。
+`mkbase.sh` 虽能自造（§19.6.1），仍需源码 rootfs 与一份 `base-boot-backup/` 都在位。留着最省事。
+
+> ⚠️ `base-boot-backup/` **已在 2026-11-27 23:58 删除**（盒子跑稳，不再需要内核回滚件）。
+> 重跑 §19.6 的 rebuild 时，第 1 步那段 `rsync … base-boot-backup/` 会**自动重建**这个目录，
+> 不用手工补；只是从此它不再是"现成的备份"，而是每次现抓的临时中转。
 
 **校验方式**：`gzip -t` 已过；`sha256sum` 源/目标分别计算，基础镜像两侧一致。
 
@@ -3224,10 +3229,10 @@ eth0 UP 192.168.1.121/24
 
 ### 23.6 回滚
 
-> **2026-11-27 23:55 起这些备份已不存在**：新内核跑稳后清了 `/boot` 里全部 `*.bak-inst-*`
-> 与 `*.bak-pre-vdec-1127`、7 个 `uEnv.txt.bak-*`（323M → 120M，24%）。
-> 现在要回退只能**重编同版本**（`kbuild-trim` 源树都在）或从 `/x96-build/base-boot-backup`
-> （只留 `-trim` 一套，49M）取件。下面的命令是**当时**的写法，留着给以后打备份时用。
+> **这些备份已经全删**（2026-11-27 23:55 清 `/boot` 的 `*.bak-inst-*`、`*.bak-pre-vdec-1127`、
+> 7 个 `uEnv.txt.bak-*`，323M → 120M；23:58 盒子确认跑稳后又删了主机 `/x96-build/base-boot-backup/`）。
+> 现在**没有回滚副本**，要回退只能重编同版本（`7.2.12-trim` 源树 + `kbuild-trim` 增量树都在）。
+> 下面的命令是**当时**的写法，留着给以后重新打备份时用。
 
 一条命令回到上一版（备份是同一时刻的全套，别跨版本混用）：
 
