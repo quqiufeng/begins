@@ -137,7 +137,7 @@ export DBUS_SESSION_BUS_ADDRESS="unix:path=/tmp/cogrt/bus"
 要点：
 - `libcogplatform-drm.so` 链接 libinput 并走 udev backend，**新插入的 uinput 设备会被自动发现**，不用重启 cog。
 - keybd 的 `config.lua` 用 `exclude="Mouse,Touch,Video,HDMI"` 跳过鼠标类接口，`grab=true` 独占。
-- 虚拟键盘设备名 `vkeybd-browser`（`/tmp/vkeyd.lua` 实验用；正式应做成 `apps/browser.lua` + `keys/browser.lua`，**尚未做**）。
+- 虚拟键盘设备名 `vkeybd-browser`（仅实验过，脚本未留档；正式应做成 `keybord/apps/browser.lua` + `keybord/keys/browser.lua`，**尚未做**）。
 
 ### 4.1 已验证可用的最小注入器（`tmp/keyinject.c`）
 
@@ -768,14 +768,18 @@ cage -- chromium --kiosk --no-sandbox --disable-dev-shm-usage \
 
 改前备份：`/root/startcage.sh.bak-pre-multicore`。
 
-### 13.4 测量脚本（都在 123 的 `/tmp/`，可重跑）
+### 13.4 测量脚本（源码在 `tools/cdp/`，跑到 123 上，可重跑）
 
-- `/tmp/prof.sh <标签> [秒]`：按进程归集 CPU + renderer/GPU 热点线程 + 页面 fps + PSS 内存。
-- `/tmp/sc2.sh`：`EXTRA="--flags" PAGE=bench.html` 起指定参数的 cage，便于 A/B。
-- `/tmp/bench.html`（canvas 重绘压测）、`/tmp/bench2.html`（blur/阴影压测）、
-  `/tmp/vid.html`（`requestVideoFrameCallback` 数真实解码帧）。
+- `tools/cdp/prof.sh <标签> [秒]`：按进程归集 CPU + renderer/GPU 热点线程 + 页面 fps + PSS 内存。
+- `tools/cdp/sc2.sh`：`EXTRA="--flags" PAGE=bench.html` 起指定参数的 cage，便于 A/B。
+- `tools/cdp/bench.html`（canvas 重绘压测）、`bench2.html`（blur/阴影压测）、
+  `vid.html`（`requestVideoFrameCallback` 数真实解码帧）。
 - 页面 fps 用 `window.__t0`/`__stats.f` 自算；**注意 rAF 计数是 BeginFrame 节流后的结果**，
   负载高时它才反映真实吞吐（低负载页面 rAF 会恒为 ~60，不能当成"上屏 60 帧"）。
+
+上盒跑之前，先把 `tools/cdp/` 里的 `cdp_do.lua` + `bench*.html` + `vid.html` 放到盒上 `/tmp/`：
+`scp tools/cdp/*.{lua,html} x98h:/tmp/`。脚本里 `$L /tmp/cdp_do.lua`、`file:///tmp/bench.html` 是**硬编码的 /tmp**，
+所以文件名不能改、目录不能挪（盒上 `/tmp` 是 tmpfs，重启即空，需重推）。
 
 ## 14. 默认字号：只能改 Preferences，且必须停机改（2026-11-26 实测）
 
@@ -1225,8 +1229,8 @@ exec dbus-run-session -- cage -- chromium \
 注入用 `inject_yt.lua`（依赖 `cdplib.lua`，= `tools/cdp/cdp_do.lua` 的库部分）：
 
 ```bash
-scp tmp/ytcookies.lua tmp/inject_yt.lua tmp/cdplib.lua x98h:/root/
-ssh x98h '/opt/reader/bin/luajit /root/inject_yt.lua /root/ytcookies.lua 9222 https://www.youtube.com/'
+scp tools/chrome3/inject.lua tools/cdp/cdp_do.lua /tmp/ytcookies.lua x98h:/root/
+ssh x98h '/opt/reader/bin/luajit /root/inject.lua /root/ytcookies.lua 9222 https://www.youtube.com/'
 # [page] about:blank
 # [cookie] 注入成功 228 / 失败 0
 # [check] {"avatar":true,"signin_btn":false,"vids":..,"thumbs":..,"name":"..."}
@@ -1281,7 +1285,7 @@ ffmpeg -f rawvideo -pix_fmt bgr0 -s 2560x1440 -i /tmp/yt.raw -vf scale=900:-1 yt
 4. **收尾必还原桌面**（同 16.7.5）：`pkill -x chromium; pkill -x cage;
    systemctl unmask --runtime desktop && systemctl start desktop`，再 `systemctl is-active desktop` 确认。
 
-### 17.7 附录：两个脚本原文（`tmp/` 是 gitignore 的临时目录，会随时清掉，所以正文留档）
+### 17.7 附录：脚本说明（源码在 `tools/chrome3/`，正文留档关键实现与踩坑）
 
 **A. `export_cookies.lua` + `cookiecrypt.c`（本机跑，只读本机 profile，输出 Lua 表）**
 
