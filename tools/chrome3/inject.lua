@@ -45,6 +45,32 @@ local SITES = {
         feeds: document.querySelectorAll('[action-type="feed_list_item"], .Feed_wrap, article').length
       })})()]],
   },
+  zh = {
+    name = "知乎",
+    cookies = "/root/zhcookies.lua",
+    url = "https://www.zhihu.com/",
+    warm = 5,                 -- 知乎首屏走 XHR，等 5s 再验
+    shot = false,
+    -- 登录态看 z_c0（会话票）+ 头部个人中心头像；没过登录会有 yidun 点选验证码
+    check = [[(function(){
+      var has=function(s){ try{ return !!document.querySelector(s); }catch(e){ return false; } };
+      var ck=document.cookie||"";
+      var nick=document.querySelector('.AppHeader-userInfo .UserLink-link, .AppHeader-profileEntry .UserLink-link');
+      var av=has('img.Avatar, .AppHeader-profileEntry img');
+      return JSON.stringify({
+        title: document.title,
+        href: location.href,
+        /* z_c0 是 HttpOnly，document.cookie 读不到，只能看它生效后的界面（头像/个人中心） */
+        z_c0_dom: av,
+        d_c0: ck.indexOf('d_c0=') >= 0,
+        profile: has('.AppHeader-profileEntry, .AppHeader-profile'),
+        nick: (nick && nick.textContent || '').trim().slice(0, 20),
+        signin: has('a[href*="/signin"], .AppHeader-login, button.SignFlow-submitButton'),
+        captcha: has('.yidun_tips, .yidun_intelli-tips, .yidun_bg-img, .Captcha'),
+        feeds: document.querySelectorAll('.TopstoryItem, .Feed, .ContentItem').length,
+        body_len: (document.body && document.body.innerText || '').length
+      })})()]],
+  },
   gm = {
     name = "Gmail",
     cookies = "/root/gm-cookies.lua",
@@ -118,8 +144,25 @@ end
 
 rpc("Network.enable")
 rpc("Page.enable")
+
+-- 幂等保护：profile 里已有会话票就别再灌 cookie。
+-- 知乎每次登录会轮换 z_c0，用旧的覆盖会立刻被判失效并踢下线（实测踩过）。
+local already = {}
+do
+  local r = rpc("Network.getCookies", { urls = { "https://www.zhihu.com/", "https://weibo.com/", "https://mail.google.com/" } })
+  local list = r and r.result and r.result.cookies
+  if type(list) == "table" then
+    for _, k in ipairs(list) do already[k.name] = true end
+  end
+end
+local SKIP_ALL = already["z_c0"] and cfg.name == "知乎"
+
 local ok, fail, errs = 0, 0, {}
+if SKIP_ALL then
+  print("[%s][cookie] 已有 z_c0，跳过注入（避免轮换后被判失效）", cfg.name)
+end
 for _, c in ipairs(cookies) do
+  if SKIP_ALL then goto continue end
   local host = c.domain
   local p = {
     name = c.name, value = c.value, path = c.path or "/",
@@ -135,8 +178,9 @@ for _, c in ipairs(cookies) do
     fail = fail + 1
     if #errs < 5 then errs[#errs + 1] = host .. ":" .. c.name .. " => " .. lib.jenc(r and (r.error or r.result) or {}) end
   end
+  ::continue::
 end
-print(string.format("[%s][cookie] 注入成功 %d / 失败 %d", cfg.name, ok, fail))
+print(string.format("[%s][cookie] 注入成功 %d / 失败 %d%s", cfg.name, ok, fail, SKIP_ALL and "（跳过）" or ""))
 for _, e in ipairs(errs) do print("  " .. e) end
 
 rpc("Page.navigate", { url = url })
@@ -147,6 +191,36 @@ end
 os.execute("sleep " .. cfg.warm)
 
 print("[check] " .. tostring(js(cfg.check)))
+
+-- 票会轮换：知乎登录后每次会话都会换 z_c0，微博换 SUB。
+-- 不回写的话，cookie 文件里的那张票就死在旧值上，下次注入等于灌一张废票。
+local function persist_tickets()
+  local path = cfg.cookies
+  local fh = path and io.open(path)
+  if not fh then return end
+  local src = fh:read("*a"); fh:close()
+  local r = rpc("Network.getCookies", { urls = { url } })
+  local live = {}
+  for _, k in ipairs((r and r.result and r.result.cookies) or {}) do live[k.name] = k end
+  local changed = 0
+  src = src:gsub('({name="([^"]+)",value=")([^"]*)(")', function(a, name, old, tail)
+    local k = live[name]
+    if k and k.value and k.value ~= old then changed = changed + 1; return a .. k.value .. tail end
+    return a .. old .. tail
+  end)
+  src = src:gsub('({name="([^"]+)",value="[^"]*"[^}]-expires=)(%d+)', function(a, name, old)
+    local k = live[name]
+    if k and k.expires and k.expires > 0 and math.floor(k.expires) ~= tonumber(old) then
+      return a .. math.floor(k.expires)
+    end
+    return a .. old
+  end)
+  if changed > 0 then
+    local out = io.open(path, "w"); out:write(src); out:close()
+    print(string.format("[cookie] 回写 %d 条新票 -> %s", changed, path))
+  end
+end
+persist_tickets()
 
 if cfg.shot then
   local shot = rpc("Page.captureScreenshot", { format = "png" })

@@ -310,10 +310,30 @@ end
 -- 之后每一次按下都被当成重复(val=2)，页面里 e.repeat 一过滤就"按 OK 毫无反应"。
 -- 所以这里记账 + 超时兜底（下面 vkbd_release_stale），让虚拟键盘不会卡键。
 local HELD = {}
+local DROP = { at = 0, n = 0 }
 local function passthru(t, c, v)
-	if (t ~= 1 and t ~= 2) or not VKBD or not EXT.up then return end
+	if t ~= 1 and t ~= 2 then return end
+	if not VKBD or not EXT.up then
+		-- 直通被丢掉时按键就"凭空消失"（遥控在浏览器里没反应）。
+		-- 这是最难查的一类故障：以前完全静默，现在每 2s 汇总一条。
+		DROP.n = DROP.n + 1
+		local t0 = evdev.now_ms()
+
+		if t0 - DROP.at > 2000 then
+			DROP.at = t0
+			log("WARN 直通丢弃 %d 个键事件（虚拟键盘=%s 合成器=%s）", DROP.n,
+				VKBD and "有" or "无", EXT.up and "在跑" or "没跑")
+			DROP.n = 0
+		end
+		return
+	end
 	evdev.uinput_emit(VKBD, t, c, v)
-	if t == 1 then HELD[c] = (v == 0) and nil or evdev.now_ms() end
+	-- 注意：这里不能写成 HELD[c] = (v == 0) and nil or now —— Lua 里
+	-- `x and nil or y` 永远等于 y（nil 被 or 短路掉），抬起时反而把"按着的时间"
+	-- 记成 now，于是每次松手都白记一笔，1.5s 后又补发一次幽灵抬起。
+	if t == 1 then
+		if v == 0 then HELD[c] = nil else HELD[c] = evdev.now_ms() end
+	end
 end
 
 local function vkbd_release_stale()

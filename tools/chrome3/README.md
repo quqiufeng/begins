@@ -1,6 +1,6 @@
-# chrome3 —— 三个网站（YouTube / 微博 / Gmail）直出脚本的合订本
+# chrome3 —— 四站（YouTube / 微博 / 知乎 / Gmail）直出脚本的合订本
 
-原来三个站各有一套 `*cage.sh` + `inject_*.lua`，内容 90% 相同，只差 profile 目录、代理开关、验登录 JS。
+原来各站各有一套 `*cage.sh` + `inject_*.lua`，内容 90% 相同，只差 profile 目录、代理开关、验登录 JS。
 这里合成三份参数化脚本，站点差异集中在一个表里。**盒上实跑记录见 `chrome.md` §11–§17。**
 
 ## 1. 站点参数表（唯一真相）
@@ -9,6 +9,7 @@
 |---|---|---|---|---|---|---|
 | YouTube | `yt` | `/root/.config/chromium` | `127.0.0.1:7890` | `#avatar-btn` 存在 = 已登录；`signin_btn` 存在 = 未登录 | 3s | 否 |
 | 微博 | `wb` | `/root/.config/chromium-wb` | 直连（国内） | `window.$CONFIG.uid/nick` 非空 | 6s | 否 |
+| 知乎 | `zh` | `/root/.config/chromium-zh` | 直连（国内） | `document.cookie` 里有 `z_c0` + `.AppHeader-profile` 存在 = 已登录；出现 `.yidun_*` = 点选验证码 | 5s | 否 |
 | Gmail | `gm` | `/root/.config/chromium-gm` | `127.0.0.1:7890` | `[gh="cm"]` 写邮件按钮 + 收件箱行数 | 12s | 是 |
 
 注意 `yt` 用的是**默认 profile**（历史原因，登录态在那），没有单独的 `chromium-yt`。
@@ -31,6 +32,7 @@
 #   .so 缺失或比 .c 旧时会自动编译，需要 libsecret-1.so.0 / libsqlite3 / libcrypto
 LJ=~/.local/share/lite/third_party/luajit/src/luajit   # 本机没有 luajit 在 PATH
 $LJ tools/chrome3/export_cookies.lua ~/.config/google-chrome/Default /tmp/wb.lua weibo.com,sina.com.cn
+#   知乎：hosts 用 zhihu.com,zhimg.com
 scp /tmp/wb.lua x98h:/root/wbcookies.lua        # 或走 base64 推送
 scp tools/chrome3/{cage.sh,startcage.sh,inject.lua} x98h:/root/
 

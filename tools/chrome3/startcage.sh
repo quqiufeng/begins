@@ -1,6 +1,6 @@
 #!/bin/bash
 # startcage.sh —— 同 cage.sh，但后台起 + 等 CDP ready + 启动前修字号 + 多核调优参数
-#   用法: startcage.sh <yt|wb|gm|raw>      （参数含义见 cage.sh）
+#   用法: startcage.sh <yt|wb|zh|gm|raw>      （参数含义见 cage.sh）
 #   为什么单独一份：字号修正必须在 chromium 停掉之后、起来之前做（运行中改会被它退出时覆写）；
 #   光栅调优是常驻参数，只有这条后台路线会等 CDP，前台 exec 版等不了。
 set -u
@@ -10,9 +10,10 @@ PROXY="http://127.0.0.1:7890"
 case "$SITE" in
   yt)  UD=/root/.config/chromium;    EXTRA=(--proxy-server=$PROXY) ;;
   wb)  UD=/root/.config/chromium-wb; EXTRA=() ;;
+  zh)  UD=/root/.config/chromium-zh; EXTRA=() ;;
   gm)  UD=/root/.config/chromium-gm; EXTRA=(--proxy-server=$PROXY) ;;
   raw) UD=/root/.config/chromium;    EXTRA=() ;;
-  *)   echo "用法: startcage.sh <yt|wb|gm|raw>"; exit 2 ;;
+  *)   echo "用法: startcage.sh <yt|wb|zh|gm|raw>"; exit 2 ;;
 esac
 
 systemctl mask --runtime desktop >/dev/null 2>&1
