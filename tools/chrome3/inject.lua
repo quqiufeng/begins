@@ -122,6 +122,35 @@ local SITES = {
         body_len: (document.body && document.body.innerText || '').length
       })})()]],
   },
+  jb = {
+    name = "Jable",
+    cookies = "/root/jbcookies.lua",
+    url = "https://jable.tv/",
+    warm = 6,                 -- 首屏是服务端直出 + cf 校验，6s 足够
+    shot = false,
+    -- 登录票 kt_member + PHPSESSID 都不是 HttpOnly，document.cookie 直接可读；
+    -- 界面旁证：有会员票时导航栏出"登出/我的"，游客出 Login/Join
+    check = [[(function(){
+      var has=function(s){ try{ return !!document.querySelector(s); }catch(e){ return false; } };
+      var ck=document.cookie||"";
+      var txt=(document.body&&document.body.innerText||"");
+      return JSON.stringify({
+        title: document.title,
+        href: location.href,
+        kt_member: ck.indexOf('kt_member=')>=0,
+        phpsessid: ck.indexOf('PHPSESSID=')>=0,
+        cf_clearance: ck.indexOf('cf_clearance=')>=0,
+        logout: has('a[href*="logout"], a[href*="/logout/"]'),
+        login: has('a[href*="login"], a[href*="/login/"]'),
+        member_link: has('a[href*="/my/"], a[href*="/members/"]'),
+        vids: document.querySelectorAll('.videobox, .video-img-box, .thumb-overlay').length,
+        captcha: /Just a moment|Verify you are human|Checking your browser/.test(txt),
+        body_len: txt.length
+      })})()]],
+    -- 判据：kt_member（会员票）进了 cookie 就算注入到位；cf 挑战页/首屏慢再多等几轮
+    ok = '"kt_member":true',
+    retries = 10,
+  },
 }
 
 local cfg = SITES[site]
@@ -181,7 +210,7 @@ rpc("Page.enable")
 -- 知乎每次登录会轮换 z_c0，用旧的覆盖会立刻被判失效并踢下线（实测踩过）。
 local already = {}
 do
-  local r = rpc("Network.getCookies", { urls = { "https://www.zhihu.com/", "https://weibo.com/", "https://mail.google.com/", "https://www.douyin.com/", "https://www.youtube.com/" } })
+  local r = rpc("Network.getCookies", { urls = { "https://www.zhihu.com/", "https://weibo.com/", "https://mail.google.com/", "https://www.douyin.com/", "https://www.youtube.com/", "https://jable.tv/" } })
   local list = r and r.result and r.result.cookies
   if type(list) == "table" then
     for _, k in ipairs(list) do already[k.name] = true end
@@ -190,7 +219,7 @@ end
 -- 各站的"会话票"：一旦 profile 里已有，就不再灌（灌旧票会被服务端判失效踢下线）
 local SESSION = {
   ["知乎"] = "z_c0", ["抖音"] = "sessionid", ["微博"] = "SUB",
-  ["YouTube"] = "SAPISID", ["Gmail"] = "SID",
+  ["YouTube"] = "SAPISID", ["Gmail"] = "SID", ["Jable"] = "kt_member",
 }
 local TK = SESSION[cfg.name]
 local SKIP_ALL = TK and already[TK]
