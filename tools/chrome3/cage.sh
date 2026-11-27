@@ -1,6 +1,6 @@
 #!/bin/bash
 # cage.sh —— 三站合一：cage 独占 DRM + chromium kiosk 直出（前台 exec，日志进 /tmp/cage.log）
-#   用法: cage.sh <yt|wb|zh|gm|raw> [额外 chromium 参数...]
+#   用法: cage.sh <yt|wb|zh|gm|dy|raw> [额外 chromium 参数...]
 #     yt  = YouTube  profile /root/.config/chromium     走代理 127.0.0.1:7890
 #     wb  = 微博     profile /root/.config/chromium-wb  国内直连，不走代理
 #     zh  = 知乎     profile /root/.config/chromium-zh  国内直连，不走代理
@@ -15,8 +15,9 @@ case "$SITE" in
   wb)  UD=/root/.config/chromium-wb; EXTRA=() ;;
   zh)  UD=/root/.config/chromium-zh; EXTRA=() ;;
   gm)  UD=/root/.config/chromium-gm; EXTRA=(--proxy-server=$PROXY) ;;
+  dy)  UD=/root/.config/chromium-dy; EXTRA=() ;;
   raw) UD=/root/.config/chromium;    EXTRA=() ;;
-  *)   echo "用法: cage.sh <yt|wb|zh|gm|raw> [额外参数]"; exit 2 ;;
+  *)   echo "用法: cage.sh <yt|wb|zh|gm|dy|raw> [额外参数]"; exit 2 ;;
 esac
 
 systemctl mask --runtime desktop >/dev/null 2>&1

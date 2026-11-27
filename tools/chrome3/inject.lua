@@ -71,6 +71,38 @@ local SITES = {
         body_len: (document.body && document.body.innerText || '').length
       })})()]],
   },
+  dy = {
+    name = "抖音",
+    cookies = "/root/dycookies.lua",
+    url = "https://www.douyin.com/",
+    warm = 8,                 -- 抖音首屏是推荐流 XHR + 播放器起播，给足 8s
+    -- 这站在 123(ARM) 上冷刷新要 ~77s 才把头像渲染出来（实测），所以等久一点；
+    -- 判据放宽：头像出现、或私信入口出现，任一即说明登录态成立
+    ok = nil,
+    ok_any = { '"avatar":true', '"im_entry":true' },
+    retries = 45,
+    shot = false,
+    -- 登录态：sessionid/sid_guard 是 HttpOnly 读不到，靠界面（右上头像 + 无登录按钮）判定
+    check = [[(function(){
+      var has=function(s){ try{ return !!document.querySelector(s); }catch(e){ return false; } };
+      var ck=document.cookie||"";
+      /* 抖音新版头像是 aweme-avatar 图，没有 user-avatar 这个 e2e；私信入口 im-entry 只有登录才渲染 */
+      var av=document.querySelector('img[src*="aweme-avatar"], [data-e2e="user-avatar"] img, [data-e2e="something-button"] img');
+      return JSON.stringify({
+        title: document.title,
+        href: location.href,
+        avatar: !!av,
+        im_entry: has('[data-e2e="im-entry"]'),
+        /* ttwid 游客也有，只能当"页面通了"的旁证；tt_webid / passport_csrf_token 同理 */
+        ttwid: ck.indexOf('ttwid=') >= 0,
+        passport: ck.indexOf('passport_csrf_token') >= 0,
+        uid_tt: ck.indexOf('uid_tt=') >= 0,
+        login_btn: has('[data-e2e="login-button"]'),
+        signin_text: /登录/.test(((document.querySelector('[data-e2e="login-button"]')||{}).textContent)||''),
+        feeds: document.querySelectorAll('[data-e2e="feed-active-video"], [data-e2e="scroll-list-item"], li[data-e2e]').length,
+        body_len: (document.body && document.body.innerText || '').length
+      })})()]],
+  },
   gm = {
     name = "Gmail",
     cookies = "/root/gm-cookies.lua",
@@ -149,17 +181,23 @@ rpc("Page.enable")
 -- 知乎每次登录会轮换 z_c0，用旧的覆盖会立刻被判失效并踢下线（实测踩过）。
 local already = {}
 do
-  local r = rpc("Network.getCookies", { urls = { "https://www.zhihu.com/", "https://weibo.com/", "https://mail.google.com/" } })
+  local r = rpc("Network.getCookies", { urls = { "https://www.zhihu.com/", "https://weibo.com/", "https://mail.google.com/", "https://www.douyin.com/", "https://www.youtube.com/" } })
   local list = r and r.result and r.result.cookies
   if type(list) == "table" then
     for _, k in ipairs(list) do already[k.name] = true end
   end
 end
-local SKIP_ALL = already["z_c0"] and cfg.name == "知乎"
+-- 各站的"会话票"：一旦 profile 里已有，就不再灌（灌旧票会被服务端判失效踢下线）
+local SESSION = {
+  ["知乎"] = "z_c0", ["抖音"] = "sessionid", ["微博"] = "SUB",
+  ["YouTube"] = "SAPISID", ["Gmail"] = "SID",
+}
+local TK = SESSION[cfg.name]
+local SKIP_ALL = TK and already[TK]
 
 local ok, fail, errs = 0, 0, {}
 if SKIP_ALL then
-  print("[%s][cookie] 已有 z_c0，跳过注入（避免轮换后被判失效）", cfg.name)
+  print(string.format("[%s][cookie] 已有会话票 %s，跳过注入（避免轮换后被判失效）", cfg.name, TK))
 end
 for _, c in ipairs(cookies) do
   if SKIP_ALL then goto continue end
@@ -190,7 +228,21 @@ for _ = 1, 120 do
 end
 os.execute("sleep " .. cfg.warm)
 
-print("[check] " .. tostring(js(cfg.check)))
+-- 首屏渲染慢的站（抖音推荐流要十几秒）：check 里出现 cfg.ok 标记才算数，否则每 2s 重试
+local function passed(r)
+  if cfg.ok and r:find(cfg.ok, 1, true) then return true end
+  for _, mark in ipairs(cfg.ok_any or {}) do
+    if r:find(mark, 1, true) then return true end
+  end
+  return cfg.ok == nil and not cfg.ok_any
+end
+local res = tostring(js(cfg.check))
+for _ = 1, (cfg.retries or 0) do
+  if passed(res) then break end
+  os.execute("sleep 2")
+  res = tostring(js(cfg.check))
+end
+print("[check] " .. res)
 
 -- 票会轮换：知乎登录后每次会话都会换 z_c0，微博换 SUB。
 -- 不回写的话，cookie 文件里的那张票就死在旧值上，下次注入等于灌一张废票。

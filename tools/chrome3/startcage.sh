@@ -1,6 +1,6 @@
 #!/bin/bash
 # startcage.sh —— 同 cage.sh，但后台起 + 等 CDP ready + 启动前修字号 + 多核调优参数
-#   用法: startcage.sh <yt|wb|zh|gm|raw>      （参数含义见 cage.sh）
+#   用法: startcage.sh <yt|wb|zh|gm|dy|raw>   （参数含义见 cage.sh）
 #   为什么单独一份：字号修正必须在 chromium 停掉之后、起来之前做（运行中改会被它退出时覆写）；
 #   光栅调优是常驻参数，只有这条后台路线会等 CDP，前台 exec 版等不了。
 set -u
@@ -12,8 +12,9 @@ case "$SITE" in
   wb)  UD=/root/.config/chromium-wb; EXTRA=() ;;
   zh)  UD=/root/.config/chromium-zh; EXTRA=() ;;
   gm)  UD=/root/.config/chromium-gm; EXTRA=(--proxy-server=$PROXY) ;;
+  dy)  UD=/root/.config/chromium-dy; EXTRA=() ;;
   raw) UD=/root/.config/chromium;    EXTRA=() ;;
-  *)   echo "用法: startcage.sh <yt|wb|zh|gm|raw>"; exit 2 ;;
+  *)   echo "用法: startcage.sh <yt|wb|zh|gm|dy|raw>"; exit 2 ;;
 esac
 
 systemctl mask --runtime desktop >/dev/null 2>&1
@@ -31,11 +32,22 @@ try:
 except Exception:
     d = {}
 w = d.setdefault("webkit", {}).setdefault("webprefs", {})
+changed = []
 if w.get("default_font_size") != size:
     w["default_font_size"] = size
+    changed.append("font-size -> %dpx" % size)
+# 关掉"是否保存登录信息？"气泡：kiosk 遥控没有键鼠，那个气泡会盖在页面上挡点击
+if d.get("credentials_enable_service") is not False:
+    d["credentials_enable_service"] = False
+    changed.append("credentials_enable_service -> false")
+prof = d.setdefault("profile", {})
+if prof.get("password_manager_enabled") is not False:
+    prof["password_manager_enabled"] = False
+    changed.append("password_manager_enabled -> false")
+if changed:
     os.makedirs(os.path.dirname(p), exist_ok=True)
     json.dump(d, open(p, "w"))
-    print("font-size -> %dpx" % size)
+    print("; ".join(changed))
 PY
 
 export XDG_RUNTIME_DIR=/run/user/0
