@@ -159,7 +159,14 @@ if not cfg then
   os.exit(2)
 end
 
-local cookiefile = select(2, ...) or cfg.cookies
+-- cookie 文件：优先用仓库里随脚本走的 cookies/<站>.lua（盒上 /root/*cookies.lua 是原始导出，仓库这份是快照）
+local cookiefile = select(2, ...)
+if not cookiefile then
+  local here = (arg and arg[0] or ""):match("^(.*)/[^/]+$") or "."
+  local local_copy = here .. "/cookies/" .. site .. ".lua"
+  local f = io.open(local_copy, "r")
+  if f then f:close() cookiefile = local_copy else cookiefile = cfg.cookies end
+end
 local url = select(3, ...) or cfg.url
 -- cdplib 在加载时读全局 arg[3] 定 CDP 端口，所以要在 dofile 之前塞好
 arg = { [3] = select(4, ...) or "9222" }

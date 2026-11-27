@@ -1,0 +1,18 @@
+return {
+  {domain=".jable.tv",name="kt_rt_lang",value="zh",path="/",expires=1821741294,secure=false,httpOnly=false,sameSite="Unspecified"},
+  {domain=".en.jable.tv",name="kt_rt_lang",value="zh",path="/",expires=1822020002,secure=false,httpOnly=false,sameSite="Unspecified"},
+  {domain=".jable.tv",name="kt_member",value="ba4b3e2fa707b61b25a5224ae19385d9",path="/",expires=1796524800,secure=false,httpOnly=false,sameSite="Unspecified"},
+  {domain="en.jable.tv",name="__nuvt",value="8-aeb1226731c75efa96c06fbc23c89d3b",path="/",expires=1830142827,secure=false,httpOnly=false,sameSite="Unspecified"},
+  {domain="en.jable.tv",name="__suvt",value="8-401f92d5f2557e6e3c9c26c38253e40b",path="/",expires=1830142827,secure=false,httpOnly=false,sameSite="Unspecified"},
+  {domain="en.jable.tv",name="kt_tcookie",value="1",path="/",expires=1796187629,secure=false,httpOnly=false,sameSite="Unspecified"},
+  {domain=".jable.tv",name="PHPSESSID",value="eosb9i9n7hmjle3ul88orco9ts",path="/",expires=-11644473600,secure=false,httpOnly=false,sameSite="Unspecified"},
+  {domain=".jable.tv",name="cf_clearance",value="CtvMCGwHO368TMEKAwruZSmVNwKRoAudqPMxy4Ctc7mvrYFHR_tJJcoAH6w2Meiu_QJV4hKavlviXrQvgPwnItdC2wkpxXu4haEFddNVc49Apy-v_OfXYm0YHWGFp9QHWn5xhSSl17SqGvcqbc9kUvfZ-5C50b_aybMn2om6Db8gXt3DTMhRm1nVoHNinHRNJb8LSxCNddVaKlo2NPAkuBA7N-6AVnBPzIe8RnLrPECMbQMph2eX5UuU16k3VHHBqxQppVs6PuRxQN6dzOpPCdmuYTLkk3mPRPib4ynv57I7-X9IE_C7wCYLKPdY0aueSXa-jMLDu6FPtTagN3gZJ_Y3XZCKH-M5ubQjnrCpg85ep_KFAcCzlqM04ilYR4e8v-G-w77_sBDZIfym_h9gcn7yn9rr62WL84HhnCCVX9xc0Q1y",path="/",expires=1827278850,secure=true,httpOnly=true,sameSite="None"},
+  {domain="jable.tv",name="__nuvt",value="8-aeb1226731c75efa96c06fbc23c89d3b",path="/",expires=1830309725,secure=false,httpOnly=false,sameSite="Unspecified"},
+  {domain="jable.tv",name="__suvt",value="8-e3214e5cbe42080fd16e3489b0de12c2",path="/",expires=1830309725,secure=false,httpOnly=false,sameSite="Unspecified"},
+  {domain=".jable.tv",name="_ga",value="GA1.1.2011225925.1779876031",path="/",expires=1830309725,secure=false,httpOnly=false,sameSite="Unspecified"},
+  {domain="jable.tv",name="adc",value="%7B%22v%22%3A2%2C%22u%22%3A%22adc_01a21a98-34cd-70ed-9718-14fe69dc3b1e%22%2C%22t%22%3A1795742512%2C%22b%22%3A7%2C%22p%22%3A0%7D",path="/",expires=1795828912,secure=true,httpOnly=false,sameSite="Lax"},
+  {domain=".jable.tv",name="kt_ips",value="191.223.218.135",path="/",expires=1795836125,secure=false,httpOnly=false,sameSite="Unspecified"},
+  {domain="jable.tv",name="kt_tcookie",value="1",path="/",expires=1796354525,secure=false,httpOnly=false,sameSite="Unspecified"},
+  {domain="jable.tv",name="test",value="test",path="/",expires=-11644473600,secure=false,httpOnly=false,sameSite="Unspecified"},
+  {domain=".jable.tv",name="_ga_1DTX7D4FHE",value="GS2.1.s1795749578$o783$g1$t1795749746$j38$l0$h0",path="/",expires=1830309746,secure=false,httpOnly=false,sameSite="Unspecified"},
+}
