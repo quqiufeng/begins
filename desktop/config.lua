@@ -210,8 +210,17 @@ if env("DESKTOP_APPS", "1") ~= "0" then
 					and "file:///root/browser-home.html" or "about:blank")),
 		})
 	end
-	-- 微信：同样是 cage + wayland（/root/wx-run.sh 的原样参数）
-	if exists("/opt/wechat/wechat") then
+	-- 微信：sway + wayland（不再用 cage）。cage 0.2 的 view 只能贴左上角
+	-- （lx/ly 写死 0，无配置项、无 IPC），窗口既不能居中也不会留壁纸背景；
+	-- sway 走 /opt/desktop/wechat.conf：背景铺 assets/wallpaper.png，
+	-- 窗口由 bin/wx-center.py 在 map 后 resize 到 1280x720 并居中。
+	if exists("/opt/wechat/wechat") and exists("/usr/bin/sway") then
+		add_app({
+			name = "微信", kind = "wechat", meta = "聊天",
+			cmd = env("DESKTOP_WECHAT_CMD",
+				"exec dbus-run-session -- sway -c /opt/desktop/wechat.conf"),
+		})
+	elseif exists("/opt/wechat/wechat") then
 		add_app({
 			name = "微信", kind = "wechat", meta = "聊天",
 			cmd = env("DESKTOP_WECHAT_CMD",
