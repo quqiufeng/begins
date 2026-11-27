@@ -189,12 +189,19 @@ if env("DESKTOP_APPS", "1") ~= "0" then
 			name = "浏览器", kind = "browser", meta = "网页",
 			-- 首页：本地 /root/browser-home.html，没有这个文件就退回白页
 			cmd = env("DESKTOP_BROWSER_CMD",
-				"exec dbus-run-session -- cage -- chromium --kiosk --no-sandbox "
+				-- 方向键选 URL / OK 进入：先把 navinject 拉起来（常驻，每 2s 把
+				-- /root/browser-nav.js 注入每个 page target，见该脚本头注释）
+				"(setsid nohup /opt/reader/bin/luajit /root/navinject.lua "
+				.. ">>/tmp/navinject.log 2>&1 </dev/null &); "
+				.. "exec dbus-run-session -- cage -- chromium --kiosk --no-sandbox "
 				-- lang/translate：cage 直接起没有 locale，chromium 会判定页面是外语，
 				-- 右上角弹「翻译成英语」气泡盖住页面，一并关掉
 				.. "--lang=zh-CN --accept-lang=zh-CN,zh "
 				.. "--disable-features=Translate,TranslateUI "
 				.. "--disable-dev-shm-usage --ozone-platform=wayland "
+				-- 代理：盒上 mihomo(127.0.0.1:7890) 在跑，走它才能开 youtube/github；
+				-- 不加这段 chromium 是直连，连 SYN-SENT 卡死 → 用户看到「点了打不开」
+				.. "--proxy-server=http://127.0.0.1:7890 "
 				-- keybd 的 browser app 要读当前 url 才能判断「回首页 / 退出」：
 				-- 只监听 127.0.0.1，不对外网暴露
 				.. "--remote-debugging-port=9222 "

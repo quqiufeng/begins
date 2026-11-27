@@ -77,6 +77,9 @@ local launcher_ = launcher.new(cfg, win, bar)
 local fbcon = require("util.fbcon")
 
 fbcon.hold()
+-- 顺手把开机时残留在 /dev/fb0 里的 tty1 文本换成壁纸：
+-- 之后释放 DRM master 的空档里露出来的是壁纸，不是命令行。
+fbcon.wall()
 -- 语义状态：把 fs/preview/播放器/reader 的现场汇总成 state 里的文字
 local sem = semantic.new(cfg, fs, pv, launcher_)
 local auto
@@ -252,7 +255,7 @@ local function go_up()
 		layout()
 		dirty = true
 	elseif err then
-		toast(err, 1.5, theme.text_dim)
+		toast(err == "at home" and "已在桌面" or err, 1.5, theme.text_dim)
 	end
 end
 
@@ -288,8 +291,9 @@ local function on_key(name)
 	elseif name == "OK" or name == "ENTER" or name == "RETURN" or name == "SPACE" then
 		open_current()
 	elseif name == "BACK" or name == "ESC" or name == "ESCAPE" then
-		if fs.dir == cfg.start_dir then toast("已在起始目录")
-		else go_up() end
+		-- 根在哪由 fs:up() 按路径回答（home: / roots[] / "/"），
+		-- 这里不再拿 cfg.start_dir 比：它只是开机落点，不是根
+		go_up()
 	elseif name == "REFRESH" or name == "F5" then rescan()
 	elseif name == "QUIT" or name == "EXIT" then running = false
 	elseif name == "UP_DIR" then go_up()
@@ -766,4 +770,6 @@ pv:close()
 g:clear_thumbs(true)
 ico:destroy()
 win:close()
+-- 退出前再铺一遍：tty1 这几秒里可能又被 getty/dmesg 画了几行
+fbcon.wall(true)
 logf("退出")

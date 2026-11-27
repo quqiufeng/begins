@@ -93,6 +93,39 @@ function M.release()
 	return true
 end
 
+-- ---------- 壁纸 ----------
+-- fbcon 解绑之后，主 plane 在「没人持有 DRM master」的空档里显示的是驱动
+-- 注册的模拟 fbdev（/dev/fb0）那块内存 —— 里面是开机时 fbcon 画上去的
+-- tty1 文本。返回上一级 / 退出 app 时露出「开机 shell 画面」就是这么来的。
+-- 这里把壁纸直接铺进 fb0，之后无论谁释放 master，露出来的都是壁纸。
+local WALL_BIN = os.getenv("DESKTOP_FBWALL") or "/opt/desktop/bin/fbwall"
+local WALL_RAW = os.getenv("DESKTOP_WALLPAPER") or "/opt/desktop/assets/wallpaper.bgra"
+local WALL_W = tonumber(os.getenv("DESKTOP_WALLPAPER_W") or "") or 2560
+local WALL_H = tonumber(os.getenv("DESKTOP_WALLPAPER_H") or "") or 1440
+
+-- 只探存在性：wallpaper.bgra 有 14MB，别整块读进来
+local function exists(p)
+	local f = io.open(p, "rb")
+
+	if not f then return false end
+	f:close()
+	return true
+end
+
+local wall_at
+
+-- 幂等：同一秒内重复调用直接返回（切 app 一次只需要铺一张）
+function M.wall(force)
+	local now = os.time()
+
+	if not force and wall_at == now then return true end
+	if not exists(WALL_BIN) then return false end
+	if not exists(WALL_RAW) then return false end
+	os.execute(("%s %s %d %d >/dev/null 2>&1"):format(WALL_BIN, WALL_RAW, WALL_W, WALL_H))
+	wall_at = now
+	return true
+end
+
 function M.is_held() return held end
 
 return M

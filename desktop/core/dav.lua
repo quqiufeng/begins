@@ -307,7 +307,7 @@ function M.list(cfg, vpath)
 	local xml, err = propfind(n, remote, 1)
 
 	if not xml then return nil, err end
-	local self_href = remote:gsub("/+$", "")
+	local self_href = unenc(remote):gsub("/+$", "")
 	local out = {}
 
 	for _, e in ipairs(parse_propfind(xml)) do
