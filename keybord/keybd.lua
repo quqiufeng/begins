@@ -348,10 +348,24 @@ local function vkbd_release_stale()
 	end
 end
 
+-- 浏览器前台时返回键交给 app 自己处理（browser.lua 合成 158），这里绝不直通：
+-- 直通的话页面会先自己退一步，browser.lua 随后读到的 url 已经是首页 → 误判"在首页"→
+-- 一次 BACK 直接把 chromium 收掉（实测就是这么退进程的）。
+local function back_by_app(name)
+	if name ~= "BACK" and name ~= "BROWSER_BACK" and name ~= "ESC" then return false end
+	local a = resolve()
+
+	return (a and a.name == "browser") and true or false
+end
+
 local function press(name, code, val, devname)
-	if (devname == "ctl" or devname == "cli") and external_up() then
+	if (devname == "ctl" or devname == "cli") and external_up() and not back_by_app(name) then
 		passthru(1, code, val)
 	end
+
+	-- key-up 不派发动作：控制口/命令行发 value=0 只是抬起 uinput 的键。
+	-- 早先这里不判 val，一次按键的动作跑两遍（BACK 退两格、OK 开两次）。
+	if val == 0 then return end
 
 	ring_add(("%s%s"):format(name, val == 2 and "~" or ""))
 	if CFG.learn then
@@ -483,6 +497,10 @@ local function handle_ev(d, type, code, val)
 		-- 长按连发：设备自己的重复率可能是 33ms，这里按 REPEAT_MS 压一遍
 		if last_rep[code] and now - last_rep[code] < CFG.repeat_ms then return end
 		last_rep[code] = now
+	end
+	if direct and back_by_app(name) then
+		direct = false
+		log("back 交给 app，不直通 %s", name)
 	end
 	if direct then passthru(type, code, val) end
 	press(name, code, val, d.name)
