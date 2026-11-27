@@ -1192,10 +1192,10 @@ ffmpeg -f rawvideo -pix_fmt bgr0 -s 2560x1440 -i plane.raw -frames:v 1 wx.png
 
 ### 17.2 本机侧：把 Chrome cookie 解成 Lua 表
 
-脚本 `tmp/export_cookies.py`（一次性工具，跑完可删）：
+脚本 `tools/chrome3/export_cookies.lua`（LuaJIT FFI + C 补件，见 §17.7-A）：
 
 ```bash
-python3 tmp/export_cookies.py ~/.config/google-chrome/Default /tmp/ytcookies.lua
+luajit tools/chrome3/export_cookies.lua ~/.config/google-chrome/Default /tmp/ytcookies.lua
 # 总 N 行，选中 228 条（youtube/.google），解失败 0 -> /tmp/ytcookies.lua
 ```
 
@@ -1283,98 +1283,34 @@ ffmpeg -f rawvideo -pix_fmt bgr0 -s 2560x1440 -i /tmp/yt.raw -vf scale=900:-1 yt
 
 ### 17.7 附录：两个脚本原文（`tmp/` 是 gitignore 的临时目录，会随时清掉，所以正文留档）
 
-**A. `export_cookies.py`（本机跑，只读本机 profile，输出 Lua 表）**
+**A. `export_cookies.lua` + `cookiecrypt.c`（本机跑，只读本机 profile，输出 Lua 表）**
 
-```python
-#!/usr/bin/env python3
-"""把本机 Chrome/Chromium 的 cookie 解密导出成 Lua 表字面量（给盒上 luajit 注入用）。
-   本机专用：只读本机 keyring + profile，不落明文到仓库外。"""
-import sys, os, sqlite3, hashlib, ctypes, ctypes.util, shutil, tempfile
+原 python 版已删（要 `python3-gi` + ctypes + sqlite3 三套绑定）。现在是 lua+c 两件套，源码在仓库
+`tools/chrome3/`，这里只留关键实现与踩坑：
 
-def load_secret(label):
-    import gi
-    gi.require_version('Secret', '1')
-    from gi.repository import Secret
-    svc = Secret.Service.get_sync(Secret.ServiceFlags.LOAD_COLLECTIONS, None)
-    for c in svc.get_collections():
-        c.load_items_sync(None)
-        for it in c.get_items():
-            if (it.get_label() or '') == label:
-                it.load_secret_sync(None)
-                v = it.get_secret()
-                if v:
-                    return bytes(v.get()).decode()
-    return None
+分工：**SQLite 读表 / host 过滤 / Lua 表输出** 在 `export_cookies.lua`（LuaJIT FFI 直调 `libsqlite3`）；
+**keyring 取密码 + PBKDF2 + AES-128-CBC** 在 `cookiecrypt.c`（本机只有 `libsecret-1.so.0`、没有开发头文件，
+且遍历 SecretService→collections→items 要 GObject 变参 + GList，FFI 写不划算，手写原型比装 -dev 省事）。
 
-lib = ctypes.CDLL(ctypes.util.find_library('crypto'))
-lib.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
-lib.EVP_aes_128_cbc.restype = ctypes.c_void_p          # ← 必须声明，否则指针被截断成 int → 段错误
-lib.EVP_DecryptInit_ex.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
-lib.EVP_DecryptUpdate.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_int]
-lib.EVP_DecryptFinal_ex.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
-lib.EVP_CIPHER_CTX_free.argtypes = [ctypes.c_void_p]
-
-def decrypt(key, blob):
-    if not blob or blob[:3] not in (b'v10', b'v11'):
-        return None
-    ct = blob[3:]
-    ctx = lib.EVP_CIPHER_CTX_new()
-    if lib.EVP_DecryptInit_ex(ctx, lib.EVP_aes_128_cbc(), None, key, b' ' * 16) != 1:
-        return None
-    out = ctypes.create_string_buffer(len(ct) + 32)
-    n = ctypes.c_int()
-    if lib.EVP_DecryptUpdate(ctx, ctypes.addressof(out), ctypes.byref(n), ct, len(ct)) != 1:
-        return None
-    total = n.value
-    if lib.EVP_DecryptFinal_ex(ctx, ctypes.addressof(out) + total, ctypes.byref(n)) != 1:
-        lib.EVP_CIPHER_CTX_free(ctx)
-        return None
-    total += n.value
-    lib.EVP_CIPHER_CTX_free(ctx)
-    return out.raw[:total]
-
-SAMESITE = {-1: 'Unspecified', 0: 'None', 1: 'Lax', 2: 'Strict'}
-
-def main(profile, out_path, hosts=('youtube', '.google')):
-    # Chrome 运行中 SQLite 被锁，先快照
-    tmp = os.path.join(tempfile.gettempdir(), 'host-cookies.db')
-    shutil.copy(os.path.join(profile, 'Cookies'), tmp)
-    pw = load_secret('Chrome Safe Storage') or load_secret('Chromium Safe Storage')
-    if not pw:
-        sys.exit('keyring 里没找到 Safe Storage')
-    key = hashlib.pbkdf2_hmac('sha1', pw.encode(), b'saltysalt', 1, 16)   # Linux 迭代 1（macOS 才是 1003）
-    db = sqlite3.connect(tmp)
-    rows = db.execute('select host_key,name,encrypted_value,path,expires_utc,is_secure,is_httponly,samesite from cookies').fetchall()
-    sel, bad = [], 0
-    for host, name, enc, path, exp, sec, ho, ss in rows:
-        if hosts and not any(h in host for h in hosts):
-            continue
-        pt = decrypt(key, enc)
-        if pt is None:
-            bad += 1
-            continue
-        if pt[:32] == hashlib.sha256(host.encode()).digest():     # 新版明文前 32 字节 = sha256(host)
-            pt = pt[32:]
-        try:
-            value = pt.decode()
-        except UnicodeDecodeError:
-            bad += 1
-            continue
-        sel.append((host, name, value, path, exp, bool(sec), bool(ho), ss))
-    with open(out_path, 'w') as f:
-        f.write('return {\n')
-        for host, name, value, path, exp, sec, ho, ss in sel:
-            f.write('  {domain=%r,name=%r,value=%r,path=%r,expires=%d,secure=%s,httpOnly=%s,sameSite=%r},\n' % (
-                host, name, value, path, int(exp / 1000000 - 11644473600),
-                'true' if sec else 'false', 'true' if ho else 'false', SAMESITE.get(ss, 'Unspecified')))
-        f.write('}\n')
-    print('总 %d 行，选中 %d 条（%s），解失败 %d -> %s' % (len(rows), len(sel), '/'.join(hosts), bad, out_path))
-
-if __name__ == '__main__':
-    prof = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser('~/.config/google-chrome/Default')
-    out = sys.argv[2] if len(sys.argv) > 2 else '/tmp/ytcookies.lua'
-    main(prof, out)
+```bash
+# .so 缺失或比 .c 旧时脚本自建；链接要写 /lib/x86_64-linux-gnu/libsecret-1.so.0（没有 dev symlink）
+cc -O2 -shared -fPIC -o libcookiecrypt.so cookiecrypt.c \
+   /lib/x86_64-linux-gnu/libsecret-1.so.0 -lgobject-2.0 -lglib-2.0 -lcrypto
+luajit export_cookies.lua ~/.config/google-chrome/Default /tmp/ytcookies.lua youtube,.google
 ```
+
+四个必踩点：
+
+1. **keyring 里可能有多把 `Chrome Safe Storage`**（换过 profile / 留了旧条目），遍历顺序不保证是你
+   要的那把 —— 原 py 版按 label 取第一个，这次实测取到了旧 key（97 条全解失败）。现版本把匹配到的
+   密码**全取出逐把试**，`cc_password_nth(labels, idx)`。
+2. `PBKDF2-SHA1(pw, "saltysalt", 1, 16)`：Linux 迭代 **1**（macOS 才是 1003），IV 固定 16 个空格。
+3. 新版 Chrome 明文 = `sha256(host_key) || 真值`，前 32 字节要剥，判据是**按 host 算出来的 hash 比对**，
+   不是按长度硬砍。
+4. `Cookies` 库运行时被锁 → 先 `cp` 快照到 `/tmp/host-cookies.db`；快照里是密文，但仍是登录态材料，跑完删。
+   明文表同样用完即删（红线见 `tools/chrome3/README.md` §5）。
+
+实测对齐：本机 3331 行，`youtube` 命中 97 条、`youtube,.google` 命中 227 条，**逐字段与旧 py 版输出完全一致**。
 
 **B. `inject_yt.lua`（盒上跑，`/opt/reader/bin/luajit`；WS/CDP 库用 `cdplib.lua`）**
 
@@ -1470,3 +1406,42 @@ print(string.format("[cookie] 注入成功 %d / 失败 %d", ok, fail))
     thumbs:document.querySelectorAll('img[src^="https://i.ytimg"]').length})})()
 ```
 `avatar:true` + `signin_btn:false` 才是真登录；只看 cookie 注入数量会被"注入成功但已过期"骗。
+
+## 18. 三站脚本合订本（YouTube / 微博 / Gmail）——`tools/chrome3/`
+
+§12–§17 是逐站踩出来的，脚本散在盒上 `/root/`。三套 `*cage.sh` + `inject_*.lua` 有 90% 是重复，
+差异只在 **profile 目录 / 代理开关 / 验登录 JS / 等待时长**。已合成三份参数化脚本，站点差异集中在
+`inject.lua` 顶部一个 `SITES` 表里；文件与用法见 `tools/chrome3/README.md`。
+
+| 站点 | key | profile | 代理 | 登录态判据 | warm |
+|---|---|---|---|---|---|
+| YouTube | `yt` | `/root/.config/chromium`（默认 profile） | `127.0.0.1:7890` | `#avatar-btn` 存在；`signin_btn` 不存在 | 3s |
+| 微博 | `wb` | `/root/.config/chromium-wb` | 直连 | `window.$CONFIG.uid/nick` 非空 | 6s |
+| Gmail | `gm` | `/root/.config/chromium-gm` | `127.0.0.1:7890` | `[gh="cm"]` 写邮件按钮 + 收件箱行数 | 12s |
+
+四个文件：`export_cookies.lua`+`cookiecrypt.c`（本机，解 keyring cookie → Lua 表）、`cage.sh`（盒上，前台 exec）、
+`startcage.sh`（盒上，后台 + 等 CDP ready + 修字号 + 光栅调优）、`inject.lua`（盒上，注入+导航+验登录，gm 顺带截图）。
+
+```bash
+~/.local/share/lite/third_party/luajit/src/luajit tools/chrome3/export_cookies.lua \
+  ~/.config/google-chrome/Default /tmp/wb.lua weibo.com,weibo.cn
+ssh x98h 'bash /root/startcage.sh wb && /opt/reader/bin/luajit /root/inject.lua wb'
+```
+
+**2026-11-27 合订后实测（123，2560x1440）**：
+
+```
+CDP ready after 2x0.5s
+[page] about:blank
+[微博][cookie] 注入成功 17 / 失败 0
+[check] {"title":"微博 – 随时随地发现新鲜事","href":"https://weibo.com/","uid":2018236971,
+         "nick":null,"login_nav":false,"name":"","signin_btn":false,"feeds":6}
+```
+
+`uid` 非空 + `feeds:6` → 登录态有效；`nick=null`/`login_nav:false` 是微博新版 DOM 改名导致的选择器过期
+（只影响那个字段，不影响判据）。
+
+两个必须记住的细节：
+1. **盒上没有 `luajit` 在 PATH**，要写全 `/opt/reader/bin/luajit`（§17 的老坑）。
+2. **CDP 端口由 `cdplib.lua` 加载时的全局 `arg[3]` 决定**，所以 `inject.lua` 在 `dofile("/root/cdplib.lua")`
+   **之前**先 `arg = { [3] = port }`，否则第 4 个参数（端口）静默失效。
