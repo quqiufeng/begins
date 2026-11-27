@@ -1,0 +1,41 @@
+<!doctype html><meta charset=utf-8>
+<style>html,body{margin:0;height:100%;background:#000;color:#0f0;font:40px/1.2 monospace;overflow:hidden}
+#o{position:fixed;z-index:99;left:8px;top:8px;white-space:pre;background:#000}</style>
+<div id=o>boot</div>
+<script>
+var o=document.getElementById('o'),LOG=['boot'];
+function show(m){LOG.push(m);o.textContent=LOG.slice(-13).join('\n');}
+window.onerror=function(m,s,l){show('ERR '+m+' @'+l);};
+var W=innerWidth,H=innerHeight;
+function box(sz,x,y){var d=document.createElement('div');d.style.cssText='position:absolute;width:'+sz+'px;height:'+sz+'px;background:#0f0;top:'+y+'px;left:'+x+'px;will-change:transform';document.body.appendChild(d);return d;}
+function cvs(w,h){var c=document.createElement('canvas');c.width=w;c.height=h;c.style.cssText='position:absolute;left:0;top:0';document.body.appendChild(c);return c;}
+function bench(name,ms,setup,frame){return new Promise(function(res){
+  var st=setup(),n=0,worst=0,last=performance.now(),t0=last;
+  function tick(now){var dt=now-last;last=now;if(n>2&&dt>worst)worst=dt;n++;
+    frame(st,n,now);
+    var el=now-t0;
+    if(el>=ms){show(name+' '+((n-1)*1000/el).toFixed(1)+'fps w'+worst.toFixed(0));if(st&&st.remove)st.remove();return res();}
+    requestAnimationFrame(tick);}
+  requestAnimationFrame(tick);});}
+async function main(){
+try{show('view '+W+'x'+H);
+ // 0 纯 rAF，不动任何像素
+ await bench('0 raf-only',2000,function(){return null;},function(){});
+ // 1 小元素 transform 移动（100px 方块穿过屏幕）
+ await bench('1 trans100',3000,function(){return box(100,10,300);},function(d,n){d.style.transform='translate('+(n*6%(W-100))+'px,'+(n*4%(H-400))+'px)';});
+ // 2 中等元素 transform（400px）
+ await bench('2 trans400',3000,function(){return box(400,10,400);},function(d,n){d.style.transform='translate('+(n*9%(W-400))+'px,'+(n*5%(H-800))+'px)';});
+ // 3 canvas 128 每帧重绘
+ await bench('3 cvs128',3000,function(){var c=cvs(128,128);return c.getContext('2d');},function(x,n){x.fillStyle='hsl('+n*5%360+',80%,50%)';x.fillRect(0,0,128,128);});
+ // 4 canvas 512 每帧重绘
+ await bench('4 cvs512',3000,function(){var c=cvs(512,512);return c.getContext('2d');},function(x,n){x.fillStyle='hsl('+n*5%360+',80%,50%)';x.fillRect(0,0,512,512);});
+ // 5 canvas 4K 但只改 64x64 角
+ await bench('5 cvs4K-tiny',3000,function(){var c=cvs(W,H);var x=c.getContext('2d',{alpha:false});x.fillStyle='#123';x.fillRect(0,0,W,H);return x;},function(x,n){x.fillStyle='hsl('+n*5%360+',80%,50%)';x.fillRect(0,0,64,64);});
+ // 6 canvas 4K 全屏
+ await bench('6 cvs4K-all',3000,function(){var c=cvs(W,H);return c.getContext('2d',{alpha:false});},function(x,n){x.fillStyle='hsl('+n*5%360+',80%,50%)';x.fillRect(0,0,W,H);});
+ // 7 大图 transform（无重绘，仅 GPU 合成）
+ await bench('7 img4K-move',3000,function(){var c=document.createElement('canvas');c.width=1920;c.height=1080;var x=c.getContext('2d');x.fillStyle='#f80';x.fillRect(0,0,1920,1080);for(var i=0;i<40;i++){x.fillStyle='hsl('+i*9+',80%,50%)';x.fillRect((i*137)%1800,(i*211)%1000,160,120);}var im=document.createElement('img');im.style.cssText='position:absolute;left:0;top:0;width:'+W+'px;height:'+H+'px;will-change:transform';im.src=c.toDataURL();document.body.appendChild(im);return im;},function(im,n){im.style.transform='translate('+(n*7%200)+'px,0)';});
+ show('DONE');
+}catch(e){show('EXC '+e);}}
+main();
+</script>

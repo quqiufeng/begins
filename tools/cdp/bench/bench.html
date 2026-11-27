@@ -1,0 +1,59 @@
+<!doctype html><meta charset=utf-8><title>bench</title>
+<style>html,body{margin:0;height:100%;background:#111;color:#0f0;font:28px monospace;overflow:hidden}
+#o{position:fixed;z-index:99;background:#000c;padding:6px;white-space:pre;line-height:1.25;font-size:23px}
+#wrap{position:fixed;inset:0}</style>
+<div id=o>running</div><div id=wrap><canvas id=c></canvas><div id=box></div></div>
+<script>
+const W=innerWidth,H=innerHeight;
+const o=document.getElementById('o'),wrap=document.getElementById('wrap'),c=document.getElementById('c'),box=document.getElementById('box');
+const log=[];
+function report(t){try{fetch('http://127.0.0.1:8099/r?d='+encodeURIComponent(t),{mode:'no-cors'})}catch(e){}}
+function done(){o.textContent=log.join('\n');wrap.style.display='none';o.style.fontSize='40px';
+  const t='RESULT\n'+log.join('\n');report(t);document.title='DONE';}
+c.style.width=W+'px';c.style.height=H+'px';
+let stop=false, cur='';
+function run(name,setup,frame,ms){return new Promise(res=>{
+  c.width=1;c.height=1;c.style.display='none';box.innerHTML='';box.style.display='none';
+  wrap.style.display='block';
+  const ctx=setup?setup():null;
+  let n=0,worst=0,last=performance.now(),t0=last;
+  if(frame){ c.style.display='block'; } else { box.style.display='block'; }
+  function tick(){
+    const now=performance.now(),dt=now-last;last=now;
+    if(n>2&&dt>worst)worst=dt;
+    n++;
+    if(frame)frame(ctx,n,now);
+    const el=now-t0;
+    if(el>=ms){const fps=(n-1)*1000/el;const line=name+'  '+(fps).toFixed(1)+' fps  worst '+worst.toFixed(0)+'ms';
+      log.push(line);report(line);res();return;}
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+});}
+function ctx2d(){return c.getContext('2d');}
+async function main(){
+ log.push('view '+W+'x'+H+' dpr '+devicePixelRatio);
+ // 1 rAF 空转
+ await run('1 raf-only        ',null,()=>{},4000);
+ // 2 rAF 改 DOM 文本
+ await run('2 dom-text        ',()=>{box.innerHTML='<div id=t style="position:absolute;top:40%;left:40%;font:600px sans-serif;color:#0f0">0</div>';return box.firstChild;},
+   (t,n)=>{t.textContent=n%10;},4000);
+ // 3 CSS transform 动画
+ await run('3 css-transform   ',()=>{box.innerHTML='<div id=q style="position:absolute;width:900px;height:900px;background:linear-gradient(#f60,#06f)"></div>';return box.firstChild;},
+   (q,n)=>{q.style.transform='translate('+(n*7%W)+'px,'+(n*11%H)+'px) rotate('+(n%360)+'deg)';},4000);
+ // 4 canvas2d 4K 满屏 40 方块
+ await run('4 canvas2d 4K*40  ',()=>{c.width=W;c.height=H;return ctx2d();},
+   (x,n)=>{x.fillStyle='#123';x.fillRect(0,0,W,H);for(let i=0;i<40;i++){x.fillStyle='hsl('+(i*9+n)%360+',80%,50%)';x.fillRect((i*97+n*3)%W,(i*211)%H,240,240);}},4000);
+ // 5 canvas2d 1080p 拉伸
+ await run('5 canvas2d 1080*40',()=>{c.width=1920;c.height=1080;return ctx2d();},
+   (x,n)=>{x.fillStyle='#123';x.fillRect(0,0,1920,1080);for(let i=0;i<40;i++){x.fillStyle='hsl('+(i*9+n)%360+',80%,50%)';x.fillRect((i*97+n*3)%1920,(i*211)%1080,120,120);}},4000);
+ // 6 canvas2d 4K 纯全屏填充
+ await run('6 canvas2d 4K fill',()=>{c.width=W;c.height=H;return ctx2d();},
+   (x,n)=>{x.fillStyle='hsl('+(n*3)%360+',80%,50%)';x.fillRect(0,0,W,H);},4000);
+ // 7 WebGL 4K
+ await run('7 webgl 4K*40     ',()=>{c.width=W;c.height=H;const g=c.getContext('webgl');return g;},
+   (g,n)=>{g.viewport(0,0,W,H);g.clearColor(0.05,0.1,0.2,1);g.clear(g.COLOR_BUFFER_BIT);for(let i=0;i<40;i++){g.enable(g.SCISSOR_TEST);g.scissor((i*97+n*3)%W,(i*211)%H,240,240);g.clearColor((i*9+n)%10/10,0.5,0.9,1);g.clear(g.COLOR_BUFFER_BIT);}},4000);
+ done();
+}
+main();
+</script>

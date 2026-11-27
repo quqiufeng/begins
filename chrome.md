@@ -139,7 +139,7 @@ export DBUS_SESSION_BUS_ADDRESS="unix:path=/tmp/cogrt/bus"
 - keybd 的 `config.lua` 用 `exclude="Mouse,Touch,Video,HDMI"` 跳过鼠标类接口，`grab=true` 独占。
 - 虚拟键盘设备名 `vkeybd-browser`（仅实验过，脚本未留档；正式应做成 `keybord/apps/browser.lua` + `keybord/keys/browser.lua`，**尚未做**）。
 
-### 4.1 已验证可用的最小注入器（`tmp/keyinject.c`）
+### 4.1 已验证可用的最小注入器（`tools/chrome3/keyinject.c`）
 
 `/dev/uinput` 造 `lite-browser-kbd` 虚拟键盘，按名字注入，静态编译 aarch64：
 
@@ -282,7 +282,7 @@ Buffer address requested when its parent pool has an external reference and a de
 在 121（3840×2160，一帧 **33 177 600 B**）上跑，只抓到 1302 行就停，
 右下半截是撕裂/空白 —— **看图会误判成「页面花了 / 崩溃了」，其实是抓图工具的问题**。
 
-改用 `tmp/grabplane.c` 编译的 `/root/grabplane-aarch64`：走 DRM
+改用 `tools/chrome3/grabplane.c` 编译的 `/root/grabplane-aarch64`：走 DRM
 `GETRESOURCES → GETCRTC → GETFB → PRIME_HANDLE_TO_FD → mmap`，
 按 fb 自己的 pitch/height 全量导出，**分辨率无关**：
 
@@ -398,8 +398,8 @@ ssh x96 '/root/cog/box-cog.sh stop'
 | `/usr/bin/cog`（盒子） | apt 包 cog 0.18.4 |
 | `/usr/share/fonts/truetype/tsanger/` | 仓耳今楷硬链接 + `99-tsanger-zh.conf`（**仅 123 需要**；121 自带 CJK，不用） |
 | `/root/grabscreen-aarch64`（盒子） | 抓 DRM 帧，**写死 2560x1440**（14745600 B BGRA）→ 4K 盒子上只出半张图 |
-| `tmp/grabplane.c` → `/root/grabplane-aarch64`（121/123） | 按 fb 实际 pitch/height 全量抓帧，分辨率无关（7.2 节，**首选**） |
-| `tmp/keyinject.c` → `/root/keyinject-aarch64`（121） | uinput 虚拟键盘注入：`keyinject-aarch64 right down enter`（4.1 节） |
+| `tools/chrome3/grabplane.c` → `/root/grabplane-aarch64`（121/123） | 按 fb 实际 pitch/height 全量抓帧，分辨率无关（7.2 节，**首选**） |
+| `tools/chrome3/keyinject.c` → `/root/keyinject-aarch64`（121） | uinput 虚拟键盘注入：`keyinject-aarch64 right down enter`（4.1 节） |
 
 实验残留（123 上，可清理，均已被证明不必要）：
 `/usr/local/lib/{egl-linear-only,gst-videometa-shim,gst-glconvert-shim}.so`、`/root/media/`、`/tmp/cogtest/`。

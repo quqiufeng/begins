@@ -1,0 +1,47 @@
+<!doctype html><meta charset=utf-8><title>b2</title>
+<style>html,body{margin:0;height:100%;background:#111;color:#0f0;font:24px monospace;overflow:hidden}
+#o{position:fixed;z-index:99;background:#000d;padding:6px;white-space:pre;font-size:22px;line-height:1.3}
+#wrap{position:fixed;inset:0}
+canvas,video,img,div{display:block}</style>
+<div id=o>running</div><div id=wrap></div>
+<script>
+const W=innerWidth,H=innerHeight,src='http://127.0.0.1:8099/r?d=';
+const o=document.getElementById('o'),wrap=document.getElementById('wrap'),log=[];
+function report(t){try{var i=new Image();i.src=src+encodeURIComponent(t)+'&t='+Math.random();}catch(e){}}
+function mk(tag,style){const e=document.createElement(tag);if(style)Object.assign(e.style,style);wrap.appendChild(e);return e;}
+function clear(){wrap.innerHTML='';}
+function bench(name,ms,setup,frame){return new Promise(res=>{
+  clear();const st=setup();
+  let n=0,worst=0,last=performance.now(),t0=last;
+  function tick(now){
+    const dt=now-last;last=now;if(n>2&&dt>worst)worst=dt;n++;
+    try{frame(st,n,now);}catch(e){log.push(name+' ERR '+e);report(name+' ERR '+e);res();return;}
+    const el=now-t0;
+    if(el>=ms){const fps=(n-1)*1000/el;const l=name+' '+(fps).toFixed(1)+' fps worst '+worst.toFixed(0)+'ms';log.push(l);report(l);res();return;}
+    requestAnimationFrame(tick);}
+  requestAnimationFrame(tick);});}
+const S4K={position:'absolute',left:0,top:0,width:W+'px',height:H+'px'};
+async function main(){
+ log.push('view '+W+'x'+H+' dpr '+devicePixelRatio);report('view '+W+'x'+H+' dpr '+devicePixelRatio);
+ await bench('A canvas256 1px ',3000,()=>{const c=mk('canvas',{...S4K,imageRendering:'pixelated'});c.width=256;c.height=256;c.style.width='256px';c.style.height='256px';const x=c.getContext('2d');x.fillRect(0,0,256,256);return x;},
+  (x,n)=>{x.fillStyle='hsl('+n*3%360+',80%,50%)';x.fillRect(0,0,256,256);});
+ await bench('B canvas4K 1fill',3000,()=>{const c=mk('canvas',S4K);c.width=W;c.height=H;const x=c.getContext('2d',{alpha:false});x.fillRect(0,0,W,H);return x;},
+  (x,n)=>{x.fillStyle='hsl('+n*3%360+',80%,50%)';x.fillRect(0,0,W,H);});
+ await bench('C canvas4K desyn',3000,()=>{const c=mk('canvas',S4K);c.width=W;c.height=H;const x=c.getContext('2d',{alpha:false,desynchronized:true});return x;},
+  (x,n)=>{x.fillStyle='hsl('+n*3%360+',80%,50%)';x.fillRect(0,0,W,H);});
+ await bench('D div-bg 4K     ',3000,()=>mk('div',S4K),(d,n)=>{d.style.background='hsl('+n*3%360+',80%,50%)';});
+ await bench('E div-blur      ',3000,()=>{const d=mk('div',S4K);d.style.background='#3a6';d.style.filter='blur(20px)';return d;},(d,n)=>{d.style.transform='translate('+(n*5%100)+'px,0)';});
+ await bench('F img-scale     ',3000,()=>{const c=mk('canvas',{});c.width=512;c.height=512;const x=c.getContext('2d');x.fillStyle='#f80';x.fillRect(0,0,512,512);x.fillStyle='#08f';for(let i=0;i<20;i++)x.fillRect(i*25,i*20,120,90);const im=mk('img',S4K);im.src=c.toDataURL();return im;},(im,n)=>{im.style.transform='translate('+(n*7%W)+'px,'+(n*3%H)+'px)';});
+ await bench('G text-600px    ',3000,()=>{const d=mk('div',{position:'absolute',top:'20%',left:'5%',font:'600px serif',color:'#eee'});d.textContent='88';return d;},(d,n)=>{d.textContent=String(n%100);});
+ log.push('--- video ---');report('--- video ---');
+ await bench('H video720p play',6000,()=>{const v=mk('video',S4K);v.muted=true;v.autoplay=true;v.loop=true;v.src='http://127.0.0.1:8097/v.mp4';v.play();return v;},()=>{});
+ // 视频真实帧率用 requestVideoFrameCallback 单独测
+ clear();o.textContent=log.join('\n');
+ const v=mk('video',S4K);v.muted=true;v.autoplay=true;v.loop=true;
+ let vf=0,vt0=0;
+ if(v.requestVideoFrameCallback){v.requestVideoFrameCallback(function f(now,md){vf++;if(!vt0)vt0=now;if(now-vt0<6000)v.requestVideoFrameCallback(f);else{const l='I video rVFC     '+((vf-1)*1000/(now-vt0)).toFixed(1)+' fps meta '+(md.presentedFrames||'?');log.push(l);report(l);}}});}
+ v.src='http://127.0.0.1:8097/v.mp4';v.play();
+ setTimeout(()=>{o.textContent=log.join('\n');report('DONE\n'+log.join('\n'));},8000);
+}
+main();
+</script>

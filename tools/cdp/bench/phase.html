@@ -1,0 +1,22 @@
+<!doctype html><meta charset=utf-8><style>
+html,body{margin:0;height:100%;background:#111;overflow:hidden}
+#lab{position:fixed;left:20px;top:10px;font:700 28px monospace;color:#0f0;z-index:99}
+#box{position:absolute;width:120px;height:120px;background:#3cf}
+#full{position:absolute;inset:0;background:#000;z-index:-1}
+</style><div id=full></div><div id=box></div><div id=lab>init</div>
+<script>
+const b=document.getElementById('box'),f=document.getElementById('full'),l=document.getElementById('lab');
+let t0=performance.now(),ph=-1,last=0,n=0,tt=0,res=['-','-'];
+function loop(now){
+  const s=(now-t0)/1000, p=Math.floor(s/8)%2;
+  if(p!==ph){ph=p;last=now;n=0;tt=0;}
+  else if(last){n++;tt+=now-last;last=now;}
+  if(tt>500) res[p]=(n*1000/tt).toFixed(1);
+  l.textContent='SMALL '+res[0]+'fps  FULL '+res[1]+'fps   t='+s.toFixed(1);
+  if(p===0){ b.style.display='block'; f.style.background='#000';
+    b.style.transform='translate3d('+((s*120)%(innerWidth-120))+'px,'+((s*90)%(innerHeight-120))+'px,0)';
+  } else { b.style.display='none'; f.style.background='hsl('+((s*90)%360)+',80%,45%)'; }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>

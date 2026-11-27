@@ -1,0 +1,37 @@
+<!doctype html><meta charset=utf-8>
+<style>html,body{margin:0;height:100%;background:#000;color:#0f0;font:30px/1.25 monospace;overflow:hidden}
+#o{position:fixed;z-index:999;left:6px;top:6px;white-space:pre;background:#000;padding:4px}</style>
+<div id=o>boot</div>
+<script>
+var o=document.getElementById('o'),L=[];
+function show(m){L.push(m);o.textContent=L.slice(-22).join('\n');}
+window.onerror=function(m,s,l){show('ERR '+m);};
+var W=innerWidth,H=innerHeight;
+function bench(name,ms,setup,frame){return new Promise(function(res){
+ var st=setup(),n=0,worst=0,last=performance.now(),t0=last;
+ function tick(now){var dt=now-last;last=now;if(n>3&&dt>worst)worst=dt;n++;frame(st,n);
+  var el=now-t0;
+  if(el>=ms){show(name+' '+((n-1)*1000/el).toFixed(1)+'fps w'+worst.toFixed(0));if(st&&st.remove)st.remove();return res();}
+  requestAnimationFrame(tick);}
+ requestAnimationFrame(tick);});}
+function cvs(w,h){var c=document.createElement('canvas');c.width=w;c.height=h;
+ c.style.cssText='position:absolute;left:0;top:0';document.body.appendChild(c);return c;}
+async function main(){
+ show('view '+W+'x'+H);
+ // div transform, 不同面积
+ for (var d of [100,400,1200,2400]) {
+   await bench('div'+d,3000,function(){var e=document.createElement('div');
+     e.style.cssText='position:absolute;width:'+d+'px;height:'+d+'px;background:#0f0;left:0;top:0;will-change:transform';
+     document.body.appendChild(e);return e;},
+     function(e,n){e.style.transform='translate('+(n*6%(W-d))+'px,'+(n*4%(H-d))+'px)';});
+ }
+ // canvas 全量重绘，不同面积
+ for (var s of [[128,128],[512,512],[1024,1024],[1920,1080],[2560,1440],[3840,2160]]) {
+   await bench('cvs'+s[0]+'x'+s[1],3000,(function(ss){return function(){
+     var c=cvs(ss[0],ss[1]);return c.getContext('2d',{alpha:false});};})(s),
+     function(x,n){x.fillStyle='hsl('+n*7%360+',90%,50%)';x.fillRect(0,0,99999,99999);});
+ }
+ show('DONE');
+}
+main();
+</script>

@@ -1,0 +1,27 @@
+<!doctype html><meta charset=utf-8><style>
+html,body{margin:0;height:100%;background:#111;overflow:hidden}
+#lab{position:fixed;left:20px;top:12px;font:700 30px monospace;color:#0f0;z-index:99}
+#box{position:absolute;width:160px;height:160px;background:#3cf;will-change:transform}
+#full{position:absolute;inset:0;background:#000;z-index:-1}
+</style><div id=full></div><div id=box></div><div id=lab>init</div>
+<script>
+// 两个相位各 8s：A=小方块移动(仅局部脏矩形) B=整屏变色(全屏重绘)
+const b=document.getElementById('box'),f=document.getElementById('full'),l=document.getElementById('lab');
+let t0=performance.now(),ph=-1,last=0,n=0,tt=0,res=['-','-'],sent=0;
+function rep(p,v){ new Image().src='/log?p='+p+'&fps='+v+'&t='+((performance.now()-t0)/1000).toFixed(1); }
+function loop(now){
+  const s=(now-t0)/1000, p=Math.floor(s/8)%2;
+  if(p!==ph){ph=p;last=now;n=0;tt=0;}
+  else if(last){n++;tt+=now-last;last=now;}
+  if(tt>800){
+    const v=(n*1000/tt).toFixed(1); res[p]=v;
+    if(now-sent>1000){ sent=now; rep(p,v); }
+  }
+  l.textContent='A(局部)='+res[0]+'  B(全屏)='+res[1]+'  t='+s.toFixed(1)+'  '+innerWidth+'x'+innerHeight;
+  if(p===0){ b.style.display='block'; f.style.background='#000';
+    b.style.transform='translate3d('+((s*160)%(innerWidth-160))+'px,'+((s*110)%(innerHeight-160))+'px,0)';
+  } else { b.style.display='none'; f.style.background='hsl('+((s*90)%360)+',80%,45%)'; }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>

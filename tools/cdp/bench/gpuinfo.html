@@ -1,0 +1,36 @@
+<!doctype html><meta charset=utf-8><body style="margin:0;background:#000;color:#0f0;font:34px monospace">
+<div id=o>probing...</div><canvas id=c width=64 height=64 hidden></canvas>
+<script>
+var out=[];
+try{
+var c=document.getElementById('c'),gl=c.getContext('webgl2')||c.getContext('webgl');
+if(!gl){out.push('WebGL: NOT AVAILABLE');}
+else{
+ var dbg=gl.getExtension('WEBGL_debug_renderer_info');
+ out.push('WebGL: ok');
+ out.push('VENDOR: '+(dbg?gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL):gl.getParameter(gl.VENDOR)));
+ out.push('RENDERER: '+(dbg?gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER)));
+ out.push('VER: '+gl.getParameter(gl.VERSION));
+ // 测 GPU 4K 填充: 视口大渲染到 FBO 3840x2160, 60 次全屏 clear+40 rect, 计时
+ var W=3840,H=2160;
+ var tex=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,tex);
+ gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,W,H,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+ var fb=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,fb);
+ gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex,0);
+ out.push('FB status: '+(gl.checkFramebufferStatus(gl.FRAMEBUFFER)==gl.FRAMEBUFFER_COMPLETE?'complete':gl.checkFramebufferStatus(gl.FRAMEBUFFER)));
+ gl.viewport(0,0,W,H);
+ gl.disable(gl.SCISSOR_TEST);
+ gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array(4));
+ var px=new Uint8Array(4);var t0=performance.now(),N=60;
+ for(var i=0;i<N;i++){
+   gl.clearColor((i%10)/10,0.3,0.6,1);gl.clear(gl.COLOR_BUFFER_BIT);
+   for(var j=0;j<40;j++){gl.enable(gl.SCISSOR_TEST);gl.scissor((j*97)%W,(j*211)%H,320,320);gl.clearColor(j/40,0.5,0.9,1);gl.clear(gl.COLOR_BUFFER_BIT);gl.disable(gl.SCISSOR_TEST);}
+   gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,px); // 强制同步
+ }
+ var dt=performance.now()-t0;
+ out.push('GPU 4K fill: '+N+' frames in '+dt.toFixed(0)+'ms = '+(N*1000/dt).toFixed(1)+' fps (同步/帧)');
+}
+}catch(e){out.push('ERR '+e);}
+document.getElementById('o').innerHTML=out.join('<br>');
+document.title=out.join(' | ');
+</script>
