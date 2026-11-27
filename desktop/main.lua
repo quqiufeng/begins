@@ -68,6 +68,16 @@ local bar = chrome.new(cfg, theme, ttf)
 local pv = preview.new(cfg, sdl, img, ttf)
 local launcher_ = launcher.new(cfg, win, bar)
 
+-- 外部 app（阅读器/播放器）抢 KMS 走的是 window:suspend() → 销毁 renderer +
+-- quit_video()，回来 resume() 建的是**新** renderer：旧纹理全部作废。
+-- 缩略图和图标都是按 renderer 缓存纹理的，不在这里丢引用的话，回来以后
+-- tex_size 返回 0，图标就永久只剩文字徽章（123 上开完阅读器就变成这样）。
+win.hooks.before_suspend = function()
+	g:clear_thumbs(false)
+	ico:clear(false)
+	pv:clear_tex(false)
+end
+
 -- fbcon 从桌面起来就解绑，一直不 bind 回去。
 -- 每次「解绑 → 子进程 modeset → 退出 rebind」都是一次 CRTC 模式跳变
 -- （fbcon 自己的 1080p ↔ 桌面的 4K），HDMI 跟着退锁两次，电视就弹

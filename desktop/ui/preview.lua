@@ -33,8 +33,9 @@ function M:local_path(item)
 	return p or item.path
 end
 
-function M:clear_tex()
-	if self.tex then self.sdl.destroy_texture(self.tex) end
+-- renderer 马上要被销毁（外部 app 抢 KMS）时只能丢引用，destroy=false
+function M:clear_tex(destroy)
+	if self.tex and destroy ~= false then self.sdl.destroy_texture(self.tex) end
 	self.tex, self.tex_path = nil, nil
 end
 
