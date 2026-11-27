@@ -1,0 +1,2 @@
+新盒子 X98H 阅读器测试：中文渲染走仓耳今楷02，ABCDefgh 1234 latin 混排断行。
+第二段：这台盒子跑的是 Linux 7.2.12-x98，显示走 sun4i-drm + DW-HDMI。
