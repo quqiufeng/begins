@@ -93,7 +93,10 @@ keybd：
 | `desktop/assets/icons/*.png` | `/opt/desktop/assets/icons/`（`browser` 256、`wechat` 512、`usb`/`host`/`nas` 256） |
 | `desktop/assets/browser-home.html` | `/root/browser-home.html`（浏览器首页卡片，配置里是绝对路径 `file:///root/browser-home.html`） |
 | `desktop/tools/cdp.py` | `/root/cdp.py`（调 9222 的 CDP 小工具；页面线程卡死时 `Runtime.evaluate` 会超时，判活先看 `curl 127.0.0.1:9222/json/list`） |
-| `desktop/deploy/desktop.service` | `/etc/systemd/system/desktop.service`（含 `XDG_RUNTIME_DIR=/run/user/0`、`LIBSEAT_BACKEND=seatd`，cage 缺前者立即 exit 1） |
+| `desktop/deploy/desktop.service` | `/etc/systemd/system/desktop.service`（含 `XDG_RUNTIME_DIR=/run/user/0`、`LIBSEAT_BACKEND=seatd`，cage/sway 缺前者立即 exit 1） |
+| `desktop/wechat.conf` | `/opt/desktop/wechat.conf`（微信专用 **sway** 配置：2560x1440 + 壁纸 `bg … fill` + 全窗口 floating + `exec wx-center.py` + 微信退出即 `swaymsg exit`） |
+| `desktop/bin/wx-center.py` | `/opt/desktop/bin/wx-center.py`（`chmod +x`；等 `sway-ipc` socket，`swaymsg` 把微信 resize 1280×720 并居中。只用 python3 标准库） |
+| `desktop/assets/wallpaper.png` | `/opt/desktop/assets/wallpaper.png`（swaybg 的背景图，6.0MB。**主机**上用 `desktop/tools/bgra2png.py` 从同目录 `wallpaper.bgra` 转，盒上没 PIL） |
 | `keybord/*.lua`、`keybord/apps/`、`keybord/keys/`、`keybord/maps/` | `/opt/keybord/` 同名 |
 
 `keybord/apps/browser.lua`（order=25）是浏览器前台时的按键表：方向/ENTER 走 uinput 直通，
@@ -107,3 +110,21 @@ systemctl restart desktop && sleep 3
 ls -l /proc/$(systemctl show -p MainPID --value desktop)/fd | grep dri   # 有 /dev/dri/card0
 curl -s --max-time 4 127.0.0.1:9222/json/list | grep title               # 浏览器活着才通
 ```
+
+## 微信的合成器依赖（sway，2026-11-27 起）
+
+微信不属于模式 A（自己拿 master），它要在合成器里跑，所以**盒上必须装合成器包**：
+
+```bash
+apt-get install -y -q sway
+# 实装：sway 1.10.1-2、swaybg 1.2.1-1+b1 (automatic)、libjson-c5 (automatic) —— 只多 3 个包
+# 复用已有：libwlroots-0.18 0.18.2-3、seatd 0.9.1-1（须 active）、dbus-daemon→dbus-run-session、python3
+# 用不上：xwayland（配置里 xwayland disable，它是装 cage 时被拽上来的）
+```
+
+`desktop/config.lua` 的判断是 `exists("/opt/wechat/wechat") and exists("/usr/bin/sway")`：
+**有 sway 走 sway，没有就静默回退 `cage` 老路径**（不报错、不提示，只是窗口又贴回左上角、没有壁纸）。
+所以「微信窗口居中 + 壁纸」这套失效时，第一件事是查 `which sway` 与 `dpkg -l sway`。
+
+回退：`apt-get remove --purge sway swaybg`，`cage 0.2.0-2` 仍在机器上，配置不用动。
+完整包清单/落点/坑见 `../../chrome.md` §16.3.1。

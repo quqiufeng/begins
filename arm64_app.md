@@ -15,7 +15,7 @@
 | 模式 | 谁 | 上屏方式 | 输入怎么进来 |
 |---|---|---|---|
 | **A. 原生直出** | 桌面 / 播放器 / 阅读器 | 自己 `open(/dev/dri/card0)` → modeset → page flip（SDL2 `kmsdrm` / 直接 plane） | keybd 独占 evdev，按键翻译成动作打 app 的 socket |
-| **B. cage 直出** | 浏览器 / 微信（Chromium 内核） | `cage` 独占 DRM master，合成后贴 plane；app 只是 cage 里的一个 Wayland 客户端 | keybd 独占 evdev，**原样重放进 uinput 虚拟键盘**，cage/libinput 收得到 |
+| **B. 合成器直出** | 浏览器（`cage`）/ 微信（`sway`，2026-11-27 起） | 合成器独占 DRM master，合成后贴 plane；app 只是里面的一个 Wayland 客户端 | keybd 独占 evdev，**原样重放进 uinput 虚拟键盘**，合成器的 libinput 收得到 |
 
 ```
  物理遥控器（+2.4G 键鼠 dongle）
@@ -49,8 +49,9 @@
 
 | 约束 | 事实（123 实测） | 架构后果 |
 |---|---|---|
-| 没有桌面会话 | 没有 Xorg/GNOME/KDE；`cage` 是 74 包的单窗口 Wayland 合成器，不是桌面 | 一次只上一个 app；切换=停旧的起新的 |
-| cage 的启动前提 | 缺 `XDG_RUNTIME_DIR` 会立刻 exit 1；要 `LIBSEAT_BACKEND=seatd` | `desktop.service` 里已带这两个环境变量，别在 shell 里裸起 cage |
+| 没有桌面会话 | 没有 Xorg/GNOME/KDE；`cage`（74 包，浏览器用）/ `sway`（微信用）都是单窗口 Wayland 合成器，不是桌面 | 一次只上一个 app；切换=停旧的起新的 |
+| 合成器的启动前提 | 缺 `XDG_RUNTIME_DIR` 会立刻 exit 1；要 `LIBSEAT_BACKEND=seatd` | `desktop.service` 里已带这两个环境变量，别在 shell 里裸起 cage/sway |
+| 微信的合成器是 sway | `apt-get install -y -q sway`（sway 1.10.1 + swaybg + libjson-c5）；不装则 `config.lua` **静默回退 cage** | 重刷系统/换盒子必须补这一步，包清单见 `chrome.md` §16.3.1 |
 | 无 GPU 加速保证 | 4×A53 + Mali，渲染实际走 gles，合成多一次线性 buffer | 缩略图/纹理自己缓存；页面别堆动画 |
 | 内存 3.9G | 浏览器≈微信整套实测 **918M**（cage+主进程+…），余 2.7G | 大 PDF/OCR 仍要 LRU；同时只留一个 Chromium |
 | 无 cjson | 盒上 Lua 侧没有 cjson | 应答里有**扁平** `brief`；CDP 用零依赖 `/root/cdplib.lua` |
@@ -235,7 +236,7 @@ ssh x98h 'python3 -c "…connect socket, 发一行 JSON, 读一行…"'
 |---|---|
 | 桌面 / 播放器 / 阅读器（A） | 123 上日常在用；`desktop.service` active（LuaJIT 常驻 ≈102M），播放器入口 `/root/play.sh`，阅读器 `/opt/reader`，微信 `/opt/wechat` |
 | 浏览器（B） | cage+chromium kiosk 已跑通并进桌面卡片；遥控方向键经 uinput + `browser-nav.js` 能选点进入；BACK 走 Alt+Left / CDP 判首页 |
-| 微信（B） | cage + wayland 已上屏、鼠标可点；**没有 `apps/wechat.lua` 条目**，遥控器按键还没进得去 |
+| 微信（B） | **sway 1.10.1**（2026-11-27 从 cage 换过来）+ wayland 已上屏、窗口居中 1280×720、鼠标可点；**没有 `apps/wechat.lua` 条目**，遥控器按键还没进得去 |
 | 抓屏 | `grabplane` 可用；`grabscreen-aarch64` 只对 2560×1440 有效 |
 | 回归对拍 | `tools/x96-check.sh` 绑 `X96_HOST`（默认 x96），121 不可达；要在 123 上跑就得改 `X96_HOST=x98h`，且基线要重录 |
 

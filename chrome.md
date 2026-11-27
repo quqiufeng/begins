@@ -9,8 +9,9 @@
 > ② **x98h(123)** `cage + chromium + CDP`（74 包，动态页稳定、可注入任意 JS、登录态跨重启持久，**日常用这条**，第 11–12 节）；
 > ③ **x96(121)** `cog -P drm -O renderer=gles --device-scale=2`（61 包，**4K 3840x2160@60 直出已跑通**，
 >    动态页无长跑压测数据，第 15 节：分辨率链路 / 崩溃处置 / 装包清单）；
-> ④ **x98h(123)** `cage 0.2.0 + 微信 4.1.13.29 arm64`（**Chromium 内核的非浏览器 app**，
+> ④ **x98h(123)** `sway 1.10.1 + 微信 4.1.13.29 arm64`（**Chromium 内核的非浏览器 app**，
 >    718M，独占直出 2560x1440 已跑通，第 16 节：装机 / 直出原理 / 输入现状）。
+>    **合成器 2026-11-27 从 cage 换成 sway**（cage 只留作回退，见 16.3 的包清单）。
 >
 > **前置条件（第 10 节）**：123 能出画靠的是**内核侧的 H616/DE33 显示补丁集**（13 个 drm 补丁 + 2 处 DT），
 > 不是 cog 自带的。换盒子/重刷内核前先读第 10 节，否则 `cog -P drm` 连 plane 都拿不到。
@@ -1013,6 +1014,9 @@ awk '/^Start-Date: 2026-11-26/{p=1} p' /var/log/apt/history.log | grep -E 'Comma
 
 ### 16.2 直出链路（和 cog 的关键差别在这里）
 
+> 下面这份 fd/socket 证据是 **cage 时代**（2026-11-26）抓的；换成 sway 后协议层不变、链路同构，
+> 只是拿 master 的进程变成 `sway`（微信照样只开 `renderD128`）。原理段不必重写，把进程名读成"合成器"即可。
+
 实测抓到的实物证据（`/proc/<pid>/fd`、`/proc/net/unix`、`grabplane`）：
 
 ```text
@@ -1048,7 +1052,8 @@ crtc=49  fb=56  2560x1440@60  pitch=10240 bpp=32             ← 全屏单 plane
 | desktop | 自己 | 自研 GLES | 自建 fb → plane | 是（DE33 补丁） | — |
 | 阅读器 / 播放器 | 自己 | mupdf / 自研 vdec+GLES | 自建 fb → plane | 是 | — |
 | cog -P drm | 自己 | WPE WebKit + panfrost | 零拷贝挂 plane（必须 gles） | 是 | 123 会崩（第 7 节） |
-| cage + chromium / 微信 | cage | Chromium + panfrost | 合成后单 plane | **否** | 稳定 |
+| cage + chromium | cage | Chromium + panfrost | 合成后单 plane | **否** | 稳定 |
+| 微信（sway） | sway | Chromium + panfrost | 合成后单 plane | **否** | 稳定 |
 
 ### 16.3 装机
 
@@ -1095,7 +1100,74 @@ Description: wechat from Tencent
 
 空间提醒：`/opt/wechat` 718M + deb 203M，`/root` 要留出 1G 以上；`/tmp` 是 tmpfs（2G），别往那儿解包。
 
-### 16.4 启动脚本 `/root/wx-run.sh`（123 上就是这份）
+#### 16.3.1 合成器 sway：要装的包（2026-11-27 换掉 cage，**这条最容易漏**）
+
+微信不是直出 app，它得有个 Wayland 合成器替它拿 DRM master。原来用 `cage`，现在用 `sway`
+（cage 0.2 的 view 只能贴左上角：`lx/ly` 写死 0，没配置项也没 IPC，居中 + 壁纸在 cage 上做不到）。
+**换合成器 = 盒子上要多装一个 apt 包**，不装的话 `desktop/config.lua` 会静默回退到 cage 老路径
+（判断条件是 `exists("/usr/bin/sway")`，没有就 `cage -- …`）。
+
+123 实测就这么一条命令（其余全是已装依赖，`/var/log/apt/history.log` 2026-11-27 21:41）：
+
+```bash
+apt-get install -y -q sway
+# Install: swaybg:arm64 (1.2.1-1+b1, automatic), libjson-c5:arm64 (0.18+ds-1, automatic),
+#          sway:arm64 (1.10.1-2)
+```
+
+| 包 | 版本（123 实装） | 大小 | 谁要的 |
+|---|---|---|---|
+| `sway` | 1.10.1-2 | 1148 KB | 合成器本体；含 `sway` / `swaymsg` / `swaynag` |
+| `swaybg` | 1.2.1-1+b1 | 82 KB | sway 的硬 Depends，`bg … fill` 那条壁纸指令靠它 |
+| `libjson-c5` | 0.18+ds-1 | — | sway 的硬 Depends（自动） |
+
+不需要额外装的（cage 那轮已经在机器上，被 sway 复用 —— 重刷系统时才要补）：
+
+| 已有依赖 | 版本 | 谁提供 |
+|---|---|---|
+| `libwlroots-0.18` | 0.18.2-3 | sway 的合成后端库（cage 时代一起装的） |
+| `seatd` + `libseat1` | 0.9.1-1 | sway 靠 libseat 拿 DRM master；`systemctl is-active seatd` 必须 active |
+| `dbus-daemon` | 1.16.2-2 | 提供 `/usr/bin/dbus-run-session`（启动命令前缀） |
+| `python3` | 3.x（基系统） | `/opt/desktop/bin/wx-center.py` 只用标准库（glob/json/subprocess），无 pip 依赖 |
+| `xwayland` | 2:24.1.6-1 | **用不上**：配置里 `xwayland disable`；它是装 cage 时被拽上来的 |
+
+`fonts-noto-cjk` 仍照旧（中文显示），与合成器无关。
+
+配套的落盘文件（仓库 `desktop/` 同步到盒上，见 `desktop/deploy/README.md` 落点表）：
+
+| 文件 | 盒上落点 | 作用 |
+|---|---|---|
+| `wechat.conf` | `/opt/desktop/wechat.conf` | `output HDMI-A-1 mode 2560x1440 position 0 0 bg /opt/desktop/assets/wallpaper.png fill`、`default_border none`、`for_window [app_id=".*"] floating enable`、`exec wx-center.py`、`exec … wechat …; swaymsg exit` |
+| `bin/wx-center.py` | `/opt/desktop/bin/wx-center.py` | 等 `/run/user/0/sway-ipc.*.sock` 出现，`swaymsg -t get_tree` 找到 `app_id=wechat`，`resize set 1280 720` + `move absolute position` 居中（Electron 会覆盖 map 时刻的尺寸，只能在 map 后补一刀） |
+| `assets/wallpaper.png` | `/opt/desktop/assets/wallpaper.png` | swaybg 只吃图片文件；由 `tools/bgra2png.py` 从 `wallpaper.bgra` 转 |
+| `tools/bgra2png.py` | 不用上盒 | **在主机上跑**（要 `python3-PIL`；盒上没有 PIL，别在盒上执行） |
+
+壁纸两处一致性：桌面走 DRM 直接贴 `wallpaper.bgra`（14.7MB，`tools/fbwall`），微信走 swaybg 读
+`wallpaper.png`（6.0MB）。改壁纸必须两边都重生成，否则退出微信回桌面会看到背景跳一下。
+
+运行前提仍是 `XDG_RUNTIME_DIR=/run/user/0` + `LIBSEAT_BACKEND=seatd`（`desktop.service` 里已带，
+`desktop/config.lua` 起的 sway 继承这两个变量），sway 的 socket 落在 `/run/user/0/sway-ipc.<pid>.sock`。
+
+回退：`apt-get remove --purge sway swaybg` 后 `config.lua` 自动走 cage（`cage` 0.2.0-2 仍在机器上），
+不用改代码。
+
+### 16.4 启动命令（sway 现行 / cage 回退）
+
+日常入口不手打：桌面卡片「微信」由 `desktop/config.lua` 起来（`systemctl` 在位，走 desktop 的环境变量）：
+
+```text
+exec dbus-run-session -- sway -c /opt/desktop/wechat.conf
+```
+
+配置文件里后两行就是"起微信 + 微信退出即退出合成器"：
+
+```text
+exec /opt/desktop/bin/wx-center.py
+exec sh -c '/opt/wechat/wechat --no-sandbox --ozone-platform=wayland \
+            --disable-dev-shm-usage --window-size=1280,720; swaymsg exit'
+```
+
+命令行手测（先 mask 桌面，别再裸起）就写在同一份 `/root/wx-run.sh`（cage 老版本留作回退）：
 
 ```bash
 #!/bin/bash
@@ -1104,21 +1176,22 @@ systemctl stop desktop 2>/dev/null
 export XDG_RUNTIME_DIR=/run/user/0
 export LIBSEAT_BACKEND=seatd
 cd /root
-exec dbus-run-session -- cage -- /opt/wechat/wechat --no-sandbox --ozone-platform=wayland \
-  --disable-dev-shm-usage --window-size=1280,720 --start-maximized
+exec dbus-run-session -- sway -c /opt/desktop/wechat.conf     # 回退：cage -- /opt/wechat/wechat …
 ```
 
 逐条理由：
 
 - `mask --runtime desktop` + `stop`：desktop 是 `Restart=always`，只 stop 会被拉回来抢 DRM master（同第 3 节）。
   **`wx-run.sh` 只 mask 不还原**，收尾必须手动 `systemctl unmask --runtime desktop && systemctl start desktop`。
-- `XDG_RUNTIME_DIR=/run/user/0`：cage 的 wayland socket 落在这里（`/run/user/0/wayland-0`）；
-  root 直接跑不设这个，cage 会拒绝建 socket。
-- `LIBSEAT_BACKEND=seatd` + `dbus-run-session`：cage 0.2.0 靠 libseat 拿 master，seatd 已在跑；
+- `XDG_RUNTIME_DIR=/run/user/0`：合成器的 socket 落在这里（cage 是 `wayland-0`；sway 另有
+  `sway-ipc.<pid>.sock`，`wx-center.py` 靠它发 `swaymsg`）；root 直接跑不设这个，合成器会拒绝建 socket。
+- `LIBSEAT_BACKEND=seatd` + `dbus-run-session`：cage 0.2.0 / sway 1.10 都靠 libseat 拿 master，seatd 已在跑；
   dbus session 是 Chromium 系进程的最低要求（不然有一堆 dbus 报错，虽不致命）。
-- `--ozone-platform=wayland`：**必须**，否则会去找 X11 然后 `DISPLAY=:0` 连不上直接退出。
+- `--ozone-platform=wayland`：**必须**，否则会去找 X11 然后 `DISPLAY=:0` 连不上直接退出
+  （sway 这边 `xwayland disable`，没有 X 可连）。
 - `--no-sandbox` / `--disable-dev-shm-usage`：root 跑 Chromium 内核的老两样；后者是因为 `/dev/shm` 小。
-- `--window-size=1280,720` + `--start-maximized`：给个初始值，cage 全屏后仍是 2560x1440。
+- `--window-size=1280,720`：给个初始值。**sway 下窗口不再自动全屏**，由 `wx-center.py` 在 map 后
+  resize 到 1280x720 并居中（`--start-maximized` 在 sway 下没意义，可去掉）。
 - **不要加 `--disable-gpu`**：panfrost 能渲，加了反而把光栅压到 CPU（微信的圆角/阴影/图片滚动会明显掉帧）。
 
 日志：`/root/wx.log`（当前 3.4K，33 行）。
@@ -1129,7 +1202,7 @@ exec dbus-run-session -- cage -- /opt/wechat/wechat --no-sandbox --ozone-platfor
 
 | 进程 | RSS | 说明 |
 |---|---|---|
-| `cage` | 138M | 合成器 + DRM master |
+| `cage`（回退路径；sway 同量级） | 138M | 合成器 + DRM master |
 | `wechat` | 546M | 主进程（Chromium 外壳 + 主窗口） |
 | `wxocr` | 169M | 扫码/图片识别子进程 |
 | `wxplayer` ×2 | 28M + 17M | libvlc，语音视频消息 |
@@ -1148,14 +1221,14 @@ ffmpeg -f rawvideo -pix_fmt bgr0 -s 2560x1440 -i plane.raw -frames:v 1 wx.png
 
 ### 16.6 输入现状（遥控器**还进不去**，这是当前唯一断点）
 
-- cage 走 libinput + seatd（第 4 节那条链的 cage 版），**鼠标可用**：微信里点联系人/滚动都行。
+- sway 走 libinput + seatd（第 4 节那条链的合成器版），**鼠标可用**：微信里点联系人/滚动都行。
 - 2.4G 遥控器（`XING WEI 2.4G USB`）的 4 个键盘类接口 `event1/2/4/5/6` 被
   **`keybd.service`（/opt/reader/bin/luajit /opt/keybord/keybd.lua，config `grab=true`）独占**，
   而 keybd 没有建 uinput 虚拟键盘（`/proc/bus/input/devices` 里没有虚拟设备，`/dev/uinput` 空闲），
-  所以遥控器按键到不了 cage/微信。
+  所以遥控器按键到不了 sway/微信。
 - 要用遥控器，二选一（都**未做**）：
-  1. `systemctl stop keybd` 让 cage 的 libinput 直接吃遥控器（最简单，验证用）；
-  2. 给 keybd 加 app 映射（`browser`/`wechat`），把按键经 uinput 注入 cage —— 同第 4.1 节注入器思路，
+  1. `systemctl stop keybd` 让 sway 的 libinput 直接吃遥控器（最简单，验证用）；
+  2. 给 keybd 加 app 映射（`browser`/`wechat`），把按键经 uinput 注入合成器 —— 同第 4.1 节注入器思路，
      app 表目前只有 `player(30)/reader(20)/desktop(10)/shell(0)`。
 - 中文输入：装了 noto-cjk 只是**能显示**；盒子上没有 IBus/Fcitx，键盘直输英文/数字可以，
   中文得靠手机端或后续接输入法（未做）。
@@ -1166,12 +1239,12 @@ ffmpeg -f rawvideo -pix_fmt bgr0 -s 2560x1440 -i plane.raw -frames:v 1 wx.png
    panfrost 不实现该扩展，报错**无害**，别去改驱动。
 2. **`FlueGlobalStorage, fail to get keys from db, delete db_dir = /root/.xwechat/radium/mmkv/xweb_global_storage`**
    （首次启动连刷多条）：首次建库的自我修复，登录一次后消失，**不是装坏了**。
-3. **不要指望 wechat 自己 `-P drm`**：它只开 `renderD128`（只有渲染节点），拿 master 的是 cage。
-   想省掉 cage 就得像 cog 那样自己写 DRM 后端——没必要，cage 这条已验证稳定。
+3. **不要指望 wechat 自己 `-P drm`**：它只开 `renderD128`（只有渲染节点），拿 master 的是合成器。
+   想省掉合成器就得像 cog 那样自己写 DRM 后端——没必要，cage/sway 这条路已验证稳定。
 4. **`WeChatLinux_arm64.deb` 203M 别留在 `/tmp`**：tmpfs 重启即清且会静默写失败；放 `/root/deb/`。
 5. **收尾不还原 desktop，屏幕就卡在微信最后一帧**（第 3 节同款坑）：
    ```bash
-   pkill -x wechat; pkill -x cage
+   pkill -x wechat; pkill -x sway     # 回退路径时是 cage
    systemctl unmask --runtime desktop && systemctl start desktop
    systemctl is-active desktop    # 必须是 active
    ```

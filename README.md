@@ -58,7 +58,11 @@ app 自己 open("/dev/dri/card0") → modeset 设分辨率 → drmModeSetPlane/p
 | **播放器** | `hevcdec/`：C + V4L2（121 meson 自解 / 123 cedrus 硬解） | `vout.c` 直投 plane（NV12 / LINEAR） | 日常在用，硬解 720p≈14× 实时 |
 | **阅读器** | 独立仓 `quqiufeng/reader`：LuaJIT + MuPDF（39 个 .lua / 6250 行） | 同上，kmsdrm 全屏 | 日常在用 |
 | **浏览器** | `cog`（WPE WebKit，47 包）`-P drm`；备选 `cage + chromium`（74 包） | cog 自己占 DRM master 零拷贝直出；cage 那条多一次合成成线性 buffer | **已跑通**：123 2560×1440、121 4K 3840×2160@60；详见 [`chrome.md`](chrome.md) |
-| **微信** | 微信 Linux 版 4.1.13.29 arm64（Chromium 内核，718M） | `cage` 合成后贴 plane，独占 2560×1440 | **已跑通**（123）；遥控器按键还没接进去，鼠标可点 |
+| **微信** | 微信 Linux 版 4.1.13.29 arm64（Chromium 内核，718M） | `sway 1.10.1` 合成后贴 plane，独占 2560×1440（壁纸 + 窗口居中 1280×720） | **已跑通**（123）；遥控器按键还没接进去，鼠标可点 |
+
+> 微信这条要额外装合成器包：`apt-get install -y -q sway`（实装 sway + swaybg + libjson-c5，
+> 共用已有的 libwlroots-0.18/seatd/dbus-run-session）。不装不报错，桌面会**静默回退到 cage**。
+> 包清单、`wechat.conf`/`wx-center.py`/`wallpaper.png` 落点见 [`chrome.md`](chrome.md) §16.3.1。
 
 ### 遥控器是唯一输入 → 它就是个「智能轻显示端」
 
