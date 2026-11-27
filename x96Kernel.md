@@ -397,8 +397,16 @@ ssh root@192.168.1.121 'lsmod | grep -c vdec; dmesg | grep -i meson_vdec; v4l2-c
 
 本次结果：`Image` 32512512 B，md5 `fa0a45cd93293add25b70aeb3a64539a`，
 `build-clamp-builtin-1127.log` / `build-clamp2-1127.log` 均 `RC=0`、vdec 相关 0 warning，
-`modules_install` 也 `RC=0`。**盒子 121 当时离线（`ping` 不通），运行时验证未做**，
-刷上后要按上面 ② 补一遍。
+`modules_install` 也 `RC=0`。
+
+**这版没装机**：盒子 121 一直在跑 2026-11-19 的 `#11`（`/boot/zImage` 32444928 B /
+md5 `ced8780025c8c5c3eb0b9a13abe0225f`，`lsmod | grep -c vdec` = 3，vdec 仍是模块）。
+所以上面 ② 的运行时证据仍然缺，刷上才算完。
+
+> **误判记录（2026-11-27）**：我曾写「盒子 121 离线（`ping` 不通）」——这是假的。
+> 本机**根本没装 `ping`**（`bash: ping: 未找到命令`，退出码 127），我把「命令不存在」
+> 读成了「主机不通」。判断盒子死活用 `ssh -o ConnectTimeout=5 root@192.168.1.121 'uname -r'`，
+> 或用 `ip neigh` / `timeout 3 bash -c 'cat </dev/tcp/192.168.1.121/22'`，别依赖 `ping`。
 
 ---
 
@@ -425,9 +433,9 @@ vdec 内置那版（2026-11-27）：
 
 | 项 | 本机产物 | 盒子 |
 |---|---|---|
-| `Image` | 32512512 B / md5 `fa0a45cd93293add25b70aeb3a64539a` | 待刷（121 离线，未验） |
+| `Image` | 32512512 B / md5 `fa0a45cd93293add25b70aeb3a64539a` | **未刷**：盒上仍是 32444928 B / `ced87800`（`#11` Nov 19） |
 | `vmlinux` | 41576832 B，含 `max_refs %u > HW limit` 串 | — |
-| `.ko` | 输出树已无 `meson-vdec.ko` | `/lib/modules/.../vdec/` 该目录应只剩空壳或不存在 |
+| `.ko` | 输出树已无 `meson-vdec.ko` | 刷后 `lsmod` 应无 vdec（当前 3 个，说明还是旧模块内核）|
 | 编译 | `build-clamp-builtin-1127.log` / `build-clamp2-1127.log` `RC=0`，0 warning | — |
 
 ---
