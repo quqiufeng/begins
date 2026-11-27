@@ -22,10 +22,10 @@
 |---|---|---|
 | `export_cookies.lua` + `cookiecrypt.c`（+ 自建 `libcookiecrypt.so`） | **本机** | 解本机 Chrome/Chromium 的 cookie（keyring + AES-128-CBC）→ Lua 表。LuaJIT FFI 直读 SQLite，C 补件做 keyring + 解密 |
 | `cage.sh` | 盒上 | 独占 DRM 起 cage+chromium，前台 exec，日志 `/tmp/cage.log` |
-| `startcage.sh` | 盒上 | 同上但后台 + 等 CDP ready + 修默认字号 + 光栅调优 |
+| `startcage.sh` | 盒上（实体在仓库 `tools/cog/startcage.sh`，`deploy.sh` 推到 `/root/cog/`，`/root/startcage.sh` 是转发壳） | 同上但后台 + 等 CDP ready + 修默认字号 + 光栅调优 |
 | `inject.lua` | 盒上 | 注入 cookie → 导航 → 等渲染 → 打印验登录 JSON（gm/dy/jb 顺带截图） |
 | `browser-nav.js` + `navinject.lua` | 盒上 | 遥控方向键选链接（见 §3.5） |
-| `browser.lua` | 盒上 `/opt/keybord/apps/` | keybd 的 browser app：返回语义（见 §3.5） |
+| `browser.lua` | 盒上 `/opt/keybord/apps/`，仓库同一份 `keybord/apps/browser.lua`（只在 `keybord/` 留一份，别在 `tools/` 再放副本） | keybd 的 browser app：返回语义（见 §3.5） |
 
 依赖盒上已有的 `/root/cdplib.lua`（WebSocket/CDP 零依赖库，源自 `tools/cdp/cdp_do.lua`）。
 
@@ -38,7 +38,8 @@ LJ=~/.local/share/lite/third_party/luajit/src/luajit   # 本机没有 luajit 在
 $LJ tools/chrome3/export_cookies.lua ~/.config/google-chrome/Default /tmp/wb.lua weibo.com,sina.com.cn
 #   知乎：hosts 用 zhihu.com,zhimg.com
 scp /tmp/wb.lua x98h:/root/wbcookies.lua        # 或走 base64 推送
-scp tools/chrome3/{cage.sh,startcage.sh,inject.lua} x98h:/root/
+scp tools/chrome3/{cage.sh,inject.lua} x98h:/root/
+scp tools/cog/startcage.sh x98h:/root/cog/   # 启动脚本实体在 cog/，或直接跑 hevcdec/deploy.sh
 
 # 盒上：起浏览器（后者等 CDP ready 再返回）
 ssh x98h 'bash /root/startcage.sh wb'
