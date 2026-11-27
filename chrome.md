@@ -1048,9 +1048,24 @@ crtc=49  fb=56  2560x1440@60  pitch=10240 bpp=32             ← 全屏单 plane
 
 ### 16.3 装机
 
-包来自腾讯官网的 arm64 deb（本机下载后 scp 到盒子，`/root/deb/`）：
+包来自腾讯官网的 arm64 deb（本机下载后 scp 到盒子，`/root/deb/`）。
+
+页面：<https://linux.weixin.qq.com/>（x86_64 / arm64 / LoongArch，deb|rpm|AppImage）
+
+直链（2026-11-27 复验，`HTTP 200`，`Content-Length: 211831284` = 202M，
+`Last-Modified: Fri, 20 Nov 2026 06:53:38 GMT`）：
+
+```text
+https://dldir1v6.qq.com/weixin/Universal/Linux/WeChatLinux_arm64.deb
+```
+
+同目录另外两个格式（换后缀即可，x86_64/LoongArch 同理）：
+`WeChatLinux_arm64.rpm`、`WeChatLinux_arm64.AppImage`。
 
 ```bash
+curl -LO https://dldir1v6.qq.com/weixin/Universal/Linux/WeChatLinux_arm64.deb
+scp WeChatLinux_arm64.deb x98h:/root/deb/          # 盒子直连也行：curl -LO <上面的直链>
+
 ls -lh /root/deb/WeChatLinux_arm64.deb
 # -rw-r--r-- 1 root root 203M  /root/deb/WeChatLinux_arm64.deb
 
@@ -1157,3 +1172,301 @@ ffmpeg -f rawvideo -pix_fmt bgr0 -s 2560x1440 -i plane.raw -frames:v 1 wx.png
    systemctl is-active desktop    # 必须是 active
    ```
 6. 磁盘/内存水位：718M 程序 + 546M 常驻，`/` 与 `/root` 余量低于 500M 时先清 `/root/media`、`/tmp/cogtest`。
+
+## 17. YouTube 登录态直出 + 视频播放实测（2026-11-27，123）
+
+这一节回答两件事：**怎么让盒子上的浏览器带着本机 Chrome 的登录态打开 YouTube**，
+以及**视频能不能真的在 DRM 上放出来**。结论：能，音视频分离，画面通过，声音没有。
+
+### 17.1 链路总览
+
+```
+本机 Chrome profile ──解密──> ytcookies.lua ──CDP Network.setCookie──> 盒上 chromium
+                                                                        │ cage (DRM master)
+本机 127.0.0.1:6880 (digilink) <──链式── 盒上 mihomo 127.0.0.1:7890 <──┘ --proxy-server
+```
+
+- **不要拷 `Cookies` 加密库文件**：Chrome 的 key 在 keyring 里，换机器/换用户解密必失败。
+  正确做法是本机解密成明文表，再到盒子上用 CDP 一条条 `setCookie`。
+- 代理不是可选项：123 直连 YouTube 不通，盒子靠自己的 mihomo 出口，链路见附录。
+
+### 17.2 本机侧：把 Chrome cookie 解成 Lua 表
+
+脚本 `tmp/export_cookies.py`（一次性工具，跑完可删）：
+
+```bash
+python3 tmp/export_cookies.py ~/.config/google-chrome/Default /tmp/ytcookies.lua
+# 总 N 行，选中 228 条（youtube/.google），解失败 0 -> /tmp/ytcookies.lua
+```
+
+关键点（Linux 版 Chrome）：
+
+| 环节 | 写法 | 坑 |
+|---|---|---|
+| 取密钥 | `Secret.Service` 找 label `Chrome Safe Storage` | 没有 python3-gi / keyring 没解锁则拿不到 |
+| 派生 | `pbkdf2_hmac('sha1', pw, b'saltysalt', **1**, 16)` | Linux 迭代 **1**；抄 macOS 的 1003 会直接解不开 |
+| 解密 | AES-128-CBC，IV = 16 个空格 | `EVP_aes_128_cbc.restype` 必须声明成 `c_void_p`，否则指针被截断 → 段错误 |
+| 明文头 | 新版前 32 字节 = `sha256(host)`，**要跳过** | 不跳会解出乱码 cookie |
+| Chrome 在跑 | 先 `shutil.copy` 一份 `Cookies` 到 /tmp | 运行中 SQLite 被锁，直接 open 会 `database is locked` |
+
+### 17.3 盒上侧：注入 + 验证登录
+
+`/root/ytcage.sh`（cage 起 chromium，kiosk + 9222）：
+
+```bash
+export XDG_RUNTIME_DIR=/run/user/0 LIBSEAT_BACKEND=seatd
+exec dbus-run-session -- cage -- chromium \
+  --kiosk --no-sandbox --disable-dev-shm-usage \
+  --ozone-platform=wayland --remote-debugging-port=9222 --remote-allow-origins='*' \
+  --proxy-server=http://127.0.0.1:7890 \
+  --user-data-dir=/root/.config/chromium about:blank
+```
+
+注入用 `inject_yt.lua`（依赖 `cdplib.lua`，= `tools/cdp/cdp_do.lua` 的库部分）：
+
+```bash
+scp tmp/ytcookies.lua tmp/inject_yt.lua tmp/cdplib.lua x98h:/root/
+ssh x98h '/opt/reader/bin/luajit /root/inject_yt.lua /root/ytcookies.lua 9222 https://www.youtube.com/'
+# [page] about:blank
+# [cookie] 注入成功 228 / 失败 0
+# [check] {"avatar":true,"signin_btn":false,"vids":..,"thumbs":..,"name":"..."}
+```
+
+- **带前导点的域必须用 `domain`**，不带点的用 `url`（`https://host/path`），否则 `setCookie` 失败。
+- 注入完必须 `Page.navigate` 重载一次才生效；`#avatar-btn` 存在 = 已登录，比看 cookie 数量可靠。
+
+### 17.4 播放实测
+
+`ytplay.lua` 走**真实 DOM 点击**（`a#thumbnail[href*="/watch"].click()`），不伪造 player API：
+
+```
+[click] https://www.youtube.com/watch?v=...
+[ 2s] {"t":1.8,"ready":4,"paused":false,"w":1280,"h":720,"dur":...,"q":60,"drop":1}
+...
+[60s] {... "q":1613,"drop":128,"t":...}
+```
+
+| 项 | 实测值 | 说明 |
+|---|---|---|
+| 分辨率 | 1280x720 | 自适应，不是 2560x1440（网络带宽 + VP9 软解） |
+| 帧数 / 丢帧 | 1613 / 8% | 4x A53 软解 720p 的合理水平，不是卡死 |
+| 画面是否上屏 | 是 | 播放中连抓两帧，`raw` 差 222 万字节；HDMI 肉眼正常 |
+| 抓帧命令 | `/root/grabscreen-aarch64 /dev/dri/card0 /tmp/yt.raw` | raw 是 **BGRA**，转 PNG 必须 `-pix_fmt bgr0` |
+
+```bash
+ssh x98h '/root/grabscreen-aarch64 /dev/dri/card0 /tmp/yt.raw >/dev/null'
+scp x98h:/tmp/yt.raw /tmp/yt.raw
+ffmpeg -f rawvideo -pix_fmt bgr0 -s 2560x1440 -i /tmp/yt.raw -vf scale=900:-1 yt.png
+```
+
+**视频走的是软解 VP9/AV1 → 合成上屏**，没走 V4L2 硬解（`v4l2slvp9dec` 不可用），
+所以 720p 已经是这颗 SoC 的天花板，1080p 会掉帧更狠。
+
+### 17.5 唯一没解决的：声音
+
+- 页面内音频**确实在解码**：`webkitAudioDecodedByteCount` ≈ 1.85 MB。
+- 但 `/dev/snd/pcmC0D0p` **没有进程打开**，盒上也没有 pulseaudio/pactl 守护进程。
+- 即 Chromium 在容器里找不到可用的 ALSA/Pulse 输出设备，静默丢音。
+- 和播放器那条链不是一个问题（那边是自己 `aout_open` 直接写 ALSA），
+  浏览器要出声得给它一个 **PulseAudio 或裸 ALSA 输出**，且注意 123 上 `card1`（H616 Codec）没有 pcm 节点，
+  只有 `card0`(HDMI) 有 —— 即浏览器出声只能走 HDMI 内嵌音频。
+
+### 17.6 坑（本节新增）
+
+1. **`--password-store=basic` 是给"拷 profile 到新机器"用的，和 cookie 注入二选一**；两者混用会出现
+   登录态在、但部分站点反复掉。
+2. **`about:blank` 起、注入后再 navigate**：先开会话再注入，比直接开 YouTube 再注入稳
+   （直接开时首个请求已带空 cookie，YouTube 会给未登录分支，之后注入也不换渲染树）。
+3. **cookie 明文文件（`ytcookies.lua`）用完就删**：里面有 `SID`/`HSID` 等等价于密码，别留在 `/tmp` 或仓库。
+4. **收尾必还原桌面**（同 16.7.5）：`pkill -x chromium; pkill -x cage;
+   systemctl unmask --runtime desktop && systemctl start desktop`，再 `systemctl is-active desktop` 确认。
+
+### 17.7 附录：两个脚本原文（`tmp/` 是 gitignore 的临时目录，会随时清掉，所以正文留档）
+
+**A. `export_cookies.py`（本机跑，只读本机 profile，输出 Lua 表）**
+
+```python
+#!/usr/bin/env python3
+"""把本机 Chrome/Chromium 的 cookie 解密导出成 Lua 表字面量（给盒上 luajit 注入用）。
+   本机专用：只读本机 keyring + profile，不落明文到仓库外。"""
+import sys, os, sqlite3, hashlib, ctypes, ctypes.util, shutil, tempfile
+
+def load_secret(label):
+    import gi
+    gi.require_version('Secret', '1')
+    from gi.repository import Secret
+    svc = Secret.Service.get_sync(Secret.ServiceFlags.LOAD_COLLECTIONS, None)
+    for c in svc.get_collections():
+        c.load_items_sync(None)
+        for it in c.get_items():
+            if (it.get_label() or '') == label:
+                it.load_secret_sync(None)
+                v = it.get_secret()
+                if v:
+                    return bytes(v.get()).decode()
+    return None
+
+lib = ctypes.CDLL(ctypes.util.find_library('crypto'))
+lib.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
+lib.EVP_aes_128_cbc.restype = ctypes.c_void_p          # ← 必须声明，否则指针被截断成 int → 段错误
+lib.EVP_DecryptInit_ex.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+lib.EVP_DecryptUpdate.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_char_p, ctypes.c_int]
+lib.EVP_DecryptFinal_ex.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+lib.EVP_CIPHER_CTX_free.argtypes = [ctypes.c_void_p]
+
+def decrypt(key, blob):
+    if not blob or blob[:3] not in (b'v10', b'v11'):
+        return None
+    ct = blob[3:]
+    ctx = lib.EVP_CIPHER_CTX_new()
+    if lib.EVP_DecryptInit_ex(ctx, lib.EVP_aes_128_cbc(), None, key, b' ' * 16) != 1:
+        return None
+    out = ctypes.create_string_buffer(len(ct) + 32)
+    n = ctypes.c_int()
+    if lib.EVP_DecryptUpdate(ctx, ctypes.addressof(out), ctypes.byref(n), ct, len(ct)) != 1:
+        return None
+    total = n.value
+    if lib.EVP_DecryptFinal_ex(ctx, ctypes.addressof(out) + total, ctypes.byref(n)) != 1:
+        lib.EVP_CIPHER_CTX_free(ctx)
+        return None
+    total += n.value
+    lib.EVP_CIPHER_CTX_free(ctx)
+    return out.raw[:total]
+
+SAMESITE = {-1: 'Unspecified', 0: 'None', 1: 'Lax', 2: 'Strict'}
+
+def main(profile, out_path, hosts=('youtube', '.google')):
+    # Chrome 运行中 SQLite 被锁，先快照
+    tmp = os.path.join(tempfile.gettempdir(), 'host-cookies.db')
+    shutil.copy(os.path.join(profile, 'Cookies'), tmp)
+    pw = load_secret('Chrome Safe Storage') or load_secret('Chromium Safe Storage')
+    if not pw:
+        sys.exit('keyring 里没找到 Safe Storage')
+    key = hashlib.pbkdf2_hmac('sha1', pw.encode(), b'saltysalt', 1, 16)   # Linux 迭代 1（macOS 才是 1003）
+    db = sqlite3.connect(tmp)
+    rows = db.execute('select host_key,name,encrypted_value,path,expires_utc,is_secure,is_httponly,samesite from cookies').fetchall()
+    sel, bad = [], 0
+    for host, name, enc, path, exp, sec, ho, ss in rows:
+        if hosts and not any(h in host for h in hosts):
+            continue
+        pt = decrypt(key, enc)
+        if pt is None:
+            bad += 1
+            continue
+        if pt[:32] == hashlib.sha256(host.encode()).digest():     # 新版明文前 32 字节 = sha256(host)
+            pt = pt[32:]
+        try:
+            value = pt.decode()
+        except UnicodeDecodeError:
+            bad += 1
+            continue
+        sel.append((host, name, value, path, exp, bool(sec), bool(ho), ss))
+    with open(out_path, 'w') as f:
+        f.write('return {\n')
+        for host, name, value, path, exp, sec, ho, ss in sel:
+            f.write('  {domain=%r,name=%r,value=%r,path=%r,expires=%d,secure=%s,httpOnly=%s,sameSite=%r},\n' % (
+                host, name, value, path, int(exp / 1000000 - 11644473600),
+                'true' if sec else 'false', 'true' if ho else 'false', SAMESITE.get(ss, 'Unspecified')))
+        f.write('}\n')
+    print('总 %d 行，选中 %d 条（%s），解失败 %d -> %s' % (len(rows), len(sel), '/'.join(hosts), bad, out_path))
+
+if __name__ == '__main__':
+    prof = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser('~/.config/google-chrome/Default')
+    out = sys.argv[2] if len(sys.argv) > 2 else '/tmp/ytcookies.lua'
+    main(prof, out)
+```
+
+**B. `inject_yt.lua`（盒上跑，`/opt/reader/bin/luajit`；WS/CDP 库用 `cdplib.lua`）**
+
+库文件 `cdplib.lua` = `tools/cdp/cdp_do.lua` 前 413 行的库部分 + 导出表，别重复造：
+`lib.http_get_json_list()`、`lib.ws_open(path)`、`lib.jenc/jdec`。
+
+```lua
+-- inject_yt.lua —— 把 cookies 表逐条 Network.setCookie 注入当前 chromium，然后打开 youtube 验登录
+--   用法: luajit inject_yt.lua /root/ytcookies.lua [9222] [url]
+--   依赖同目录 cdplib.lua（= tools/cdp/cdp_do.lua 前 413 行的库部分 + 导出表）
+arg = { [3] = select(2, ...) or "9222" }
+local lib = dofile("/root/cdplib.lua")
+local cookies = dofile(select(1, ...) or "/root/ytcookies.lua")
+local url = select(3, ...) or "https://www.youtube.com/"
+
+local status, body = lib.http_get_json_list()
+if status ~= "200" then print("ERROR /json/list HTTP " .. tostring(status)); os.exit(1) end
+local list = lib.jdec(body)
+local target
+for _, t in ipairs(list) do
+  if t.type == "page" and t.webSocketDebuggerUrl then target = t break end
+end
+if not target then print("ERROR 没有 page 目标"); os.exit(1) end
+print("[page] " .. tostring(target.url))
+local wpath = target.webSocketDebuggerUrl:match("^ws://[^/]+(/.*)$")
+local ws, werr = lib.ws_open(wpath)
+if not ws then print("ERROR WS 握手失败 " .. tostring(werr)); os.exit(1) end
+
+local id = 0
+local function rpc(method, params)
+  id = id + 1
+  local myid = id
+  ws.send_frame(lib.jenc({ id = myid, method = method, params = params or {} }))
+  for _ = 1, 4000 do
+    local f = ws.recv_frame()
+    if not f then return nil end
+    if f.op == 1 and #f.payload > 0 then
+      local msg = lib.jdec(f.payload)
+      if type(msg) == "table" and msg.id == myid then return msg end
+    elseif f.op == 8 then return nil end
+  end
+end
+
+rpc("Network.enable")
+rpc("Page.enable")
+local ok, fail, errs = 0, 0, {}
+for i, c in ipairs(cookies) do
+  local host = c.domain
+  local params = {
+    name = c.name, value = c.value, path = c.path or "/",
+    secure = c.secure, httpOnly = c.httpOnly, sameSite = c.sameSite,
+    expires = c.expires,
+  }
+  -- 带前导点的域必须用 domain；不带点的用 url 更稳
+  if host:sub(1, 1) == "." then
+    params.domain = host
+  else
+    params.url = "https://" .. host .. (c.path or "/")
+  end
+  local r = rpc("Network.setCookie", params)
+  if r and r.result and r.result.success then ok = ok + 1
+  else
+    fail = fail + 1
+    if #errs < 3 then errs[#errs + 1] = host .. ":" .. c.name .. " => " .. lib.jenc(r and (r.error or r.result) or {}) end
+  end
+end
+print(string.format("[cookie] 注入成功 %d / 失败 %d", ok, fail))
+```
+
+**C. 播放验证的核心表达式**（`ytplay.lua` 里真正有用的就这两条）：
+
+```lua
+-- 真实 DOM 点击第一个视频（不要用 player API，YouTube 会判非用户操作）
+(function(){var a=document.querySelector('a#thumbnail[href*="/watch"]')||
+  document.querySelector('ytd-rich-item-renderer a[href*="/watch"]');
+  if(!a)return 'no-link';var h=a.href;a.click();return h})()
+
+-- 每秒轮询播放状态
+(function(){var v=document.querySelector('video');if(!v)return 'no-video';
+  return JSON.stringify({t:+v.currentTime.toFixed(2),ready:v.readyState,paused:v.paused,
+    w:v.videoWidth,h:v.videoHeight,dur:Math.round(v.duration),
+    q:v.getVideoPlaybackQuality().totalVideoFrames,
+    drop:v.getVideoPlaybackQuality().droppedVideoFrames})})()
+```
+
+**D. 登录态判定表达式**（`inject_yt.lua` 60 行之后的部分，注入完 `Page.navigate` 再跑）：
+
+```js
+(function(){var b=document.querySelector('#avatar-btn');
+  return JSON.stringify({title:document.title, href:location.href, avatar:!!b,
+    signin_btn:!!document.querySelector('a[href*="ServiceLogin"]'),
+    vids:document.querySelectorAll('ytd-rich-item-renderer, ytd-video-renderer').length,
+    thumbs:document.querySelectorAll('img[src^="https://i.ytimg"]').length})})()
+```
+`avatar:true` + `signin_btn:false` 才是真登录；只看 cookie 注入数量会被"注入成功但已过期"骗。
