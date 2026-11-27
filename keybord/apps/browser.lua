@@ -124,7 +124,12 @@ end
 
 function M.detect(env)
 	if not up("cage") then return false, "no cage" end
-	return true, up("chromium") and "cage+chromium" or "cage"
+	-- cage 单跑不是浏览器：微信/其它 wayland app 也是 `cage -- <app>` 起的。
+	-- 以前这里只判 cage，微信前台被当成浏览器，返回键交给 browser.run("back")，
+	-- 而它只会合成 KEY_BACK(158)（微信不认）→ 按返回毫无反应，桌面也收不到
+	-- nav.back（launcher:stop 永远不触发）。必须以 chromium 为判据。
+	if not up("chromium") then return false, "cage without chromium" end
+	return true, "cage+chromium"
 end
 
 function M.run(action, key, env)
