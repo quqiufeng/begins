@@ -259,6 +259,27 @@ local function go_up()
 	end
 end
 
+-- HOME = 回桌面首页（cfg.home_dir 那个虚拟目录），不是「光标挪到第一项」。
+-- 之前在任意子目录按 HOME 只把选中项拉回 1，看着像没反应；要回桌面只能
+-- 一路 BACK。/root/.config/desktop 里配的 home_dir 才是桌面本体。
+local function go_home()
+	if fs.dir ~= cfg.home_dir then
+		local from = fs.dir
+		local ok, err = fs:scan(cfg.home_dir)
+
+		if not ok then toast(tostring(err), 2, theme.warn); return false end
+		logf("HOME → 桌面（从 " .. tostring(from) .. "）")
+	else
+		-- 已经在桌面：退化成光标回第一项，按键别像失灵的
+		toast("已在桌面", 1.4, theme.text_dim)
+	end
+
+	g:home(fs)
+	layout()
+	dirty = true
+	return true
+end
+
 function rescan()
 	fs:scan(fs.dir, fs:current() and fs:current().name)
 	layout()
@@ -276,7 +297,7 @@ local function on_key(name)
 	elseif name == "DOWN" then g:move(fs, 0, 1)
 	elseif name == "PAGEUP" or name == "CHANNELUP" then g:page(fs, -1)
 	elseif name == "PAGEDOWN" or name == "CHANNELDOWN" then g:page(fs, 1)
-	elseif name == "HOME" then g:home(fs)
+	elseif name == "HOME" then go_home()
 	elseif name == "MENU" then
 		-- 遥控器 ☰ 键（实测报 KEY_3+Ctrl，keybd 派 nav.menu）：只刷新列表。
 		-- 这里以前顺带 theme.cycle(1) 换配色，结果 ☰ 一按主题就变——用户以为
