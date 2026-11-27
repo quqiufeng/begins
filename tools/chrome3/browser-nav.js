@@ -20,6 +20,10 @@
 
   var SEL = 'a[href],[role="link"],[role="button"],button,input[type="submit"],[data-href]';
   var EDITABLE = 'input,textarea,select,[contenteditable=""],[contenteditable="true"]';
+  /* 页头/导航容器：遥控是看内容的，顶部那一排菜单/Logo/搜索框选不中不心疼。
+     只认「容器语义」，不按元素大小一刀切 —— 正文里的小链接（标签、目录、评论楼）还要能选。 */
+  var NAVBOX = 'header,nav,[role="banner"],[role="navigation"],' +
+               '#masthead,#topbar,.site-header,.site-header-wrap,.navbar,.nav-bar,.top-nav,.header-nav';
   var CLS = 'lite-nav-focus';
   var cur = null;          /* { el: Element } */
 
@@ -48,9 +52,28 @@
     return true;
   }
 
+  /* 在页头/导航条里？（含固定在视口顶部的悬浮条：很多站页头是 position:fixed，不挂在 <header> 下） */
+  function in_nav(el) {
+    try {
+      if (el.closest && el.closest(NAVBOX)) return true;
+    } catch (e) {}
+    var r = el.getBoundingClientRect();
+    /* 贴在视口顶部 12% 以内的定宽条：高度小、横跨半个屏以上，就是条工具栏 */
+    if (r.top < window.innerHeight * 0.12 && r.height < 60 && r.width > window.innerWidth * 0.4) {
+      var p = el, s = null;
+      for (var i = 0; p && i < 4; i++, p = p.parentElement) {
+        try { s = window.getComputedStyle(p); } catch (e) { break; }
+        if (!s) break;
+        if (s.position === 'fixed' || s.position === 'sticky') return true;
+      }
+    }
+    return false;
+  }
+
   /* 当前方向可选的元素（每次按键重算，页面是活的） */
   function items() {
     var out = [], list;
+    var vp = window.innerWidth * window.innerHeight || 1;
     try { list = document.querySelectorAll(SEL); } catch (e) { return out; }
     for (var i = 0; i < list.length && out.length < 800; i++) {
       var el = list[i];
@@ -58,10 +81,15 @@
       if (el.closest && el.closest(EDITABLE)) continue;
       if (!visible(el)) continue;
       var r = el.getBoundingClientRect();
+      var area = r.width * r.height;
       /* 同一个框里套了好几层（缩略图 a > 图片 a）：只留面积最小的那层 */
-      out.push({ el: el, r: r, area: r.width * r.height });
+      out.push({ el: el, r: r, area: area, big: area >= vp * 0.008, nav: in_nav(el) });
     }
-    return out;
+    if (!out.length) return out;
+    /* 页头导航整排丢掉；万一整页候选都在导航容器里（有些站把内容也塞 <nav>），保留原样别把人困死 */
+    var content = [];
+    for (var i = 0; i < out.length; i++) if (!out[i].nav) content.push(out[i]);
+    return content.length ? content : out;
   }
 
   function center(r) { return { x: r.left + r.width / 2, y: r.top + r.height / 2 }; }
@@ -72,15 +100,16 @@
       ref = { el: cur.el, r: cur.el.getBoundingClientRect() };
     }
     if (!ref) {
-      /* 还没选过：从视口里最靠左上那个开始，别一上来就选中页头里的隐藏跳转链接 */
-      var first = null, bestKey = Infinity;
+      /* 还没选过：优先落在大块内容上（视频卡/文章封面），没有大块再退到最靠左上那个 */
+      var first = null, bestKey = Infinity, bigFirst = null, bigKey = Infinity;
       for (var i = 0; i < list.length; i++) {
         var q = list[i].r;
         if (q.bottom < 8 || q.top > window.innerHeight - 8) continue;
         var k = Math.max(0, q.top) * 10000 + q.left;
         if (k < bestKey) { bestKey = k; first = list[i]; }
+        if (list[i].big && k < bigKey) { bigKey = k; bigFirst = list[i]; }
       }
-      return first || (list.length ? list[0] : null);
+      return bigFirst || first || (list.length ? list[0] : null);
     }
     var c = center(ref.r), best = null, bestScore = Infinity;
     for (var i = 0; i < list.length; i++) {
@@ -93,8 +122,9 @@
       else if (dir === 'left') { if (dx > -8) continue; primary = -dx; secondary = Math.abs(dy); }
       else if (dir === 'down') { if (dy < 8) continue; primary = dy; secondary = Math.abs(dx); }
       else { if (dy > -8) continue; primary = -dy; secondary = Math.abs(dx); }
-      /* 主方向距离为主，垂直偏移重罚：斜着跳三行不如正前方跳一格 */
-      var score = primary + 6 * secondary;
+      /* 主方向距离为主，垂直偏移重罚：斜着跳三行不如正前方跳一格。
+         小元素乘 1.8：和大块内容抢位置时让路，但它们没被禁掉（标签、目录这类还要能选到）。 */
+      var score = (primary + 6 * secondary) * (it.big ? 1 : 1.8);
       if (score < bestScore) { bestScore = score; best = it; }
     }
     return best;

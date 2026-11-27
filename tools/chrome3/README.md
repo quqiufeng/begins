@@ -57,8 +57,9 @@ YouTube 换看视频：`luajit /root/inject.lua yt` 之后跑 `ytplay.lua`（§1
 
 | 文件 | 在哪跑 | 作用 |
 |---|---|---|
-| `browser-nav.js` | 页面内（CDP 注入） | 方向键按几何距离选「最近的链接/按钮」并加黄框；OK 真点它（`A.click()` 不生效时兜底 `location.href`）；其他键不拦。首页 `browser-home.html` 与 `chrome://` 内建页直接 return，不抢键 |
+| `browser-nav.js` | 页面内（CDP 注入） | 方向键按几何距离选「最近的链接/按钮」并加黄框；OK 真点它（`A.click()` 不生效时兜底 `location.href`）；其他键不拦。首页 `browser-home.html` 与 `chrome://` 内建页直接 return，不抢键。页头/导航条（`header`/`nav`/`[role=banner]`/`.site-header`/贴顶 fixed-sticky 横条）整排不参与选点，面积 ≥0.8% 视口的大块内容优先（小元素得分 ×1.8 让路但不禁用），首次落点优先视口内最靠左上的大块 |
 | `navinject.lua` | 盒上常驻 | 每 2s 扫 CDP `/json/list`，对新 page 目标下 `Page.addScriptToEvaluateOnNewDocument` + 立刻 `Runtime.evaluate` 一次，SPA 跳转后仍生效；单实例靠 `/run/navinject.pid`，日志 `/tmp/navinject.log` |
+| `naveval.lua` | 盒上调 `luajit naveval.lua <js文件> [9222]` | 调试口：CDP `Runtime.evaluate` 在当前 page 里跑一段 JS 并打印返回值（查 `__navState()`/`__liteNav` 用，不用截图） |
 | `browser.lua` | `/opt/keybord/apps/browser.lua` | keybd 的 browser app：`BACK` 不在首页时合成 `KEY_BACK(158)` 交给 chromium 走历史；**在首页则收掉 chromium/cage 并 `systemctl restart desktop`** |
 
 配套的关键修复在 `keybord/keybd.lua`：浏览器前台时 `BACK`/`ESC` **不直通**（否则页面先自己退一步，
