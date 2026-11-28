@@ -3901,8 +3901,19 @@ static int run_raw_sink(unsigned w, unsigned h, double fps)
 	int fdy, fdc;
 	unsigned char *py, *pc, *ty, *tc;
 	double t0;
+	/* 落后丢帧：和自解码路径（play_due + DROP_LATE）同一套语义。
+	 * 缺省阈值 = 一帧：晚不到一帧就等（等得起），超过就丢了追回来。
+	 * DROP_LATE=0 关掉，留着做「丢」与「不丢」的对照。 */
+	double drop_late;
+	long dropped = 0;
+	long sync_ms0 = -1;
+	int sync_dbg = getenv("SYNC") ? 1 : 0;
 
 	if (fps > 0) g_raw_fps = fps;
+	/* 阈值要等 g_raw_fps 定下来才能算，所以放在这一行之后 */
+	drop_late = getenv("DROP_LATE") ? atof(getenv("DROP_LATE"))
+					: (g_raw_fps > 0 ? 1000.0 / g_raw_fps : 0);
+	if (drop_late < 0) drop_late = 0;
 	printf("RAWIN: %ux%u @%.3ffps  硬件解码（ffmpeg v4l2request）→ 只上屏\n",
 	       w, h, g_raw_fps);
 	signal(SIGTERM, raw_sig);
@@ -3960,10 +3971,30 @@ static int run_raw_sink(unsigned w, unsigned h, double fps)
 		}
 		if (read_full(0, ty, ytight) < 0 || read_full(0, tc, ctight) < 0)
 			break;	/* ffmpeg 收工 / 被停 */
-		raw_copy_plane(py, ty, w, h, yp);
-		raw_copy_plane(pc, tc, w, h / 2, yp);
 		n++;
 		g_raw_frames = n;
+		/* 落后丢帧：先算这一帧该上屏的时刻（t0 + n/fps），已经晚了
+		 * 超过阈值就只把它吞掉 —— 连 memcpy 和上屏都省了，下一帧的
+		 * due 又往后走一格，误差因此钉死在阈值以内。
+		 *
+		 * 以前这里只有「落后 0.5s 就重锚 t0」，重锚等于把画面整体往
+		 * 后拖，而音频照真实时间走（aout 读 fifo），越拖越不同步。
+		 * 前两帧不丢：首帧必须上屏，音频才有开闸的基准。
+		 */
+		due = t0 + n / g_raw_fps;
+		now = now_s();
+		if (drop_late > 0 && n > 2 && (now - due) * 1000.0 > drop_late) {
+			dropped++;
+			if (dropped <= 5 || dropped % 50 == 0) {
+				printf("RAWIN: 落后丢帧 第%lu帧 late=%.0fms 阈值=%.0fms（累计 %ld）\n",
+				       n, (now - due) * 1000.0, drop_late, dropped);
+				fflush(stdout);
+			}
+			if (g_raw_stop || pctl_want_exit()) break;
+			continue;
+		}
+		raw_copy_plane(py, ty, w, h, yp);
+		raw_copy_plane(pc, tc, w, h / 2, yp);
 		if (glout_frame(fdy, fdc, w, h, yp, yp) < 0) {
 			printf("RAWIN: 上屏失败\n");
 			break;
@@ -3972,10 +4003,25 @@ static int run_raw_sink(unsigned w, unsigned h, double fps)
 			audio_gate(0);	/* 首帧上屏才开闸，声音不抢在画面之前 */
 			printf("RAWIN: 首帧上屏\n");
 		}
+		/* 同步观测（SYNC=1）：画面位置 = n/fps，音频位置 = aout 已播，
+		 * d = 音频 - 画面。自解码路径是 AVSYNC2，这里是 RAWSYNC。 */
+		if (sync_dbg && n % 24 == 1) {
+			long ams = aout_played_ms();
+
+			if (ams >= 0) {
+				if (sync_ms0 < 0) sync_ms0 = ams;
+				printf("RAWSYNC n=%lu audio_ms=%ld frame_pos=%.2f "
+				       "audio_pos=%.2f d=%+ldms drop=%ld\n",
+				       n, ams, (double)n / g_raw_fps,
+				       (double)(ams - sync_ms0) / 1000.0,
+				       (ams - sync_ms0) - (long)(n * 1000.0 / g_raw_fps),
+				       dropped);
+				fflush(stdout);
+			}
+		}
 		/* 节拍：睡到 t0 + n/fps。glout_frame 本身只等一个 vblank，
 		 * 不节拍的话 40fps 的解码速度会把 23.976 的片子放成 1.67 倍速。
 		 */
-		due = t0 + n / g_raw_fps;
 		now = now_s();
 		if (due > now) {
 			struct timespec ts;
