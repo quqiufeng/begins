@@ -346,8 +346,14 @@ function M:draw(ren, fs, W, H)
 			local name_h = #lines * line_h
 			local ly = iy + ih + 10
 			local bottom = y + self.cell_h - pad
-			-- 右下角小字：文件夹给项数做不了（要再扫），这里给类别/大小
-			local meta = item.meta or (item.dir and "文件夹" or fs.human_size(item.size))
+			-- 右下角小字：只给文件/文件夹（"文件夹"/大小）。首页的 app 格子
+			-- （item.app）一律不画——图标 + 下面居中名字就够了，右下角再挤一行
+			-- "应用/聊天/扫码改 Key" 纯噪声。
+			local meta
+
+			if not item.app then
+				meta = item.meta or (item.dir and "文件夹" or fs.human_size(item.size))
+			end
 			-- 两行长名 + 小字会打架：空间不够时不画小字（名字更重要），
 			-- 名字块再整体上移贴底，别溢出到下一张卡片。
 			local show_meta = (ly + name_h + 4 + t.font_small) <= bottom
@@ -358,7 +364,7 @@ function M:draw(ren, fs, W, H)
 					x + floor(self.cell_w / 2), ly + (li - 1) * line_h,
 					sel and t.text_sel or t.text, "center")
 			end
-			if show_meta then
+			if show_meta and meta then
 				self.ttf.draw(ren, self.font_path, meta, t.font_small,
 					x + self.cell_w - pad, bottom - t.font_small,
 					sel and t.accent or t.text_dim, "right")

@@ -234,7 +234,7 @@ if env("DESKTOP_APPS", "1") ~= "0" then
 	-- 图标是 assets/icons/qr.png，由 tools/gen-qr.sh 按本机 IP 生成：
 	-- 换 IP/端口就重跑那个脚本，桌面重开即生效（这里不写死 URL，免得两份真相）。
 	-- last = true：core/fs.lua 把它排到最右边（U 盘图标也插在它前面）。
-	add_app({ name = "更新Key", kind = "qr", meta = "扫码改 Key", last = true })
+	add_app({ name = "更新Key", kind = "qr", last = true })
 end
 M.launch_log = env("DESKTOP_LAUNCH_LOG", "/tmp/desktop-launch.log")
 
