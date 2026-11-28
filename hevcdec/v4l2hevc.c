@@ -3901,6 +3901,11 @@ static int run_raw_sink(unsigned w, unsigned h, double fps)
 	int fdy, fdc;
 	unsigned char *py, *pc, *ty, *tc;
 	double t0;
+	/* 暂停起点（0=没在暂停）。RAW 这条路的时间轴是纯墙钟 t0 + n/fps，
+	 * 暂停期间墙钟照走、n 不动 —— 不把暂停时长补回 t0，恢复后 due 就
+	 * 永久落在 now 后面，每帧都"落后"，一路被丢光：音频照走，画面冻死
+	 * 在暂停那一帧（实测 late 恒 2.7~3.8s，drop 一直涨）。 */
+	double t_pause0;
 	/* 落后丢帧：和自解码路径（play_due + DROP_LATE）同一套语义。
 	 * 缺省阈值 = 一帧：晚不到一帧就等（等得起），超过就丢了追回来。
 	 * DROP_LATE=0 关掉，留着做「丢」与「不丢」的对照。 */
@@ -3951,6 +3956,7 @@ static int run_raw_sink(unsigned w, unsigned h, double fps)
 	pctl_set_sources(raw_pos_ms, raw_au);
 
 	t0 = now_s();
+	t_pause0 = 0;
 	for (;;) {
 		double due, now;
 
@@ -3964,10 +3970,24 @@ static int run_raw_sink(unsigned w, unsigned h, double fps)
 		 * 补画 —— 不补的话冻住的那一帧会把提示条永远挂在屏上。
 		 */
 		if (pctl_paused()) {
+			if (!t_pause0)
+				t_pause0 = now_s();	/* 记下进暂停的时刻 */
 			if (osd_poll_dirty())
 				glout_repaint();
 			usleep(20000);
 			continue;
+		}
+		if (t_pause0) {
+			/* 刚恢复：暂停期间墙钟走了、n 没走，把这段补进锚点。
+			 * 音频那头同样被 pctl 停了这么久，所以顺延后两条时间轴
+			 * 仍然对齐（aout 的 played_ms 也是暂停期间冻住的）。
+			 */
+			double el = now_s() - t_pause0;
+
+			t0 += el;
+			t_pause0 = 0;
+			printf("RAWIN: 恢复播放（暂停 %.2fs，配速锚点顺延）\n", el);
+			fflush(stdout);
 		}
 		if (read_full(0, ty, ytight) < 0 || read_full(0, tc, ctight) < 0)
 			break;	/* ffmpeg 收工 / 被停 */
@@ -3991,6 +4011,18 @@ static int run_raw_sink(unsigned w, unsigned h, double fps)
 				fflush(stdout);
 			}
 			if (g_raw_stop || pctl_want_exit()) break;
+			/* 落后超过 0.5s 不是抖动而是跳变（暂停没记全、断流、
+			 * 上游卡了一大段）：光丢帧追不回来——丢的那几帧照样要
+			 * 从管道里读出来，n 和墙钟同步前进，late 因此永远不变。
+			 * 这里直接把锚点重设到当前帧，宁可跳一小段，也不让画面
+			 * 冻在最后一帧（数据面条）。
+			 */
+			if (now - due > 0.5) {
+				t0 = now - n / g_raw_fps;
+				printf("RAWIN: 落后 %.2fs，配速锚点重设（跳过这段）\n",
+				       now - due);
+				fflush(stdout);
+			}
 			continue;
 		}
 		raw_copy_plane(py, ty, w, h, yp);
