@@ -25,7 +25,11 @@ M.map = {
 	RIGHT = "next", NEXTSONG = "next",
 	LEFT = "prev", PREVIOUSSONG = "prev",
 	-- 音量 / 静音
+	-- 这台的遥控音量键上报的不是 VOLUMEUP/KEY_VOLUMEUP(115)，而是
+	-- LEFTCTRL+KEY_4 / LEFTCTRL+KEY_5（name 为 C-4 / C-5），所以两头都要写。
 	VOLUMEUP = "volup", VOLUMEDOWN = "voldn", MUTE = "mute",
+	C4 = "volup", C5 = "voldn", C2 = "mute",
+	["C-4"] = "volup", ["C-5"] = "voldn", ["C-2"] = "mute",
 	-- 状态 / 退出
 	INFO = "status", BLUE = "status",
 	BACK = "quit", ESC = "quit", EXIT = "quit", STOP = "quit", STOPCD = "quit",

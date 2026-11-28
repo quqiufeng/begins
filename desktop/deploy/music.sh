@@ -73,7 +73,8 @@ exec mpv --no-config --vo=gpu --gpu-context=drm --fs --osc=no \
 	--ao=alsa --audio-device="$DEV" --volume="$VOL" \
 	--http-header-fields="$AUTH" \
 	--lavfi-complex="$LAVFI" \
-	--osd-level=0 --script=/root/pl-osd.lua \
+	--osd-level=0 --osd-font="${OSD_FONT:-TsangerJinKai02}" \
+	--script=/root/pl-osd.lua \
 	--playlist="$LIST" --shuffle --loop-playlist=inf \
 	--cache=yes --cache-secs=60 \
 	--input-ipc-server="$SOCK"
