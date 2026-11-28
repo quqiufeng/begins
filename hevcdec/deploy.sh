@@ -69,7 +69,7 @@ cd "$DIR" || exit 1
 # 所以先探驱动再决定编不编/推哪个 —— 别再像 11-25 那样把单平面推给 121，
 # 盒子上直接 S_FMT OUT EINVAL、整条播放链断掉（docs/box-matrix.md §2/§4）。
 # 探测失败（老盒子没 sysfs 名字）时按 BOX 名兜底，仍不确定才认 PLANE 变量。
-MPLANE_BIN="$DIR/dist/hevcdec-20261119-1949-84d7124/v4l2hevc-aarch64"
+MPLANE_BIN="$DIR/dist/hevcdec-20261128-1717-50e246b-drop/v4l2hevc-aarch64"
 BOX_DRV=$(ssh "$BOX" 'cat /sys/class/video4linux/video0/name 2>/dev/null' 2>/dev/null)
 case "$BOX_DRV" in
 *meson*)		BOX_PLANE=mplane ;;

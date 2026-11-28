@@ -61,6 +61,7 @@ ffmpeg -v error -i <片源>.mkv -map 0:v:0 -c copy \
 | `RENDER` | `auto` / `drm`（直出 plane）/ `gl`（GLES3 出图） |
 | `NOWRITE` | 播放时不必再设了：**`PLAY=1` 且没给 `OUTYUV` 时默认不落盘**。要边播边存就显式 `OUTYUV=xx.yuv`（会打一行 `OUT:` 确认）；纯解码不带 `PLAY` 仍默认落 `/tmp/out.yuv` |
 | `FPS` / `LEAD` | 配速与领先量，默认 24 / 6；`NOPACE` 关节拍 |
+| `DROP_LATE` | 落后丢帧阈值（ms），默认 0 → 按一帧算（24fps ≈ 42ms）；`0` 关掉。解码渲染一帧超过预算时，硬撑会把欠账线性累积，丢一帧抹平；`DROPBG=1` 打每次丢帧的 late/thr |
 | `TMDITHER=0` | 关有序抖动（A/B 比效果用） |
 
 `mkv` 是 length-prefixed，要喂 `-bsf:v hevc_mp4toannexb` 转 Annex-B
