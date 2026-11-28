@@ -141,3 +141,34 @@ systemctl show -p Environment desktop | tr ' ' '\n' | grep -E 'XDG_RUNTIME_DIR|L
 
 回退：`apt-get remove --purge sway swaybg`，`cage 0.2.0-2` 仍在机器上，配置不用动。
 完整包清单/落点/坑见 `../../chrome.md` §16.3.1。
+## display-adapt 与 desktop 的 job 死锁（2026-11-28 实修）
+
+`display-adapt.service` 是 `Type=oneshot` + `Before=desktop.service`，脚本在「当前模式 ≠ EDID 首选」
+时会自己 `systemctl stop desktop` → `drm-setmode` → `systemctl start desktop`。而 desktop 的 **start job**
+按 `Before=` 必须等 display-adapt 脚本退出 —— 脚本同步等 start job 完成，**脚本等 job、job 等脚本**，
+`systemctl list-jobs` 里就摆着 `display-adapt start running` + `desktop start waiting`，屏幕一直黑。
+`resident-heal` 每 10s `start desktop` 也永远拉不起来，`ExecMainStatus=15` 只是 display-adapt 自己
+`stop desktop` 发的 TERM，不是崩溃。
+
+修法（盒上已生效，脚本第 112 行）：
+
+```bash
+systemctl --no-block start desktop      # 原：systemctl start desktop
+```
+
+`--no-block` 只入队不等待，脚本立刻退出、`Before=` 解锁，job 自己跑完。
+`stop desktop` 那步不用改：实测（1280x720 → 3840x2160@60）全链路 rc=0、无残留 job。
+
+死锁已经发生时：
+
+```bash
+systemctl list-jobs                      # 看到 desktop start waiting 就是这个
+kill -TERM $(pgrep -f 'systemctl start desktop')   # 只杀卡住的同步 start
+systemctl reset-failed desktop
+systemctl --no-block start desktop
+```
+
+另注：脚本 `pref()` 取的是 `drm-setmode --list` 里 `[preferred]` 那行的**带刷新率**值
+（`3840x2160@60`），所以 `same_mode()` 能把 `3840x2160@24` 判成不一致并修正过来；
+只写 `3840x2160` 会让它以为已经对了，桌面就长期停在模式表首项 @24（滑动发涩）。
+修正成功后脚本会 `rm -f /run/display-adapt.tried`，跳过逻辑不会粘住；但要手动重试先删这个文件。

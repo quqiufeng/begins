@@ -1,0 +1,13 @@
+# /etc/systemd/system/display-adapt.service
+[Unit]
+Description=HDMI display adapt (EDID 模式表 → 分辨率)
+After=local-fs.target
+Before=desktop.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/display-adapt 10
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

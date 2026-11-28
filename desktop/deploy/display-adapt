@@ -1,0 +1,121 @@
+#!/bin/bash
+# display-adapt — 显示适配：优先用显示器真实 EDID（DDC 现读），DDC 读不到才挂固件兜底
+set -u
+exec 9>/run/display-adapt.lock
+flock -n 9 || { printf '%s %s\n' "$(date +%T)" "另一实例在跑，退出" >>/run/display-adapt.log; exit 0; }
+CONN=/sys/class/drm/card0-HDMI-A-1
+LOG=/run/display-adapt.log
+TRIED=/run/display-adapt.tried
+WAIT=${1:-10}
+SM=/usr/local/bin/drm-setmode
+# 兜底固件 EDID（只有 DDC 完全读不到时才用）
+FALLBACK_FW=${FALLBACK_FW:-edid/active.bin}
+FW_BIN=/lib/firmware/$FALLBACK_FW
+
+log(){ printf '%s %s\n' "$(date +%T)" "$*" >>"$LOG"; }
+nmodes(){ local n; n=$(wc -l 2>/dev/null < "$CONN/modes"); echo "${n:-0}"; }
+cur_mode(){
+  # 返回 "宽x高@刷新"（刷新率能拿到才带），只比 宽x高 会把 4K30 误判成 4K60
+  local l m r
+  l=$(grep -m1 'mode:' /sys/kernel/debug/dri/0/state 2>/dev/null)
+  m=$(printf '%s' "$l" | grep -oE '"[0-9]+x[0-9]+"' | tr -d '"' | head -1)
+  r=$(printf '%s' "$l" | sed -n 's/.*": *\([0-9][0-9]*\).*/\1/p' | head -1)
+  if [ -z "$m" ]; then
+    m=$(head -1 /sys/class/graphics/fb0/modes 2>/dev/null | grep -oE '[0-9]+x[0-9]+' | head -1)
+    r=$(head -1 /sys/class/graphics/fb0/modes 2>/dev/null | sed -n 's/.*p-\{0,1\}\([0-9][0-9]*\).*/\1/p' | head -1)
+  fi
+  [ -z "$m" ] && { echo unknown; return; }
+  [ -n "$r" ] && echo "$m@$r" || echo "$m"
+}
+same_mode(){
+  # $1=实际 $2=目标（目标可能不带 @刷新）
+  local a="$1" b="$2"
+  [ "$a" = "$b" ] && return 0
+  [ "${a%%@*}" = "${b%%@*}" ] && [ "$b" = "${b%%@*}" ] && return 0
+  return 1
+}
+fw_get(){ cat /sys/module/drm/parameters/edid_firmware 2>/dev/null | tr -d " \r"; }
+fw_set(){ printf '%s' "$1" > /sys/module/drm/parameters/edid_firmware 2>/dev/null; }
+# 清空只能用 NUL 字节：内核 param_set_copystring 走 strnlen，写 "0"/"\n" 都会变成固件名，
+# 导致 probe 时 "Requesting EDID firmware \"0\" failed (err=-2)" 刷屏
+fw_clear(){ printf '\0' > /sys/module/drm/parameters/edid_firmware 2>/dev/null; }
+pref(){
+  local p
+  p=$("$SM" --list 2>/dev/null | awk '/\[preferred\]/{print $2; exit}')
+  [ -z "$p" ] && p=$(head -1 "$CONN/modes" 2>/dev/null | tr -d ' \r')
+  echo "$p"
+}
+reprobe(){ echo detect > "$CONN/status" 2>/dev/null; sleep 2; }
+# 等模式表出现（DDC 有热身延迟）
+wait_modes(){
+  local dl=$(( $(date +%s) + ${1:-10} ))
+  while [ "$(nmodes)" -eq 0 ] && [ "$(date +%s)" -lt "$dl" ]; do reprobe; done
+  nmodes
+}
+
+# 0) 摘掉固件 EDID 覆盖，改用显示器真实 EDID；真读不到再挂回兜底
+cur_fw=$(fw_get)
+if [ -n "$cur_fw" ] && [ "$cur_fw" != "0" ]; then
+  if fw_clear; then
+    log "摘掉 EDID 固件覆盖（原 $cur_fw）→ 试真实 EDID"
+    reprobe
+    if [ "$(nmodes)" -gt 0 ]; then
+      log "真实 EDID 可用：$(nmodes) 项模式，首选 $(pref)"
+    else
+      log "摘掉覆盖后仍无模式 → 挂回兜底 $FALLBACK_FW"
+      if [ -s "$FW_BIN" ] && fw_set "$FALLBACK_FW"; then
+        reprobe
+        log "已挂回 $FALLBACK_FW（$(nmodes) 项模式，首选 $(pref)）"
+      fi
+    fi
+  else
+    log "清 EDID 覆盖失败（写 edid_firmware 被拒）"
+  fi
+else
+  log "EDID 用真实显示器数据（无固件覆盖）"
+fi
+
+# 1) 还是没有模式表 = EDID 彻底读不到，挂兜底固件
+if [ "$(wait_modes "$WAIT")" -eq 0 ]; then
+  if [ -s "$FW_BIN" ] && fw_set "$FALLBACK_FW"; then
+    log "无 EDID（DDC 失败）→ 挂兜底 $FALLBACK_FW"
+    reprobe
+  fi
+fi
+if [ "$(nmodes)" -eq 0 ]; then
+  log "仍无 EDID 模式表 → 保持内核合成模式 $(cur_mode)"
+  exit 0
+fi
+
+# 2) 首选模式
+PREF=$(pref)
+case "${PREF:-}" in
+  [0-9]*x[0-9]*) : ;;
+  *) log "拿不到首选模式 → 不调整"; exit 0 ;;
+esac
+
+CUR=$(cur_mode)
+if same_mode "$CUR" "$PREF"; then
+  log "首选 $PREF，当前 $CUR 已一致（模式表 $(nmodes) 项）"
+  exit 0
+fi
+if [ -f "$TRIED" ] && [ "$(cat "$TRIED")" = "$PREF" ]; then
+  log "首选 $PREF，当前 $CUR；已尝试过，暂不重复(重试: rm $TRIED)"
+  exit 0
+fi
+echo "$PREF" > "$TRIED"
+log "首选 $PREF，当前 $CUR 不一致 → 停桌面 + 直接 modeset + 起桌面"
+systemctl stop desktop 2>/dev/null
+sleep 1
+"$SM" "$PREF" >>"$LOG" 2>&1 || log "drm-setmode $PREF 失败"
+sleep 1
+systemctl --no-block start desktop 2>/dev/null
+sleep 5
+AFTER=$(cur_mode)
+log "修正后当前 $AFTER"
+if same_mode "$AFTER" "$PREF"; then
+  log "已修正到 $AFTER"
+  rm -f "$TRIED"
+else
+  log "仍不一致($AFTER)，保留 $TRIED 防循环"
+fi

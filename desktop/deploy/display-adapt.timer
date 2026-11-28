@@ -1,0 +1,12 @@
+# /etc/systemd/system/display-adapt.timer
+[Unit]
+Description=周期复查 HDMI EDID 与当前分辨率
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=120s
+AccuracySec=5s
+Unit=display-adapt.service
+
+[Install]
+WantedBy=timers.target
