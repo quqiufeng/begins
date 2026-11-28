@@ -182,6 +182,14 @@ if env("DESKTOP_APPS", "1") ~= "0" then
 		})
 	end
 	add_app({ name = "本机", kind = "host", meta = "本机文件", goto = M.home })
+	-- 音乐：mpv 全屏（频谱 + 播放列表 OSD）放 NAS 曲库，遥控由 keybd 的
+	-- apps/music.lua 走 mpv 的 IPC 口 /tmp/m.sock（键位见那个文件）。
+	-- 脚本在 /root/music.sh（deploy/music.sh），歌单默认 /root/music.m3u。
+	add_app({
+		name = "音乐", kind = "music", meta = "音乐",
+		app = true,
+		cmd = env("DESKTOP_MUSIC_APP_CMD", "/root/music.sh"),
+	})
 	-- 浏览器：cage 独占 DRM + chromium kiosk。这台盒子上 cog/WPE 已经不在系统里了
 	-- （dpkg 无 cog、全盘无 cog 二进制），cage+chromium 是还能跑通的直出路线。
 	if exists("/usr/bin/cage") and exists("/usr/bin/chromium") then
