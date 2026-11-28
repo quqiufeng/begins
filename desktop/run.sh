@@ -24,4 +24,11 @@ if [ -x /opt/desktop/lib/kmsflip.so ] && [ -n "${KMSFLIP}" ]; then
 	export KMSFLIP_LOG=${KMSFLIP_LOG:-/tmp/kmsflip.log}
 fi
 export LUAJIT=${LUAJIT:-/opt/reader/bin/luajit}
+# 「更新Key」二维码里装的是 http://<本机IP>:8080/ —— IP 是 DHCP 分的，换网、
+# 续租换段就变，而 assets/icons/qr.png 是预生成文件，写死了当时的地址。每次起
+# 桌面按当前地址重出一遍（gen_qr.lua FFI 直调 libqrencode + zlib，528² 几毫秒），
+# 失败只吞掉不阻塞桌面 —— 顶多二维码停在旧地址，扫出来打不开而已。
+if [ -x "$LUAJIT" ] && [ -f tools/gen_qr.lua ]; then
+	"$LUAJIT" tools/gen_qr.lua --scale 16 --margin 4 --level M >/dev/null 2>&1 || true
+fi
 exec "$LUAJIT" main.lua "$@"
