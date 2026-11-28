@@ -71,3 +71,7 @@ meson-vdec/logs/
 # 调试期临时备份（*.bak-1124-1855 这类带时间戳的现场备份）
 *.bak-*
 .tmp-*/
+
+# 桌面「更新Key」二维码：tools/gen-qr.sh 按本机 IP 生成，两台盒子各不相同，
+# 入库就等于把某一台的 IP 当成真相（部署到另一台会扫到别人的 8080）。
+desktop/assets/icons/qr.png

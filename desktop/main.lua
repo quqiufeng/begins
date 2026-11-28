@@ -72,10 +72,13 @@ local launcher_ = launcher.new(cfg, win, bar)
 -- quit_video()，回来 resume() 建的是**新** renderer：旧纹理全部作废。
 -- 缩略图和图标都是按 renderer 缓存纹理的，不在这里丢引用的话，回来以后
 -- tex_size 返回 0，图标就永久只剩文字徽章（123 上开完阅读器就变成这样）。
+-- 二维码全屏视图的纹理也挂在 renderer 上，同理只能丢引用不能 destroy。
+local qr_on, qr_tex = false, nil
 win.hooks.before_suspend = function()
 	g:clear_thumbs(false)
 	ico:clear(false)
 	pv:clear_tex(false)
+	qr_tex = nil
 end
 
 -- fbcon 从桌面起来就解绑，一直不 bind 回去。
@@ -186,7 +189,11 @@ local function open_current()
 	-- 外部 app 回来了：解除自动化口的 busy（pump 期间只答只读查询）
 	if auto then auto.busy = false end
 
-	if res == "into" then
+	if res == "qr" then
+		-- 二维码：全屏大字才扫得动（launcher 只说"这是二维码"，怎么画归 main）
+		qr_on, qr_tex = true, nil
+		dirty = true
+	elseif res == "into" then
 		-- 进目录只是 fs:enter()，全程没碰 KMS（launcher:open 对 item.dir 直接 return，
 		-- 根本不跑外部命令），所以【绝对不能】suspend/resume。
 		-- 老代码在这里 win:suspend()+resume()：suspend 会 SDL_DestroyWindow +
@@ -300,6 +307,8 @@ end
 local function on_key(name)
 	name = tostring(name or ""):upper()
 
+	-- 二维码全屏：任意键关掉。必须排在预览前面，否则 LEFT/RIGHT 会被预览吃掉
+	if qr_on then qr_on = false; dirty = true; return true end
 	if pv:key(name) then dirty = true; return true end
 	if name == "LEFT" then g:move(fs, -1, 0)
 	elseif name == "RIGHT" then g:move(fs, 1, 0)
@@ -733,6 +742,27 @@ local function boot()
 		tostring(win.driver), theme.font_scale or 1))
 end
 
+-- 二维码全屏：白底黑块尽量铺满（按框等比 contain，倍数取整让模块边缘不糊）。
+-- 直接放大已经生成好的 qr.png（528px、16px/模块），比在 Lua 里重画矩阵省事，
+-- 也不需要 qrencode 的 ASCII 输出解析。
+local function draw_qr(ren)
+	if not qr_on then return end
+	if not qr_tex then
+		local dir = cfg.icons_dir or (cfg.assets_dir and (cfg.assets_dir .. "/icons"))
+		qr_tex = dir and img.texture(ren, dir .. "/qr.png") or nil
+	end
+	if not qr_tex then qr_on = false; return end
+	local tw, th = sdl.tex_size(qr_tex)
+	if not tw or tw <= 0 or th <= 0 then qr_tex = nil; return end
+	local box = floor(min(win.W, win.H) * 0.88)
+	local s = floor(box / max(tw, th))
+	if s < 1 then s = min(win.W / tw, win.H / th) end
+	local dw, dh = floor(tw * s), floor(th * s)
+	sdl.clear(ren, theme.bg)
+	sdl.copy(ren, qr_tex, { x = floor((win.W - dw) / 2), y = floor((win.H - dh) / 2),
+		w = dw, h = dh })
+end
+
 local function draw()
 	local ren = win.ren
 
@@ -743,6 +773,7 @@ local function draw()
 	bar:draw_bottom(ren, fs, win.W, win.H, sdl)
 	bar:draw_toast(ren, win.W, win.H, sdl)
 	pv:draw(ren, win.W, win.H)
+	draw_qr(ren)
 	win:present()
 end
 

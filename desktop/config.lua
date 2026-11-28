@@ -229,6 +229,12 @@ if env("DESKTOP_APPS", "1") ~= "0" then
 				.. "--window-size=1280,720 --start-maximized"),
 		})
 	end
+	-- 二维码（书架最后一格）：扫一下就是 8080 那把「更新 API Key」页
+	-- （lite setup --host 0.0.0.0 --port 8080，见 lite-setup.service）。
+	-- 图标是 assets/icons/qr.png，由 tools/gen-qr.sh 按本机 IP 生成：
+	-- 换 IP/端口就重跑那个脚本，桌面重开即生效（这里不写死 URL，免得两份真相）。
+	-- last = true：core/fs.lua 把它排到最右边（U 盘图标也插在它前面）。
+	add_app({ name = "更新Key", kind = "qr", meta = "扫码改 Key", last = true })
 end
 M.launch_log = env("DESKTOP_LAUNCH_LOG", "/tmp/desktop-launch.log")
 

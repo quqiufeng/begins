@@ -360,6 +360,9 @@ function M:open(fs, preview, item)
 		if not ok then return nil, err end
 		return "into"
 	end
+	-- 二维码：书架上的图标只有几十像素，手机对不上焦，交回 main 画全屏
+	-- （任意键关掉，见 main.lua 的 qr_on / draw_qr）
+	if kind == "qr" then return "qr" end
 	-- 直出 app：没有文件参数，起进程后等它退出，桌面自动回来（run 里已 suspend）
 	if item.app then
 		if not item.cmd or item.cmd == "" then

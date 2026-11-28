@@ -240,14 +240,19 @@ local function app_items(cfg)
 
 	local used = {}
 
-	for i, a in ipairs(cfg.apps or {}) do
+	-- 一条 cfg.apps → 一条虚拟条目
+	local function push(a, i)
 		used[a.name] = true
 		out[#out + 1] = {
 			name = a.name, path = "app://" .. tostring(a.kind) .. "/" .. tostring(i),
 			dir = false, kind = a.kind, ext = "", size = 0, mtime = 0,
-			app = true, cmd = a.cmd, goto = a.goto,
+			app = true, cmd = a.cmd, goto = a.goto, last = a.last,
 			meta = a.meta or "应用",
 		}
+	end
+
+	for i, a in ipairs(cfg.apps or {}) do
+		if not a.last then push(a, i) end
 	end
 	-- U 盘：只有在这一刻真的插着（热插拔已经挂上）才出图标，
 	-- 拔盘时 main.lua 的 on_change 重扫首页，图标跟着消失。
@@ -268,6 +273,11 @@ local function app_items(cfg)
 			app = true, goto = v.mnt,
 			meta = v.mnt or "U盘",
 		}
+	end
+	-- last = true 的 app（二维码）：钉在书架最右边。U 盘是热插拔动态出现的，
+	-- 只有放到 USB 那一轮之后再追加，位置才不会被新插的盘顶到后面去。
+	for i, a in ipairs(cfg.apps or {}) do
+		if a.last then push(a, i) end
 	end
 	return out
 end
