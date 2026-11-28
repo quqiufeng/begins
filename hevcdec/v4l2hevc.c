@@ -2454,6 +2454,16 @@ double g_play_fps = 24.0;	/* 播放配速；0 = 不限速（测吞吐） */
  * 出来——"跳段"（两边一起丢）和"错位"（只丢画面）是两种完全不同的病，
  * 光看日志分不清。d = 音频走过的时长 - 画面帧号走过的时长。 */
 static int    g_sync_dbg;
+/* 落后丢帧（DROP_LATE=<ms>，0=关，缺省=一帧的时间）。
+ * 解码渲染一帧要真花钱：4K 屏上 GPU 整屏放大一帧 30~46 ms，而 24 fps
+ * 的格子只有 41.7 ms —— 硬撑"一帧不丢"的结果就是每帧都欠一点点账，欠
+ * 账只能往后排队（配速只许迟到不许早到），误差线性累积（实测 45 s 漂
+ * +1.9 s，越到后面越像"声音一点一点跑到前面去"）。
+ * 所以落后超过阈值就把这一帧直接还回解码器：不做色调映射、不转格式、
+ * 不提交上屏，下一帧的 due 又往后走一格，误差因此被钉死在阈值以内。
+ * 这是 mpv/vlc 一直在做的事（丢帧抹平，而不是硬等）。 */
+static double g_drop_late = -1.0;	/* 阈值（ms）；<0=按一帧算，0=不丢 */
+static long   g_drop_n;			/* 丢掉的上屏候选帧数（诊断） */
 /* seek 之后上屏的帧数：诊断口径。got 是"这次进程一共解了多少帧"，跨 seek
  * 不清零，拿它当位置量（got/fps）就会在 seek 后凭空多出十几秒 —— 2026-11-20
  * 就是被这条假数据带偏，找了一轮"音画差 20 秒"的幽灵 bug。 */
@@ -4218,6 +4228,13 @@ int main(int argc, char **argv)
 		/* 配速归播放器，Renderer 只按 pts 找上屏槽 */
 		g_play_fps = getenv("FPS") ? atof(getenv("FPS")) : 24.0;
 		g_play_lead = getenv("LEAD") ? atof(getenv("LEAD")) : 6;
+		/* 缺省阈值 = 一帧：落后不到一帧就等（等得起），超过一帧就
+		 * 说明这一帧再怎么等也补不回来了，只能丢。0 关掉丢帧做对照。 */
+		if (getenv("DROP_LATE"))
+			g_drop_late = atof(getenv("DROP_LATE"));
+		else if (g_drop_late < 0 && g_play_fps > 0)
+			g_drop_late = 1000.0 / g_play_fps;
+		if (g_drop_late < 0) g_drop_late = 0;
 		if (getenv("NOPACE")) {
 			g_play_fps = 0;
 			g_play_lead = 0;
@@ -4713,6 +4730,9 @@ no_stall:;
 			struct v4l2_plane sh = {0};
 			struct v4l2_plane *pl = &sh;
 			int rendered = 0;
+			int dropped = 0;	/* 落后丢帧：这一帧不上屏 */
+			double due = 0;
+			int have_due = 0;
 
 			b.type = CAP_T;
 			b.memory = cap_memory;
@@ -4772,7 +4792,31 @@ no_stall:;
 				write_nv12(b.index, capw, caph);
 				t_write_acc += now_s() - tw;
 			}
-			if (rend) {
+			/* 落后丢帧：这一帧已经比它该上屏的时刻晚太多了，再撑下去
+			 * 只会把欠账留给后面所有帧（配速只许迟到不许早到，欠一帧
+			 * 就永远欠着，误差线性累积）。直接不提交，让它走底部
+			 * QBUF 还回解码器；下一帧的 due 又往后走一格，误差就被
+			 * 钉在阈值以内。前几帧不丢：那时配速锚点刚立、声音闸门刚
+			 * 开，读数不稳，丢了反而是自己制造抖动。 */
+			if (rend && g_play_fps > 0) {
+				have_due = 1;
+				due = play_due(got);
+				if (g_drop_late > 0 && g_shown_n >= 4) {
+					double late = (now_s() - due) * 1000.0;
+
+					if (late > g_drop_late) {
+						dropped = 1;
+						g_drop_n++;
+						if (getenv("DROPBG") &&
+						    (g_drop_n <= 5 || g_drop_n % 50 == 0))
+							printf("DROP: n=%ld got=%ld shown=%ld "
+							       "late=%.1fms thr=%.0fms\n",
+							       g_drop_n, (long)got, g_shown_n,
+							       late, g_drop_late);
+					}
+				}
+			}
+			if (rend && !dropped) {
 				int rc;
 
 				if (g_need_tm) {
@@ -4796,8 +4840,8 @@ no_stall:;
 				double ts = now_s();
 				rc = render_submit(rend, capbuf[b.index].dmabuf,
 						   capw, caph, cap_bpl, cap_bpl,
-						   (g_play_fps > 0 && render_has_pace(rend)) ?
-						   play_due(got) : 0,
+						   (have_due && render_has_pace(rend)) ?
+						   due : 0,
 						   &capbuf[b.index]);
 				t_sub_acc += now_s() - ts;
 				}
@@ -4840,8 +4884,8 @@ no_stall:;
 						capbuf[b.index].dmabuf[1], capw, caph);
 #endif
 			/* 后端没有节拍器（同步后端不会自己等）：配速归播放器 */
-			if (rend && g_play_fps > 0 && !render_has_pace(rend)) {
-				double due = play_due(got);
+			if (rend && !dropped && g_play_fps > 0 &&
+			    !render_has_pace(rend)) {
 				double nn = now_s();
 
 				if (due > nn) {
@@ -4998,7 +5042,12 @@ no_stall:;
 		       rs.misses, rs.late, rs.late_ms_max, el,
 		       el > 0 ? rs.shown / el : 0.0);
 		if (rs.draw_ms_sum > 0)
-			printf("PLAY: draw avg=%.2fms max=%.2fms swap=%.2fs\n",
+			if (g_drop_n)
+			printf("PLAY: 落后丢帧 %ld 帧（阈值 %.0fms，%.2f%%）\n",
+			       g_drop_n, g_drop_late,
+			       100.0 * (double)g_drop_n /
+			       (double)(g_drop_n + (rs.shown ? rs.shown : 1)));
+		printf("PLAY: draw avg=%.2fms max=%.2fms swap=%.2fs\n",
 			       rs.draw_ms_sum / (rs.shown ? rs.shown : 1),
 			       rs.draw_ms_max, rs.swap_ms_sum);
 	}
